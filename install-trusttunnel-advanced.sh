@@ -2,7 +2,7 @@
 set -e
 
 echo "==============================================="
-echo "  Установка TrustTunnel VPN (расширенная версия)"
+echo "  Установка TrustTunnel VPN (без Docker)"
 echo "  Ubuntu Server 24.04"
 echo "==============================================="
 echo
@@ -40,9 +40,15 @@ apt upgrade -y
 # ------------------ Установка пакетов ------------------
 
 apt install -y curl git ufw fail2ban certbot python3-certbot-nginx \
-  docker.io docker-compose-plugin
+  build-essential pkg-config libssl-dev
 
-systemctl enable --now docker
+# ------------------ Установка Rust ------------------
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "Установка Rust..."
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  source "$HOME/.cargo/env"
+fi
 
 # ------------------ Включение BBR ------------------
 
@@ -99,7 +105,21 @@ EOF
 chmod +x /etc/letsencrypt/renewal-hooks/pre/open80.sh
 chmod +x /etc/letsencrypt/renewal-hooks/post/close80.sh
 
-# ------------------ Установка TrustTunnel ------------------
+# ------------------ Сборка TrustTunnel ------------------
+
+mkdir -p /opt/trusttunnel
+cd /opt/trusttunnel
+
+if [[ ! -d TrustTunnel ]]; then
+  git clone https://github.com/TrustTunnel/TrustTunnel.git
+fi
+
+cd TrustTunnel
+cargo build --release
+
+install -m 755 target/release/endpoint /usr/local/bin/trusttunnel-endpoint
+
+# ------------------ Конфиги ------------------
 
 mkdir -p /opt/trusttunnel/config
 mkdir -p /opt/trusttunnel/certs
@@ -107,23 +127,25 @@ mkdir -p /opt/trusttunnel/certs
 cp "$CERT_PATH" /opt/trusttunnel/certs/cert.pem
 cp "$KEY_PATH"  /opt/trusttunnel/certs/key.pem
 
-# Конфиг VPN
+# vpn.toml
 cat > /opt/trusttunnel/config/vpn.toml <<EOF
 bind_addr = "0.0.0.0:443"
 public_ip = "$SERVER_IP"
 domain = "$DOMAIN"
 antidpi = $ANTIDPI
+credentials = "/opt/trusttunnel/config/credentials.toml"
+hosts = "/opt/trusttunnel/config/hosts.toml"
 EOF
 
-# Конфиг хостов
+# hosts.toml
 cat > /opt/trusttunnel/config/hosts.toml <<EOF
 [[hosts]]
 server_name = "$DOMAIN"
-cert_file = "/data/certs/cert.pem"
-key_file  = "/data/certs/key.pem"
+cert_file = "/opt/trusttunnel/certs/cert.pem"
+key_file  = "/opt/trusttunnel/certs/key.pem"
 EOF
 
-# Создание 10 пользователей
+# credentials.toml
 CRED="/opt/trusttunnel/config/credentials.toml"
 echo "# Пользователи TrustTunnel" > "$CRED"
 
@@ -133,36 +155,18 @@ for i in $(seq 1 10); do
   echo "$USER:$PASS" >> "$CRED"
 done
 
-# Docker Compose
-cat > /opt/trusttunnel/docker-compose.yml <<EOF
-version: "3.8"
+# ------------------ systemd сервис ------------------
 
-services:
-  trusttunnel-endpoint:
-    image: ghcr.io/trusttunnel/endpoint:latest
-    container_name: trusttunnel-endpoint
-    restart: always
-    network_mode: host
-    volumes:
-      - /opt/trusttunnel/config/vpn.toml:/data/vpn.toml:ro
-      - /opt/trusttunnel/config/hosts.toml:/data/hosts.toml:ro
-      - /opt/trusttunnel/config/credentials.toml:/data/credentials.toml:ro
-      - /opt/trusttunnel/certs:/data/certs:ro
-EOF
-
-# systemd сервис
-cat > /etc/systemd/system/trusttunnel.service << 'EOF'
+cat > /etc/systemd/system/trusttunnel.service <<EOF
 [Unit]
 Description=TrustTunnel VPN Endpoint
-After=network-online.target docker.service
-Wants=network-online.target docker.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-WorkingDirectory=/opt/trusttunnel
-ExecStart=/usr/bin/docker compose up -d
-ExecStop=/usr/bin/docker compose down
+ExecStart=/usr/local/bin/trusttunnel-endpoint --config /opt/trusttunnel/config/vpn.toml
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
