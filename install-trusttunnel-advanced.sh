@@ -1,8 +1,8 @@
 #!/bin/bash
 
 #############################################
-# TrustTunnel Auto-Installer Advanced v4.2
-# Полная установка TrustTunnel на Ubuntu 24.04
+# TrustTunnel Auto-Installer Advanced v4.3
+# Полная установка TrustTunnel (master build) на Ubuntu 24.04
 #############################################
 
 set -e
@@ -19,7 +19,7 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-SCRIPT_VERSION="4.2"
+SCRIPT_VERSION="4.3"
 INSTALL_LOG="/var/log/trusttunnel-install.log"
 
 SERVER_IP="${SERVER_IP:-$(curl -s ifconfig.me || echo 127.0.0.1)}"
@@ -160,9 +160,30 @@ install_dependencies() {
         net-tools htop nano \
         ufw fail2ban \
         certbot python3-certbot \
-        nginx
+        nginx \
+        build-essential pkg-config \
+        cmake ninja-build clang \
+        golang perl
 
     log_info "Зависимости установлены"
+}
+
+# ============================================
+# УСТАНОВКА RUST (stable)
+# ============================================
+
+install_rust() {
+    log_section "🦀 УСТАНОВКА RUST (stable)"
+
+    if ! command -v rustc >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        source "$HOME/.cargo/env"
+    fi
+
+    rustup default stable
+    rustup update stable
+
+    log_info "Rust stable установлен"
 }
 
 # ============================================
@@ -286,43 +307,37 @@ EOF
 }
 
 # ============================================
-# СКАЧИВАНИЕ БИНАРНИКА TRUSTTUNNEL (v0.9.125)
+# СБОРКА И УСТАНОВКА TRUSTTUNNEL ИЗ MASTER
 # ============================================
 
 install_trusttunnel_binary() {
-    log_section "⬇️ УСТАНОВКА TRUSTTUNNEL v0.9.125 (СТАБИЛЬНЫЙ БИНАРНИК)"
+    log_section "⬇️ СБОРКА TRUSTTUNNEL ИЗ MASTER"
 
-    local tmp="/tmp/trusttunnel"
+    local tmp="/tmp/trusttunnel-master"
+    rm -rf "$tmp"
     mkdir -p "$tmp"
 
-    local version="v0.9.125"
-    local archive="trusttunnel-${version}-linux-x86_64.tar.gz"
-    local url="https://github.com/TrustTunnel/TrustTunnel/releases/download/${version}/${archive}"
+    log_info "Клонирование репозитория TrustTunnel..."
+    git clone --depth 1 https://github.com/TrustTunnel/TrustTunnel.git "$tmp"
 
-    log_info "Скачивание бинарника TrustTunnel:"
-    log_info "  $url"
+    log_info "Сборка TrustTunnel (это может занять 5–20 минут)..."
+    cd "$tmp"
 
-    if ! curl -fL -o "$tmp/$archive" "$url"; then
-        log_error "Не удалось скачать бинарник TrustTunnel по адресу:"
-        log_error "  $url"
+    if ! cargo build --release; then
+        log_error "Ошибка сборки TrustTunnel"
         exit 1
     fi
 
-    log_info "Распаковка архива..."
-    tar -xzf "$tmp/$archive" -C "$tmp"
+    local endpoint_bin="$tmp/target/release/endpoint"
 
-    log_info "Поиск бинарника endpoint..."
-    local endpoint_bin
-    endpoint_bin=$(find "$tmp" -type f -name "endpoint" -o -name "trusttunnel-endpoint" | head -n1)
-
-    if [[ -z "$endpoint_bin" ]]; then
-        log_error "В архиве отсутствует бинарник endpoint"
+    if [[ ! -f "$endpoint_bin" ]]; then
+        log_error "Сборка завершилась, но бинарник endpoint не найден"
         exit 1
     fi
 
     install -m 755 "$endpoint_bin" "${BIN_DIR}/trusttunnel-endpoint"
 
-    log_info "TrustTunnel v0.9.125 установлен: ${BIN_DIR}/trusttunnel-endpoint"
+    log_info "TrustTunnel (master) установлен: ${BIN_DIR}/trusttunnel-endpoint"
 }
 
 # ============================================
@@ -488,7 +503,8 @@ EOF
 }
 
 # ============================================
-# АВТООБНОВЛЕНИЕ TRUSTTUNNEL (по-прежнему latest через API)
+# АВТООБНОВЛЕНИЕ TRUSTTUNNEL
+# (оставляем как в 4.1 — через latest API)
 # ============================================
 
 create_trusttunnel_update() {
@@ -793,7 +809,7 @@ main() {
 
     clear_screen
     log_section "🎉 TRUSTTUNNEL AUTO-INSTALLER v$SCRIPT_VERSION"
-    echo "Полная установка TrustTunnel VPN на Ubuntu Server 24.04"
+    echo "Полная установка TrustTunnel (master build) на Ubuntu Server 24.04"
     echo ""
 
     sleep 1
@@ -803,6 +819,7 @@ main() {
     create_directories
     update_system
     install_dependencies
+    install_rust
     configure_kernel
     setup_firewall
     setup_fail2ban
