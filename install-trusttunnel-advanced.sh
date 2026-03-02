@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #############################################
-# TrustTunnel Auto-Installer Advanced v4.0
+# TrustTunnel Auto-Installer Advanced v4.1
 # Полная установка TrustTunnel на Ubuntu 24.04
 #############################################
 
@@ -19,17 +19,15 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-SCRIPT_VERSION="4.0"
+SCRIPT_VERSION="4.1"
 INSTALL_LOG="/var/log/trusttunnel-install.log"
 
-# Значения по умолчанию
-SERVER_IP="${SERVER_IP:-195.206.234.157}"
+SERVER_IP="${SERVER_IP:-$(curl -s ifconfig.me || echo 127.0.0.1)}"
 DOMAIN="${DOMAIN:-example.duckdns.org}"
 EMAIL="${EMAIL:-admin@example.com}"
 NUM_USERS="${NUM_USERS:-10}"
 VPN_PORT_DEFAULT="${VPN_PORT_DEFAULT:-443}"
 
-# Директории
 INSTALL_DIR="/opt/trusttunnel"
 BIN_DIR="${INSTALL_DIR}/bin"
 CONFIG_DIR="${INSTALL_DIR}/config"
@@ -43,17 +41,9 @@ SCRIPTS_DIR="${INSTALL_DIR}/scripts"
 # ЛОГИРОВАНИЕ
 # ============================================
 
-log_info() {
-    echo -e "${GREEN}[✓]${NC} $1" | tee -a "$INSTALL_LOG"
-}
-
-log_error() {
-    echo -e "${RED}[✗]${NC} $1" | tee -a "$INSTALL_LOG"
-}
-
-log_warn() {
-    echo -e "${YELLOW}[⚠]${NC} $1" | tee -a "$INSTALL_LOG"
-}
+log_info() { echo -e "${GREEN}[✓]${NC} $1" | tee -a "$INSTALL_LOG"; }
+log_error() { echo -e "${RED}[✗]${NC} $1" | tee -a "$INSTALL_LOG"; }
+log_warn() { echo -e "${YELLOW}[⚠]${NC} $1" | tee -a "$INSTALL_LOG"; }
 
 log_section() {
     echo ""
@@ -88,31 +78,19 @@ check_root() {
     fi
 }
 
-check_system_requirements() {
-    log_section "🔍 ПРОВЕРКА СИСТЕМНЫХ ТРЕБОВАНИЙ"
+check_system() {
+    log_section "🔍 ПРОВЕРКА СИСТЕМЫ"
 
-    if ! grep -q "Ubuntu" /etc/os-release; then
+    if ! grep -q 'Ubuntu' /etc/os-release; then
         log_error "Требуется Ubuntu Server"
         exit 1
     fi
 
     if ! grep -q 'VERSION_ID="24.04"' /etc/os-release; then
-        log_warn "Скрипт рассчитан на Ubuntu 24.04. Продолжить на свой риск."
+        log_warn "Скрипт рассчитан на Ubuntu 24.04"
     fi
 
-    log_info "ОС: Ubuntu Server"
-
-    MEM_MB=$(free -m | awk 'NR==2{print $2}')
-    log_info "Память: ${MEM_MB}MB"
-
-    FREE_GB=$(df / | awk 'NR==2{print $4/1024/1024}' | cut -d'.' -f1)
-    if [ "$FREE_GB" -lt 10 ]; then
-        log_error "Недостаточно свободного места (нужно минимум 10GB)"
-        exit 1
-    fi
-    log_info "Диск: ${FREE_GB}GB свободно"
-
-    sleep 1
+    log_info "ОС: Ubuntu 24.04"
 }
 
 # ============================================
@@ -123,37 +101,24 @@ prompt_parameters() {
     clear_screen
     log_section "⚙️ КОНФИГУРАЦИЯ ПАРАМЕТРОВ"
 
-    echo "Введите параметры установки (или Enter для значений по умолчанию)"
-    echo ""
-
     read -p "📍 IP адрес сервера [$SERVER_IP]: " INPUT_IP
     SERVER_IP="${INPUT_IP:-$SERVER_IP}"
-    log_info "IP: $SERVER_IP"
 
     read -p "🌐 Доменное имя [$DOMAIN]: " INPUT_DOMAIN
     DOMAIN="${INPUT_DOMAIN:-$DOMAIN}"
-    log_info "Домен: $DOMAIN"
 
-    read -p "📧 Email для Let's Encrypt [$EMAIL]: " INPUT_EMAIL
+    read -p "📧 Email [$EMAIL]: " INPUT_EMAIL
     EMAIL="${INPUT_EMAIL:-$EMAIL}"
-    log_info "Email: $EMAIL"
 
     read -p "🔌 Порт VPN [$VPN_PORT_DEFAULT]: " INPUT_PORT
     VPN_PORT="${INPUT_PORT:-$VPN_PORT_DEFAULT}"
-    log_info "Порт VPN: $VPN_PORT"
 
     read -p "👥 Количество пользователей [$NUM_USERS]: " INPUT_USERS
     NUM_USERS="${INPUT_USERS:-$NUM_USERS}"
-    log_info "Пользователей: $NUM_USERS"
 
     echo ""
     read -p "Все верно? (y/n) [y]: " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]?$ ]]; then
-        log_error "Отменено пользователем"
-        exit 0
-    fi
-
-    sleep 1
+    [[ "$CONFIRM" =~ ^[Yy]?$ ]] || exit 0
 }
 
 # ============================================
@@ -163,12 +128,11 @@ prompt_parameters() {
 create_directories() {
     log_section "📁 СОЗДАНИЕ ДИРЕКТОРИЙ"
 
-    mkdir -p "$LOG_DIR" "$INSTALL_DIR" "$CONFIG_DIR" "$CERTS_DIR" \
-             "$SCRIPTS_DIR" "$BACKUP_DIR" "$USERS_DIR" "$BIN_DIR"
+    mkdir -p "$INSTALL_DIR" "$BIN_DIR" "$CONFIG_DIR" "$CERTS_DIR" \
+             "$LOG_DIR" "$USERS_DIR" "$BACKUP_DIR" "$SCRIPTS_DIR"
 
     log_info "Директории созданы"
 }
-
 # ============================================
 # ОБНОВЛЕНИЕ СИСТЕМЫ
 # ============================================
@@ -183,17 +147,17 @@ update_system() {
 }
 
 # ============================================
-# ЗАВИСИМОСТИ
+# УСТАНОВКА ЗАВИСИМОСТЕЙ
 # ============================================
 
 install_dependencies() {
     log_section "📦 УСТАНОВКА ЗАВИСИМОСТЕЙ"
 
     apt-get install -y -qq \
-        curl wget git \
+        curl wget git jq \
         openssl ca-certificates \
         net-tools htop nano \
-        jq ufw fail2ban \
+        ufw fail2ban \
         certbot python3-certbot \
         nginx
 
@@ -201,42 +165,41 @@ install_dependencies() {
 }
 
 # ============================================
-# КОНФИГУРАЦИЯ ЯДРА И DDoS
+# КОНФИГУРАЦИЯ ЯДРА + DDoS
 # ============================================
 
 configure_kernel() {
-    log_section "⚙️ КОНФИГУРАЦИЯ ЯДРА И DDoS ЗАЩИТЫ"
+    log_section "⚙️ НАСТРОЙКА ЯДРА И DDoS ЗАЩИТЫ"
 
     cat > /etc/sysctl.d/99-trusttunnel.conf << EOF
-# BBR TCP Congestion Control
+# BBR
 net.ipv4.tcp_congestion_control=bbr
 net.core.default_qdisc=fq
 
-# DDoS Protection
+# SYN Flood
 net.ipv4.tcp_syncookies=1
 net.ipv4.tcp_max_syn_backlog=4096
 net.ipv4.tcp_synack_retries=2
 net.ipv4.tcp_syn_retries=2
-net.ipv4.tcp_rfc1337=1
 
-# IP Spoofing Protection
+# IP Spoofing
 net.ipv4.conf.all.rp_filter=1
 net.ipv4.conf.default.rp_filter=1
 
-# Network Optimization
+# Network Buffers
 net.core.rmem_max=134217728
 net.core.wmem_max=134217728
 net.ipv4.tcp_rmem=4096 87380 67108864
 net.ipv4.tcp_wmem=4096 65536 67108864
 net.core.netdev_max_backlog=5000
 
-# ICMP / UDP flood basic mitigation
+# ICMP Flood
 net.ipv4.icmp_echo_ignore_broadcasts=1
 net.ipv4.icmp_ignore_bogus_error_responses=1
 EOF
 
     sysctl --system > /dev/null 2>&1 || true
-    log_info "Ядро и DDoS защита настроены"
+    log_info "BBR и DDoS защита включены"
 }
 
 # ============================================
@@ -244,15 +207,15 @@ EOF
 # ============================================
 
 setup_firewall() {
-    log_section "🔐 КОНФИГУРАЦИЯ UFW"
+    log_section "🔐 НАСТРОЙКА FIREWALL"
 
     ufw --force enable > /dev/null 2>&1
     ufw allow ssh > /dev/null 2>&1
-    ufw allow "${VPN_PORT}/tcp" > /dev/null 2>&1
-    ufw allow "${VPN_PORT}/udp" > /dev/null 2>&1
+    ufw allow ${VPN_PORT}/tcp > /dev/null 2>&1
+    ufw allow ${VPN_PORT}/udp > /dev/null 2>&1
     ufw allow 80/tcp > /dev/null 2>&1
 
-    log_info "UFW включен и настроен"
+    log_info "UFW настроен"
 }
 
 # ============================================
@@ -260,7 +223,7 @@ setup_firewall() {
 # ============================================
 
 setup_fail2ban() {
-    log_section "🛡️ КОНФИГУРАЦИЯ FAIL2BAN"
+    log_section "🛡️ НАСТРОЙКА FAIL2BAN"
 
     cat > /etc/fail2ban/jail.local << 'EOF'
 [DEFAULT]
@@ -271,15 +234,13 @@ maxretry = 5
 [sshd]
 enabled = true
 port = ssh
-filter = sshd
 logpath = /var/log/auth.log
-maxretry = 5
 EOF
 
-    systemctl restart fail2ban > /dev/null 2>&1
-    systemctl enable fail2ban > /dev/null 2>&1
+    systemctl restart fail2ban
+    systemctl enable fail2ban
 
-    log_info "Fail2Ban настроен"
+    log_info "Fail2Ban включён"
 }
 
 # ============================================
@@ -287,7 +248,7 @@ EOF
 # ============================================
 
 setup_certbot() {
-    log_section "🔐 НАСТРОЙКА LET'S ENCRYPT"
+    log_section "🔐 ПОЛУЧЕНИЕ СЕРТИФИКАТА LET'S ENCRYPT"
 
     ufw allow 80/tcp > /dev/null 2>&1
     systemctl stop nginx 2>/dev/null || true
@@ -296,24 +257,17 @@ setup_certbot() {
         -d "$DOMAIN" \
         --non-interactive --agree-tos \
         -m "$EMAIL" --keep-until-expiring || {
-            log_error "Не удалось получить сертификат Let's Encrypt"
+            log_error "Ошибка получения сертификата"
             exit 1
         }
 
     ufw delete allow 80/tcp > /dev/null 2>&1 || true
 
-    CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-    KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+    cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERTS_DIR/cert.pem"
+    cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem" "$CERTS_DIR/key.pem"
 
-    if [[ ! -f "$CERT_PATH" || ! -f "$KEY_PATH" ]]; then
-        log_error "Сертификаты не найдены после выдачи"
-        exit 1
-    fi
+    log_info "Сертификаты скопированы"
 
-    cp "$CERT_PATH" "$CERTS_DIR/cert.pem"
-    cp "$KEY_PATH" "$CERTS_DIR/key.pem"
-
-    # Хуки обновления
     mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
 
     cat > /etc/letsencrypt/renewal-hooks/pre/open80.sh << 'EOF'
@@ -328,77 +282,47 @@ EOF
 
     chmod +x /etc/letsencrypt/renewal-hooks/pre/open80.sh
     chmod +x /etc/letsencrypt/renewal-hooks/post/close80.sh
-
-    log_info "Let's Encrypt настроен, сертификаты скопированы"
 }
 
 # ============================================
-# УСТАНОВКА TRUSTTUNNEL (БИНАРНИК)
+# СКАЧИВАНИЕ БИНАРНИКА TRUSTTUNNEL
 # ============================================
 
 install_trusttunnel_binary() {
-    log_section "⬇️ УСТАНОВКА TRUSTTUNNEL ENDPOINT"
+    log_section "⬇️ УСТАНОВКА TRUSTTUNNEL (СТАБИЛЬНЫЙ БИНАРНИК)"
 
     local api_url="https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest"
-    local tmp_dir="/tmp/trusttunnel-download"
-    mkdir -p "$tmp_dir"
+    local tmp="/tmp/trusttunnel"
+    mkdir -p "$tmp"
 
-    log_info "Получение информации о последнем релизе TrustTunnel..."
+    log_info "Получение информации о последнем релизе..."
+
     local asset_url
     asset_url=$(curl -s "$api_url" | jq -r '.assets[] | select(.name | test("endpoint.*x86_64.*linux.*tar.gz")) | .browser_download_url' | head -n1)
 
-    if [[ -z "$asset_url" || "$asset_url" == "null" ]]; then
-        log_warn "Не удалось найти бинарник endpoint в релизах. Придётся собирать из исходников."
-        install_trusttunnel_from_source
-        return
+    if [[ -z "$asset_url" ]]; then
+        log_error "Не найден бинарник endpoint для x86_64"
+        exit 1
     fi
 
-    log_info "Найден бинарник: $asset_url"
-    local tar_file="${tmp_dir}/trusttunnel-endpoint.tar.gz"
+    log_info "Скачивание: $asset_url"
 
-    curl -L -o "$tar_file" "$asset_url" || {
-        log_warn "Ошибка скачивания бинарника. Переходим к сборке из исходников."
-        install_trusttunnel_from_source
-        return
-    }
+    curl -L -o "$tmp/endpoint.tar.gz" "$asset_url"
 
-    tar -xzf "$tar_file" -C "$tmp_dir"
+    tar -xzf "$tmp/endpoint.tar.gz" -C "$tmp"
+
     local endpoint_bin
-    endpoint_bin=$(find "$tmp_dir" -type f -name "endpoint" | head -n1)
+    endpoint_bin=$(find "$tmp" -type f -name "endpoint" | head -n1)
 
     if [[ -z "$endpoint_bin" ]]; then
-        log_warn "Не найден бинарник endpoint в архиве. Переходим к сборке из исходников."
-        install_trusttunnel_from_source
-        return
+        log_error "Бинарник endpoint не найден в архиве"
+        exit 1
     fi
 
     install -m 755 "$endpoint_bin" "${BIN_DIR}/trusttunnel-endpoint"
-    log_info "TrustTunnel endpoint установлен в ${BIN_DIR}/trusttunnel-endpoint"
+
+    log_info "TrustTunnel установлен: ${BIN_DIR}/trusttunnel-endpoint"
 }
-
-install_trusttunnel_from_source() {
-    log_section "🧱 СБОРКА TRUSTTUNNEL ИЗ ИСХОДНИКОВ"
-
-    apt-get install -y -qq build-essential pkg-config libssl-dev
-
-    if ! command -v cargo >/dev/null 2>&1; then
-        log_info "Установка Rust (rustup)..."
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-        source "$HOME/.cargo/env"
-    fi
-
-    local src_dir="/opt/trusttunnel-src"
-    if [[ ! -d "$src_dir" ]]; then
-        git clone https://github.com/TrustTunnel/TrustTunnel.git "$src_dir"
-    fi
-
-    cd "$src_dir"
-    cargo build --release
-
-    install -m 755 target/release/endpoint "${BIN_DIR}/trusttunnel-endpoint"
-    log_info "TrustTunnel endpoint собран и установлен в ${BIN_DIR}/trusttunnel-endpoint"
-}
-
 # ============================================
 # КОНФИГИ TRUSTTUNNEL
 # ============================================
@@ -418,7 +342,7 @@ create_trusttunnel_config() {
     done
 
     chmod 600 "$cred_file"
-    log_info "Создано $NUM_USERS пользователей в $cred_file"
+    log_info "Создано $NUM_USERS пользователей"
 
     # hosts.toml
     cat > "${CONFIG_DIR}/hosts.toml" << EOF
@@ -480,12 +404,13 @@ EOF
 }
 
 # ============================================
-# РЕЗЕРВНОЕ КОПИРОВАНИЕ И ВОССТАНОВЛЕНИЕ
+# БЭКАПЫ И ВОССТАНОВЛЕНИЕ
 # ============================================
 
 create_backup_and_restore() {
     log_section "💾 РЕЗЕРВНОЕ КОПИРОВАНИЕ И ВОССТАНОВЛЕНИЕ"
 
+    # backup.sh
     cat > "${SCRIPTS_DIR}/backup.sh" << 'EOF'
 #!/bin/bash
 BACKUP_DIR="/var/backups/trusttunnel"
@@ -507,6 +432,7 @@ EOF
 
     chmod +x "${SCRIPTS_DIR}/backup.sh"
 
+    # restore-config.sh
     cat > "${SCRIPTS_DIR}/restore-config.sh" << 'EOF'
 #!/bin/bash
 BACKUP_DIR="/var/backups/trusttunnel"
@@ -526,7 +452,7 @@ EOF
 
     chmod +x "${SCRIPTS_DIR}/restore-config.sh"
 
-    # systemd timer for backup
+    # systemd backup timer
     cat > /etc/systemd/system/trusttunnel-backup.service << EOF
 [Unit]
 Description=TrustTunnel Backup Service
@@ -556,7 +482,7 @@ EOF
     systemctl enable trusttunnel-backup.timer > /dev/null 2>&1 || true
     systemctl start trusttunnel-backup.timer > /dev/null 2>&1 || true
 
-    log_info "Резервное копирование и восстановление настроены"
+    log_info "Бэкапы и восстановление настроены"
 }
 
 # ============================================
@@ -577,7 +503,7 @@ mkdir -p "\$TMP_DIR"
 
 asset_url=\$(curl -s "\$API_URL" | jq -r '.assets[] | select(.name | test("endpoint.*x86_64.*linux.*tar.gz")) | .browser_download_url' | head -n1)
 
-if [[ -z "\$asset_url" || "\$asset_url" == "null" ]]; then
+if [[ -z "\$asset_url" ]]; then
     echo "No endpoint binary found in latest release."
     exit 0
 fi
@@ -630,7 +556,7 @@ EOF
     systemctl enable trusttunnel-update.timer > /dev/null 2>&1 || true
     systemctl start trusttunnel-update.timer > /dev/null 2>&1 || true
 
-    log_info "Автообновление TrustTunnel настроено (раз в неделю)"
+    log_info "Автообновление TrustTunnel включено"
 }
 
 # ============================================
@@ -684,9 +610,8 @@ EOF
     systemctl enable ubuntu-weekly-update.timer > /dev/null 2>&1 || true
     systemctl start ubuntu-weekly-update.timer > /dev/null 2>&1 || true
 
-    log_info "Еженедельное обновление Ubuntu настроено"
+    log_info "Еженедельное обновление Ubuntu включено"
 }
-
 # ============================================
 # CLI
 # ============================================
@@ -776,7 +701,7 @@ esac
 EOFCLI
 
     chmod +x "${SCRIPTS_DIR}/trusttunnel-cli.sh"
-    ln -sf "${SCRIPTS_DIR}/trusttunnel-cli.sh" /usr/local/bin/trusttunnel-cli 2>/dev/null || true
+    ln -sf "${SCRIPTS_DIR}/trusttunnel-cli.sh" /usr/local/bin/trusttunnel-cli
 
     log_info "CLI интерфейс создан (trusttunnel-cli)"
 }
@@ -810,7 +735,7 @@ EOF
 }
 
 # ============================================
-# ИТОГОВАЯ ИНФОРМАЦИЯ
+# ИТОГОВЫЙ ВЫВОД
 # ============================================
 
 show_summary() {
@@ -870,7 +795,7 @@ main() {
 
     sleep 1
 
-    check_system_requirements
+    check_system
     prompt_parameters
     create_directories
     update_system
@@ -888,7 +813,7 @@ main() {
     create_cli
     final_setup
 
-    systemctl start trusttunnel.service 2>/dev/null || true
+    systemctl start trusttunnel.service
 
     show_summary
 }
