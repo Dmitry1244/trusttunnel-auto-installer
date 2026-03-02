@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #############################################
-# TrustTunnel Auto-Installer Advanced v4.1
+# TrustTunnel Auto-Installer Advanced v4.2
 # Полная установка TrustTunnel на Ubuntu 24.04
 #############################################
 
@@ -19,7 +19,7 @@ CYAN='\033[0;36m'
 MAGENTA='\033[0;35m'
 NC='\033[0m'
 
-SCRIPT_VERSION="4.1"
+SCRIPT_VERSION="4.2"
 INSTALL_LOG="/var/log/trusttunnel-install.log"
 
 SERVER_IP="${SERVER_IP:-$(curl -s ifconfig.me || echo 127.0.0.1)}"
@@ -133,6 +133,7 @@ create_directories() {
 
     log_info "Директории созданы"
 }
+
 # ============================================
 # ОБНОВЛЕНИЕ СИСТЕМЫ
 # ============================================
@@ -285,44 +286,45 @@ EOF
 }
 
 # ============================================
-# СКАЧИВАНИЕ БИНАРНИКА TRUSTTUNNEL
+# СКАЧИВАНИЕ БИНАРНИКА TRUSTTUNNEL (v0.9.125)
 # ============================================
 
 install_trusttunnel_binary() {
-    log_section "⬇️ УСТАНОВКА TRUSTTUNNEL (СТАБИЛЬНЫЙ БИНАРНИК)"
+    log_section "⬇️ УСТАНОВКА TRUSTTUNNEL v0.9.125 (СТАБИЛЬНЫЙ БИНАРНИК)"
 
-    local api_url="https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest"
     local tmp="/tmp/trusttunnel"
     mkdir -p "$tmp"
 
-    log_info "Получение информации о последнем релизе..."
+    local version="v0.9.125"
+    local archive="trusttunnel-${version}-linux-x86_64.tar.gz"
+    local url="https://github.com/TrustTunnel/TrustTunnel/releases/download/${version}/${archive}"
 
-    local asset_url
-    asset_url=$(curl -s "$api_url" | jq -r '.assets[] | select(.name | test("endpoint.*x86_64.*linux.*tar.gz")) | .browser_download_url' | head -n1)
+    log_info "Скачивание бинарника TrustTunnel:"
+    log_info "  $url"
 
-    if [[ -z "$asset_url" ]]; then
-        log_error "Не найден бинарник endpoint для x86_64"
+    if ! curl -fL -o "$tmp/$archive" "$url"; then
+        log_error "Не удалось скачать бинарник TrustTunnel по адресу:"
+        log_error "  $url"
         exit 1
     fi
 
-    log_info "Скачивание: $asset_url"
+    log_info "Распаковка архива..."
+    tar -xzf "$tmp/$archive" -C "$tmp"
 
-    curl -L -o "$tmp/endpoint.tar.gz" "$asset_url"
-
-    tar -xzf "$tmp/endpoint.tar.gz" -C "$tmp"
-
+    log_info "Поиск бинарника endpoint..."
     local endpoint_bin
-    endpoint_bin=$(find "$tmp" -type f -name "endpoint" | head -n1)
+    endpoint_bin=$(find "$tmp" -type f -name "endpoint" -o -name "trusttunnel-endpoint" | head -n1)
 
     if [[ -z "$endpoint_bin" ]]; then
-        log_error "Бинарник endpoint не найден в архиве"
+        log_error "В архиве отсутствует бинарник endpoint"
         exit 1
     fi
 
     install -m 755 "$endpoint_bin" "${BIN_DIR}/trusttunnel-endpoint"
 
-    log_info "TrustTunnel установлен: ${BIN_DIR}/trusttunnel-endpoint"
+    log_info "TrustTunnel v0.9.125 установлен: ${BIN_DIR}/trusttunnel-endpoint"
 }
+
 # ============================================
 # КОНФИГИ TRUSTTUNNEL
 # ============================================
@@ -486,7 +488,7 @@ EOF
 }
 
 # ============================================
-# АВТООБНОВЛЕНИЕ TRUSTTUNNEL
+# АВТООБНОВЛЕНИЕ TRUSTTUNNEL (по-прежнему latest через API)
 # ============================================
 
 create_trusttunnel_update() {
@@ -612,6 +614,7 @@ EOF
 
     log_info "Еженедельное обновление Ubuntu включено"
 }
+
 # ============================================
 # CLI
 # ============================================
