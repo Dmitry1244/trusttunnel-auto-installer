@@ -51,12 +51,12 @@ clear_screen() {
     clear
     echo -e "${MAGENTA}"
     cat << 'BANNER'
-  ████████╗██████╗ ██╗   ██╗███████╗████████╗████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗     
-  ╚══██╔══╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║     
-     ██║   ██████╔╝██║   ██║███████╗   ██║      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║     
-     ██║   ██╔══██╗██║   ██║╚════██║   ██║      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║     
-     ██║   ██║  ██║╚██████╔╝███████║   ██║      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
-     ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
+████████╗██████╗ ██╗   ██╗███████╗████████╗████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗     
+╚══██╔══╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║     
+   ██║   ██████╔╝██║   ██║███████╗   ██║      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║     
+   ██║   ██╔══██��██║   ██║╚════██║   ██║      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║     
+   ██║   ██║  ██║╚██████╔╝███████║   ██║      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
+   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
     echo -e "${NC}"
 }
@@ -111,14 +111,12 @@ validate_email() {
 check_system_requirements() {
     log_section "🔍 ПРОВЕРКА СИСТЕМНЫХ ТРЕБОВАНИЙ"
     
-    # Проверка ОС
     if ! grep -q "Ubuntu" /etc/os-release; then
         log_error "Требуется Ubuntu Server"
         exit 1
     fi
     log_info "Обнаружена ОС Ubuntu"
     
-    # Проверка памяти
     MEM_MB=$(free -m | awk 'NR==2{print $2}')
     if [ "$MEM_MB" -lt 512 ]; then
         log_warn "Низкое количество памяти: ${MEM_MB}MB (минимум 512MB)"
@@ -126,16 +124,14 @@ check_system_requirements() {
         log_info "Доступная память: ${MEM_MB}MB"
     fi
     
-    # Проверка свободного места
     FREE_GB=$(df / | awk 'NR==2{print $4/1024/1024}' | cut -d'.' -f1)
     if [ "$FREE_GB" -lt 10 ]; then
         log_error "Недостаточно свободного места: ${FREE_GB}GB (требуется 10GB)"
         exit 1
     else
-        log_info "Свободное место: ${FREE_GB}GB"
+        log_info "Свободн��е место: ${FREE_GB}GB"
     fi
     
-    # Проверка интернета
     if ping -c 1 8.8.8.8 &> /dev/null; then
         log_info "Интернет соединение: OK"
     else
@@ -328,19 +324,19 @@ show_summary() {
     clear_screen
     log_section "📋 ПОДТВЕРЖДЕНИЕ ПАРАМЕТРОВ УСТАНОВКИ"
     
-    echo -e "${CYAN}IP адрес сервера:${NC}          $SERVER_IP"
-    echo -e "${CYAN}Доменное имя:${NC}}                $DOMAIN"
-    echo -e "${CYAN}Email адрес:${NC}                 $EMAIL"
-    echo -e "${CYAN}Количество пользователей:${NC}    $NUM_USERS"
-    echo -e "${CYAN}Хранение резервных копий:${NC}    $BACKUP_DAYS дней"
-    echo -e "${CYAN}Ротация логов:${NC}               $LOG_ROTATE_DAYS дней"
+    echo -e "${CYAN}IP адрес сервера:${NC}              $SERVER_IP"
+    echo -e "${CYAN}Доменное имя:${NC}                  $DOMAIN"
+    echo -e "${CYAN}Email адрес:${NC}                   $EMAIL"
+    echo -e "${CYAN}Количество пользователей:${NC}      $NUM_USERS"
+    echo -e "${CYAN}Хранение резервных копий:${NC}      $BACKUP_DAYS дней"
+    echo -e "${CYAN}Ротация логов:${NC}                 $LOG_ROTATE_DAYS дней"
     echo ""
     echo -e "${CYAN}Функции:${NC}"
-    echo -e "  DDoS защита:                  $([ "$ENABLE_DDOS" = true ] && echo "✓ Включена" || echo "✗ Отключена")"
-    echo -e "  Мониторинг метрик:            $([ "$ENABLE_MONITORING" = true ] && echo "✓ Включен" || echo "✗ Отключен")"
-    echo -e "  Резервное копирование:        $([ "$ENABLE_BACKUP" = true ] && echo "✓ Включено" || echo "✗ Отключено")"
-    echo -e "  Автоматическое восстановление: $([ "$ENABLE_RECOVERY" = true ] && echo "✓ Включено" || echo "✗ Отключено")"
-    echo -e "  Slack уведомления:            $([ "$ENABLE_SLACK" = true ] && echo "✓ Включены" || echo "✗ Отключены")"
+    echo -e "  DDoS защита:                    $([ "$ENABLE_DDOS" = true ] && echo "✓ Включена" || echo "✗ Отключена")"
+    echo -e "  Мониторинг метрик:              $([ "$ENABLE_MONITORING" = true ] && echo "✓ Включен" || echo "✗ Отключен")"
+    echo -e "  Резервное копирование:          $([ "$ENABLE_BACKUP" = true ] && echo "✓ Включено" || echo "✗ Отключено")"
+    echo -e "  Автоматическое восстановление:  $([ "$ENABLE_RECOVERY" = true ] && echo "✓ Включено" || echo "✗ Отключено")"
+    echo -e "  Slack уведомления:              $([ "$ENABLE_SLACK" = true ] && echo "✓ Включены" || echo "✗ Отключены")"
     echo ""
     
     while true; do
@@ -364,7 +360,7 @@ show_summary() {
 # ============================================
 
 create_directories() {
-    log_section "📁 СОЗДАНИЕ ДИРЕ��ТОРИЙ"
+    log_section "📁 СОЗДАНИЕ ДИРЕКТОРИЙ"
     
     INSTALL_DIR="/opt/trusttunnel"
     CONFIG_DIR="/etc/trusttunnel"
@@ -436,7 +432,7 @@ EOF
     systemctl daemon-reload
     systemctl enable trusttunnel-backup.timer 2>/dev/null || true
     
-    log_info "Система резервного копирования настроена"
+    log_info "Система резервного к��пирования настроена"
 }
 
 setup_monitoring() {
@@ -645,10 +641,10 @@ main() {
     clear_screen
     log_section "🎉 ДОБРО ПОЖАЛОВАТЬ В TRUSTTUNNEL AUTO-INSTALLER v$SCRIPT_VERSION"
     
-    echo "Этот скрипт поможет вам установить и настроить полн��стью"
+    echo "Этот скрипт поможет вам установить и настроить полностью"
     echo "функциональный VPN сервер TrustTunnel на Ubuntu Server 24.04"
     echo ""
-    echo "Установка займет несколько минут в зависимости от скорости интернета."
+    echo "Установка займ��т несколько минут в зависимости от скорости интернета."
     echo ""
     
     sleep 2
