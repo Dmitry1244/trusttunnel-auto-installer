@@ -1,379 +1,212 @@
 #!/usr/bin/env bash
-#############################################################
-# TrustTunnel Auto-Installer Advanced v4.4
-# Полная установка TrustTunnel (endpoint) на Ubuntu 24.04
-#############################################################
-
 set -euo pipefail
 
-# ============================================
-# ЦВЕТА И ПЕРЕМЕННЫЕ
-# ============================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-MAGENTA='\033[0;35m'
-NC='\033[0m'
+RED="\e[31m"; GREEN="\e[32m"; YELLOW="\e[33m"; BLUE="\e[34m"; RESET="\e[0m"
+log_info()  { echo -e "${BLUE}[INFO]${RESET} $*"; }
+log_ok()    { echo -e "${GREEN}[OK]${RESET}  $*"; }
+log_warn()  { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+log_err()   { echo -e "${RED}[ERR]${RESET}  $*" >&2; }
 
-SCRIPT_VERSION="4.4"
-INSTALL_LOG="/var/log/trusttunnel-install.log"
-
-SERVER_IP="${SERVER_IP:-$(curl -fsS ifconfig.me 2>/dev/null || echo 127.0.0.1)}"
-DOMAIN="${DOMAIN:-example.duckdns.org}"
-EMAIL="${EMAIL:-admin@example.com}"
-NUM_USERS="${NUM_USERS:-10}"
-VPN_PORT_DEFAULT="${VPN_PORT_DEFAULT:-443}"
-VPN_PORT="${VPN_PORT:-$VPN_PORT_DEFAULT}"
-
-INSTALL_DIR="/opt/trusttunnel"
-BIN_DIR="${INSTALL_DIR}/bin"
-CONFIG_DIR="${INSTALL_DIR}/config"
-CERTS_DIR="${INSTALL_DIR}/certs"
-LOG_DIR="/var/log/trusttunnel"
-BACKUP_DIR="/var/backups/trusttunnel"
-SCRIPTS_DIR="${INSTALL_DIR}/scripts"
-
-ENDPOINT_BIN="${BIN_DIR}/trusttunnel_endpoint"
-
-# ============================================
-# ЛОГИРОВАНИЕ
-# ============================================
-log_info()   { echo -e "${GREEN}[✓]${NC} $1" | tee -a "$INSTALL_LOG"; }
-log_error()  { echo -e "${RED}[✗]${NC} $1" | tee -a "$INSTALL_LOG" >&2; }
-log_warn()   { echo -e "${YELLOW}[⚠]${NC} $1" | tee -a "$INSTALL_LOG"; }
-log_section() {
-  echo "" | tee -a "$INSTALL_LOG"
-  echo -e "${BLUE}╔════════════════════════════════════════════════╗${NC}" | tee -a "$INSTALL_LOG"
-  echo -e "${BLUE}║${NC} $1" | tee -a "$INSTALL_LOG"
-  echo -e "${BLUE}╚════════════════════════════════════════════════╝${NC}" | tee -a "$INSTALL_LOG"
-  echo "" | tee -a "$INSTALL_LOG"
-}
-
-on_error() {
-  local exit_code=$?
-  log_error "Скрипт завершился с ошибкой (код: ${exit_code}). Смотри лог: ${INSTALL_LOG}"
-  exit "$exit_code"
-}
-trap on_error ERR
-
-clear_screen() {
-  clear || true
-  echo -e "${MAGENTA}"
-  cat << 'BANNER'
-████████╗██████╗ ██╗   ██╗███████╗████████╗████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
-╚══██╔══╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
-   ██║   ██████╔╝██║   ██║███████╗   ██║      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
-   ██║   ██╔══██╗██║   ██║╚════██║   ██║      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
-   ██║   ██║  ██║╚██████╔╝███████║   ██║      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
-   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
-BANNER
-  echo -e "${NC}"
-}
-
-# ============================================
-# ПРОВЕРКИ
-# ============================================
-check_root() {
-  if [[ ${EUID} -ne 0 ]]; then
-    log_error "Требуются права root"
+require_root() {
+  if [[ "$EUID" -ne 0 ]]; then
+    log_err "Запустите скрипт от root: sudo bash $0"
     exit 1
   fi
 }
 
-check_system() {
-  log_section "ПРОВЕРКА СИСТЕМЫ"
-  if ! grep -q 'Ubuntu' /etc/os-release; then
-    log_error "Требуется Ubuntu Server"
-    exit 1
-  fi
-  if ! grep -q 'VERSION_ID="24.04"' /etc/os-release; then
-    log_warn "Скрипт рассчитан на Ubuntu 24.04 (продолжаю, но возможны отличия)"
+pause() { read -rp "Нажмите Enter для продолжения..."; }
+
+ask_input() {
+  local prompt varname default value
+  prompt="$1"; varname="$2"; default="${3:-}"
+  if [[ -n "$default" ]]; then
+    read -rp "$prompt [$default]: " value || true
+    value="${value:-$default}"
   else
-    log_info "ОС: Ubuntu 24.04"
+    while true; do
+      read -rp "$prompt: " value || true
+      [[ -n "$value" ]] && break
+      log_warn "Поле не может быть пустым."
+    done
   fi
+  printf -v "$varname" '%s' "$value"
 }
 
-# ============================================
-# ИНТЕРАКТИВНЫЙ ВВОД
-# ============================================
-prompt_parameters() {
-  clear_screen
-  log_section "⚙️ КОНФИГУРАЦИЯ ПАРАМЕТРОВ"
-
-  read -r -p " IP адрес сервера [$SERVER_IP]: " INPUT_IP
-  SERVER_IP="${INPUT_IP:-$SERVER_IP}"
-
-  read -r -p " Доменное имя [$DOMAIN]: " INPUT_DOMAIN
-  DOMAIN="${INPUT_DOMAIN:-$DOMAIN}"
-
-  read -r -p " Email (для Let's Encrypt) [$EMAIL]: " INPUT_EMAIL
-  EMAIL="${INPUT_EMAIL:-$EMAIL}"
-
-  read -r -p " Порт VPN [$VPN_PORT_DEFAULT]: " INPUT_PORT
-  VPN_PORT="${INPUT_PORT:-$VPN_PORT_DEFAULT}"
-
-  read -r -p " Количество пользователей [$NUM_USERS]: " INPUT_USERS
-  NUM_USERS="${INPUT_USERS:-$NUM_USERS}"
-
-  echo ""
-  read -r -p "Все верно? (y/n) [y]: " CONFIRM
-  [[ "${CONFIRM:-y}" =~ ^[Yy]$ ]] || exit 0
+enable_bbr() {
+  log_info "Включаю BBR..."
+  grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf || echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+  grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf || echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+  sysctl -p >/dev/null 2>&1 || true
+  log_ok "BBR включён."
 }
 
-# ============================================
-# ДИРЕКТОРИИ
-# ============================================
-create_directories() {
-  log_section "СОЗДАНИЕ ДИРЕКТОРИЙ"
-  mkdir -p \
-    "$INSTALL_DIR" \
-    "$BIN_DIR" \
-    "$CONFIG_DIR" \
-    "$CERTS_DIR" \
-    "$LOG_DIR" \
-    "$BACKUP_DIR" \
-    "$SCRIPTS_DIR"
-  chmod 700 "$CERTS_DIR"
-  log_info "Директории созданы"
-}
-
-# ============================================
-# ОБНОВЛЕНИЕ СИСТЕМЫ
-# ============================================
 update_system() {
-  log_section "ОБНОВЛЕНИЕ СИСТЕМЫ"
-  apt-get update -qq
-  apt-get upgrade -y -qq
-  log_info "Система обновлена"
+  log_info "Обновляю систему и устанавливаю зависимости..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get upgrade -y
+  apt-get install -y git curl wget tar ufw fail2ban certbot cron openssl
+  log_ok "Система обновлена, пакеты установлены."
 }
 
-# ============================================
-# УСТАНОВКА ЗАВИСИМОСТЕЙ
-# ============================================
-install_dependencies() {
-  log_section "УСТАНОВКА ЗАВИСИМОСТЕЙ"
-  apt-get install -y -qq \
-    curl wget git jq \
-    openssl ca-certificates \
-    net-tools htop nano \
-    ufw fail2ban \
-    certbot \
-    nginx
-  log_info "Зависимости установлены"
+configure_ufw() {
+  local port="$1"
+  log_info "Настраиваю UFW..."
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow 22/tcp
+  ufw allow "${port}"/tcp
+  ufw allow "${port}"/udp
+  ufw deny 80/tcp || true
+  yes | ufw enable
+  log_ok "UFW настроен (SSH, порт ${port}/tcp+udp)."
 }
 
-# ============================================
-# КОНФИГУРАЦИЯ ЯДРА + базовая защита
-# ============================================
-configure_kernel() {
-  log_section "⚙️ НАСТРОЙКА ЯДРА (BBR) И БАЗОВАЯ СЕТЕВАЯ ЗАЩИТА"
-  cat > /etc/sysctl.d/99-trusttunnel.conf << 'EOF'
-# BBR
-net.ipv4.tcp_congestion_control=bbr
-net.core.default_qdisc=fq
-
-# SYN Flood
-net.ipv4.tcp_syncookies=1
-net.ipv4.tcp_max_syn_backlog=4096
-net.ipv4.tcp_synack_retries=2
-net.ipv4.tcp_syn_retries=2
-
-# IP Spoofing
-net.ipv4.conf.all.rp_filter=1
-net.ipv4.conf.default.rp_filter=1
-
-# Network buffers
-net.core.netdev_max_backlog=5000
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-  log_info "BBR и базовая защита включены"
-}
-
-# ============================================
-# FIREWALL
-# ============================================
-setup_firewall() {
-  log_section "НАСТРОЙКА FIREWALL"
-  ufw --force enable >/dev/null 2>&1 || true
-  ufw allow ssh >/dev/null 2>&1 || true
-  ufw allow 80/tcp >/dev/null 2>&1 || true
-  ufw allow "${VPN_PORT}/tcp" >/dev/null 2>&1 || true
-  ufw allow "${VPN_PORT}/udp" >/dev/null 2>&1 || true
-  log_info "UFW настроен"
-}
-
-# ============================================
-# FAIL2BAN
-# ============================================
-setup_fail2ban() {
-  log_section "НАСТРОЙКА FAIL2BAN"
-  cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-bantime = 3600
-findtime = 600
-maxretry = 5
-
+configure_fail2ban() {
+  log_info "Настраиваю Fail2Ban..."
+  cat >/etc/fail2ban/jail.local <<EOF
 [sshd]
 enabled = true
-port = ssh
+port    = ssh
 logpath = /var/log/auth.log
+maxretry = 5
 EOF
+  systemctl enable fail2ban
   systemctl restart fail2ban
-  systemctl enable fail2ban >/dev/null 2>&1 || true
-  log_info "Fail2Ban включён"
+  log_ok "Fail2Ban настроен."
 }
 
-# ============================================
-# LET'S ENCRYPT (standalone)
-# ============================================
-setup_certbot() {
-  log_section "ПОЛУЧЕНИЕ СЕРТИФИКАТА LET'S ENCRYPT"
-
-  systemctl stop nginx >/dev/null 2>&1 || true
-
-  certbot certonly --standalone \
-    -d "$DOMAIN" \
-    --non-interactive --agree-tos \
-    -m "$EMAIL" --keep-until-expiring
-
-  mkdir -p "$CERTS_DIR"
-  cp "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" "$CERTS_DIR/cert.pem"
-  cp "/etc/letsencrypt/live/$DOMAIN/privkey.pem"   "$CERTS_DIR/key.pem"
-  chmod 600 "$CERTS_DIR/key.pem"
-  chmod 644 "$CERTS_DIR/cert.pem"
-
-  log_info "Сертификаты скопированы в ${CERTS_DIR}"
-}
-
-# ============================================
-# УСТАНОВКА TRUSTTUNNEL (ОФИЦИАЛЬНЫЙ INSTALL.SH)
-# ============================================
 install_trusttunnel_binary() {
-  log_section "⬇️ УСТАНОВКА TRUSTTUNNEL ENDPOINT (OFFICIAL RELEASE)"
+  log_info "Устанавливаю TrustTunnel Endpoint из GitHub Releases..."
+  local base_dir="/opt/trusttunnel"
+  local bin_dir="${base_dir}/bin"
+  local cfg_dir="${base_dir}/config"
+  local cert_dir="${base_dir}/certs"
 
-  # Официальный инсталлер ставит в /opt/trusttunnel (или -o DIR)
-  curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh \
-    | sh -s - -o "$INSTALL_DIR"
+  mkdir -p "$bin_dir" "$cfg_dir" "$cert_dir" /var/log/trusttunnel
 
-  # Убедимся, что бинарники на месте
-  if [[ ! -x "$INSTALL_DIR/trusttunnel_endpoint" ]]; then
-    log_error "После установки не найден $INSTALL_DIR/trusttunnel_endpoint"
+  local tmp_tar="/tmp/trusttunnel-linux-x86_64.tar.gz"
+  wget -qO "$tmp_tar" "https://github.com/TrustTunnel/TrustTunnel/releases/latest/download/trusttunnel-linux-x86_64.tar.gz"
+  tar -xzf "$tmp_tar" -C /tmp
+  if [[ ! -f /tmp/trusttunnel_endpoint ]]; then
+    log_err "Не найден бинарник trusttunnel_endpoint в архиве."
     exit 1
   fi
-
-  # Приведём структуру к твоей (bin/)
-  install -m 755 "$INSTALL_DIR/trusttunnel_endpoint" "$ENDPOINT_BIN"
-  if [[ -x "$INSTALL_DIR/setup_wizard" ]]; then
-    install -m 755 "$INSTALL_DIR/setup_wizard" "$BIN_DIR/setup_wizard"
-  fi
-
-  log_info "TrustTunnel endpoint установлен: $ENDPOINT_BIN"
+  mv /tmp/trusttunnel_endpoint "${bin_dir}/trusttunnel_endpoint"
+  chmod +x "${bin_dir}/trusttunnel_endpoint"
+  rm -f "$tmp_tar"
+  log_ok "TrustTunnel Endpoint установлен в ${bin_dir}."
 }
 
-# ============================================
-# КОНФИГИ TRUSTTUNNEL (АКТУАЛЬНЫЙ ФОРМАТ)
-# ============================================
-create_trusttunnel_config() {
-  log_section "⚙️ СОЗДАНИЕ КОНФИГУРАЦИИ TRUSTTUNNEL"
-
-  # credentials.toml (формат [[client]] username/password)
-  local cred_file="${CONFIG_DIR}/credentials.toml"
+generate_credentials() {
+  log_info "Создаю 10 пользователей TrustTunnel..."
+  local cfg_dir="/opt/trusttunnel/config"
+  local cred_file="${cfg_dir}/credentials.toml"
   : > "$cred_file"
-
-  for i in $(seq 1 "$NUM_USERS"); do
-    local user="user$i"
+  for i in $(seq 1 10); do
+    local user="user${i}"
     local pass
-    pass="$(openssl rand -base64 18 | tr -d '\n' | tr -d '/' | tr -d '+' | head -c 18)"
-    cat >> "$cred_file" << EOF
+    pass="$(openssl rand -hex 12)"
+    cat >>"$cred_file" <<EOF
 [[client]]
 username = "${user}"
 password = "${pass}"
 
 EOF
+    log_info "Создан пользователь: ${user} / ${pass}"
   done
   chmod 600 "$cred_file"
-  log_info "Создано $NUM_USERS пользователей в ${cred_file}"
+  log_ok "Файл credentials.toml создан: ${cred_file}"
+}
 
-  # hosts.toml (актуальный формат [[main_hosts]])
-  cat > "${CONFIG_DIR}/hosts.toml" << EOF
-[[main_hosts]]
-hostname = "${DOMAIN}"
-cert_chain_path = "${CERTS_DIR}/cert.pem"
-private_key_path = "${CERTS_DIR}/key.pem"
-EOF
-  chmod 644 "${CONFIG_DIR}/hosts.toml"
+generate_vpn_config() {
+  local port="$1"
+  log_info "Создаю vpn.toml..."
+  local cfg_dir="/opt/trusttunnel/config"
+  cat >"${cfg_dir}/vpn.toml" <<EOF
+listen_address = "0.0.0.0:${port}"
+credentials_file = "/opt/trusttunnel/config/credentials.toml"
 
-  # vpn.toml (актуальные ключи)
-  cat > "${CONFIG_DIR}/vpn.toml" << EOF
-# Main endpoint settings
-listen_address = "0.0.0.0:${VPN_PORT}"
-
-# Credentials
-credentials_file = "${CONFIG_DIR}/credentials.toml"
-
-# Enable common listen protocols
 [listen_protocols]
+
 [listen_protocols.http1]
-upload_buffer_size = 32768
 
 [listen_protocols.http2]
-initial_connection_window_size = 8388608
-initial_stream_window_size = 131072
-max_concurrent_streams = 1000
-max_frame_size = 16384
-header_table_size = 65536
 
 [listen_protocols.quic]
-recv_udp_payload_size = 1350
-send_udp_payload_size = 1350
-initial_max_data = 104857600
-initial_max_stream_data_bidi_local = 1048576
-initial_max_stream_data_bidi_remote = 1048576
-initial_max_stream_data_uni = 1048576
-initial_max_streams_bidi = 4096
-initial_max_streams_uni = 4096
-max_connection_window = 25165824
-max_stream_window = 16777216
-disable_active_migration = true
-enable_early_data = true
-message_queue_capacity = 4096
 
-# Default forwarding: direct
 [forward_protocol]
 direct = {}
 EOF
-  chmod 644 "${CONFIG_DIR}/vpn.toml"
-
-  log_info "Конфигурация TrustTunnel создана: vpn.toml / hosts.toml / credentials.toml"
+  chmod 600 "${cfg_dir}/vpn.toml"
+  log_ok "vpn.toml создан: ${cfg_dir}/vpn.toml"
 }
 
-# ============================================
-# SYSTEMD СЕРВИС
-# ============================================
-create_systemd_service() {
-  log_section "СОЗДАНИЕ SYSTEMD СЕРВИСА"
+generate_hosts_config() {
+  local domain="$1"
+  log_info "Создаю hosts.toml..."
+  local cfg_dir="/opt/trusttunnel/config"
+  cat >"${cfg_dir}/hosts.toml" <<EOF
+[[main_hosts]]
+hostname = "${domain}"
+cert_chain_path = "/opt/trusttunnel/certs/cert.pem"
+private_key_path = "/opt/trusttunnel/certs/key.pem"
+EOF
+  chmod 600 "${cfg_dir}/hosts.toml"
+  log_ok "hosts.toml создан: ${cfg_dir}/hosts.toml"
+}
 
-  mkdir -p "$LOG_DIR"
-  touch "$LOG_DIR/endpoint.log"
-  chmod 640 "$LOG_DIR/endpoint.log"
+copy_le_certs() {
+  local domain="$1"
+  log_info "Копирую сертификаты Let's Encrypt в /opt/trusttunnel/certs..."
+  local src_dir="/etc/letsencrypt/live/${domain}"
+  local cert_dir="/opt/trusttunnel/certs"
+  if [[ ! -f "${src_dir}/fullchain.pem" || ! -f "${src_dir}/privkey.pem" ]]; then
+    log_err "Сертификаты Let's Encrypt для домена ${domain} не найдены в ${src_dir}."
+    return 1
+  fi
+  cp "${src_dir}/fullchain.pem" "${cert_dir}/cert.pem"
+  cp "${src_dir}/privkey.pem" "${cert_dir}/key.pem"
+  chmod 600 "${cert_dir}/cert.pem" "${cert_dir}/key.pem"
+  log_ok "Сертификаты скопированы."
+}
 
-  cat > /etc/systemd/system/trusttunnel.service << EOF
+obtain_initial_certificate() {
+  local domain="$1" email="$2"
+  if [[ -z "$domain" ]]; then
+    log_warn "Домен не указан — пропускаю получение сертификата."
+    return 0
+  fi
+  log_info "Получаю первоначальный сертификат Let's Encrypt для домена ${domain}..."
+  ufw allow 80/tcp || true
+  certbot certonly --standalone -d "$domain" --agree-tos -m "$email" --non-interactive || {
+    log_err "Не удалось получить сертификат для ${domain}."
+    ufw deny 80/tcp || true
+    return 1
+  }
+  ufw deny 80/tcp || true
+  copy_le_certs "$domain" || true
+  log_ok "Первоначальный сертификат обработан."
+}
+
+create_trusttunnel_service() {
+  log_info "Создаю systemd-сервис TrustTunnel..."
+  cat >/etc/systemd/system/trusttunnel.service <<'EOF'
 [Unit]
 Description=TrustTunnel Endpoint
-After=network-online.target
-Wants=network-online.target
+After=network.target
 
 [Service]
 Type=simple
 User=root
-WorkingDirectory=${INSTALL_DIR}
-ExecStart=${ENDPOINT_BIN} ${CONFIG_DIR}/vpn.toml ${CONFIG_DIR}/hosts.toml --logfile ${LOG_DIR}/endpoint.log --loglvl info
+WorkingDirectory=/opt/trusttunnel
+ExecStart=/opt/trusttunnel/bin/trusttunnel_endpoint \
+/opt/trusttunnel/config/vpn.toml \
+/opt/trusttunnel/config/hosts.toml \
+--loglvl info \
+--logfile /var/log/trusttunnel/trusttunnel.log
 Restart=always
-RestartSec=3
-StartLimitIntervalSec=60
-StartLimitBurst=10
+RestartSec=5
 LimitNOFILE=1000000
 
 [Install]
@@ -381,124 +214,44 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable trusttunnel.service >/dev/null 2>&1 || true
-
-  log_info "Systemd сервис trusttunnel.service создан"
+  systemctl enable trusttunnel.service
+  systemctl restart trusttunnel.service || true
+  log_ok "systemd-сервис TrustTunnel создан и включён."
 }
 
-# ============================================
-# БЭКАПЫ И ВОССТАНОВЛЕНИЕ
-# ============================================
-create_backup_and_restore() {
-  log_section "РЕЗЕРВНОЕ КОПИРОВАНИЕ И ВОССТАНОВЛЕНИЕ"
-
-  cat > "${SCRIPTS_DIR}/backup.sh" << 'EOF'
+create_trusttunnel_update_timer() {
+  log_info "Создаю таймер еженедельного обновления TrustTunnel..."
+  cat >/usr/local/sbin/update-trusttunnel.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-BACKUP_DIR="/var/backups/trusttunnel"
-DATE="$(date +%Y%m%d_%H%M%S)"
-BACKUP_FILE="${BACKUP_DIR}/trusttunnel_backup_${DATE}.tar.gz"
-mkdir -p "$BACKUP_DIR"
-tar -czf "$BACKUP_FILE" \
-  /opt/trusttunnel/config \
-  /opt/trusttunnel/certs \
-  /var/log/trusttunnel \
-  2>/dev/null || true
-find "$BACKUP_DIR" -name "trusttunnel_backup_*.tar.gz" -mtime +30 -delete || true
-echo "[$(date)] Backup created: $BACKUP_FILE"
-EOF
-  chmod +x "${SCRIPTS_DIR}/backup.sh"
 
-  cat > "${SCRIPTS_DIR}/restore-config.sh" << 'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-BACKUP_DIR="/var/backups/trusttunnel"
-LATEST_BACKUP="$(ls -1t "${BACKUP_DIR}"/trusttunnel_backup_*.tar.gz 2>/dev/null | head -n1 || true)"
-if [[ -z "${LATEST_BACKUP}" ]]; then
-  echo "No backups found in ${BACKUP_DIR}"
-  exit 1
+BASE_DIR="/opt/trusttunnel"
+BIN_DIR="${BASE_DIR}/bin"
+TMP_TAR="/tmp/trusttunnel-linux-x86_64.tar.gz"
+
+wget -qO "$TMP_TAR" "https://github.com/TrustTunnel/TrustTunnel/releases/latest/download/trusttunnel-linux-x86_64.tar.gz"
+tar -xzf "$TMP_TAR" -C /tmp
+if [[ -f /tmp/trusttunnel_endpoint ]]; then
+  mv /tmp/trusttunnel_endpoint "${BIN_DIR}/trusttunnel_endpoint"
+  chmod +x "${BIN_DIR}/trusttunnel_endpoint"
 fi
-echo "Restoring from backup: $LATEST_BACKUP"
-tar -xzf "$LATEST_BACKUP" -C /
-systemctl restart trusttunnel || true
-echo "Restore complete."
+rm -f "$TMP_TAR"
+/bin/systemctl restart trusttunnel.service || true
 EOF
-  chmod +x "${SCRIPTS_DIR}/restore-config.sh"
+  chmod +x /usr/local/sbin/update-trusttunnel.sh
 
-  cat > /etc/systemd/system/trusttunnel-backup.service << EOF
+  cat >/etc/systemd/system/update-trusttunnel.service <<'EOF'
 [Unit]
-Description=TrustTunnel Backup Service
-After=trusttunnel.service
+Description=Update TrustTunnel from GitHub Releases
 
 [Service]
 Type=oneshot
-ExecStart=${SCRIPTS_DIR}/backup.sh
+ExecStart=/usr/local/sbin/update-trusttunnel.sh
 EOF
 
-  cat > /etc/systemd/system/trusttunnel-backup.timer << 'EOF'
+  cat >/etc/systemd/system/update-trusttunnel.timer <<'EOF'
 [Unit]
-Description=Daily TrustTunnel Backup
-
-[Timer]
-OnCalendar=daily
-OnBootSec=10min
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable trusttunnel-backup.timer >/dev/null 2>&1 || true
-  systemctl start trusttunnel-backup.timer >/dev/null 2>&1 || true
-
-  log_info "Бэкапы и восстановление настроены"
-}
-
-# ============================================
-# АВТООБНОВЛЕНИЕ TRUSTTUNNEL (через official install.sh)
-# ============================================
-create_trusttunnel_update() {
-  log_section "♻️ АВТООБНОВЛЕНИЕ TRUSTTUNNEL (OFFICIAL)"
-
-  cat > "${SCRIPTS_DIR}/update-trusttunnel.sh" << EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-INSTALL_DIR="${INSTALL_DIR}"
-BIN_DIR="${BIN_DIR}"
-ENDPOINT_BIN="${ENDPOINT_BIN}"
-
-systemctl stop trusttunnel || true
-
-curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh \\
-  | sh -s - -o "\$INSTALL_DIR"
-
-# обновим бинарники в bin/
-install -m 755 "\$INSTALL_DIR/trusttunnel_endpoint" "\$ENDPOINT_BIN"
-if [[ -x "\$INSTALL_DIR/setup_wizard" ]]; then
-  install -m 755 "\$INSTALL_DIR/setup_wizard" "\$BIN_DIR/setup_wizard"
-fi
-
-systemctl start trusttunnel || true
-echo "TrustTunnel updated successfully."
-EOF
-  chmod +x "${SCRIPTS_DIR}/update-trusttunnel.sh"
-
-  cat > /etc/systemd/system/trusttunnel-update.service << EOF
-[Unit]
-Description=Weekly TrustTunnel Update
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=${SCRIPTS_DIR}/update-trusttunnel.sh
-EOF
-
-  cat > /etc/systemd/system/trusttunnel-update.timer << 'EOF'
-[Unit]
-Description=Weekly TrustTunnel Update Timer
+Description=Weekly TrustTunnel update
 
 [Timer]
 OnCalendar=weekly
@@ -509,235 +262,159 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable trusttunnel-update.timer >/dev/null 2>&1 || true
-  systemctl start trusttunnel-update.timer >/dev/null 2>&1 || true
-
-  log_info "Автообновление TrustTunnel включено"
+  systemctl enable update-trusttunnel.timer
+  systemctl start update-trusttunnel.timer
+  log_ok "Таймер обновления TrustTunnel настроен."
 }
 
-# ============================================
-# CLI
-# ============================================
-create_cli() {
-  log_section "СОЗДАНИЕ CLI ИНТЕРФЕЙСА"
-
-  cat > "${SCRIPTS_DIR}/trusttunnel-cli.sh" << 'EOF'
+create_system_update_reboot_timer() {
+  log_info "Создаю таймер еженедельного обновления системы и перезагрузки..."
+  cat >/usr/local/sbin/weekly-system-update-and-reboot.sh <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-INSTALL_DIR="/opt/trusttunnel"
-CONFIG_DIR="${INSTALL_DIR}/config"
-USERS_FILE="${CONFIG_DIR}/credentials.toml"
-SCRIPTS_DIR="${INSTALL_DIR}/scripts"
-LOG_DIR="/var/log/trusttunnel"
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get upgrade -y
+reboot
+EOF
+  chmod +x /usr/local/sbin/weekly-system-update-and-reboot.sh
 
-case "${1:-}" in
-  status)
-    systemctl status trusttunnel --no-pager
-    ;;
-  restart)
-    systemctl restart trusttunnel
-    echo "TrustTunnel restarted."
-    ;;
-  logs)
-    # endpoint пишет в файл + journal
-    echo "---- FILE LOG (${LOG_DIR}/endpoint.log) ----"
-    tail -n 200 "${LOG_DIR}/endpoint.log" 2>/dev/null || true
-    echo ""
-    echo "---- JOURNAL ----"
-    journalctl -u trusttunnel -n 200 --no-pager
-    ;;
-  users)
-    case "${2:-}" in
-      list)
-        echo "VPN Users:"
-        awk '
-          $0 ~ /^\[\[client\]\]$/ {in=1; u=""; p=""}
-          in && $1=="username" {gsub(/"|=/,""); u=$3}
-          in && $1=="password" {gsub(/"|=/,""); p=$3}
-          in && u!="" && p!="" {print u ":" p; in=0}
-        ' "$USERS_FILE" | nl -ba
-        ;;
-      add)
-        USERNAME="${3:-}"
-        if [[ -z "$USERNAME" ]]; then
-          echo "Usage: trusttunnel-cli users add <username>"
-          exit 1
-        fi
-        PASSWORD="$(openssl rand -base64 18 | tr -d '\n' | tr -d '/' | tr -d '+' | head -c 18)"
-        cat >> "$USERS_FILE" << EOF2
+  cat >/etc/systemd/system/weekly-system-update.service <<'EOF'
+[Unit]
+Description=Weekly system update and reboot
 
-[[client]]
-username = "${USERNAME}"
-password = "${PASSWORD}"
-EOF2
-        systemctl restart trusttunnel || true
-        echo "User created: ${USERNAME}"
-        echo "Password: ${PASSWORD}"
-        ;;
-      delete)
-        USERNAME="${3:-}"
-        if [[ -z "$USERNAME" ]]; then
-          echo "Usage: trusttunnel-cli users delete <username>"
-          exit 1
-        fi
-        # грубо, но работает: удаляем блок [[client]] где username совпал
-        tmp="$(mktemp)"
-        awk -v u="$USERNAME" '
-          BEGIN{keep=1; block=""}
-          {
-            if ($0 ~ /^\[\[client\]\]$/) {block=$0"\n"; keep=1; next}
-            if (block!="") {
-              block = block $0 "\n"
-              if ($0 ~ /username/ && $0 ~ u) {keep=0}
-              # конец блока - пустая строка или следующий [[client]]
-              if ($0 ~ /^$/) {
-                if (keep) printf "%s", block
-                block=""
-              }
-              next
-            }
-            print
-          }
-          END{
-            if (block!="") { if (keep) printf "%s", block }
-          }
-        ' "$USERS_FILE" > "$tmp"
-        mv "$tmp" "$USERS_FILE"
-        systemctl restart trusttunnel || true
-        echo "User deleted (if existed): ${USERNAME}"
-        ;;
-      *)
-        echo "Usage: trusttunnel-cli users {list|add|delete} [username]"
-        ;;
-    esac
-    ;;
-  backup)
-    "${SCRIPTS_DIR}/backup.sh"
-    ;;
-  restore)
-    "${SCRIPTS_DIR}/restore-config.sh"
-    ;;
-  update)
-    "${SCRIPTS_DIR}/update-trusttunnel.sh"
-    ;;
-  *)
-    echo "TrustTunnel CLI"
-    echo ""
-    echo "Commands:"
-    echo "  status                 - Service status"
-    echo "  restart                - Restart service"
-    echo "  logs                   - View logs"
-    echo "  users list             - List users"
-    echo "  users add <username>   - Add user"
-    echo "  users delete <username>- Delete user"
-    echo "  backup                 - Create backup"
-    echo "  restore                - Restore from last backup"
-    echo "  update                 - Update TrustTunnel"
-    ;;
-esac
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/weekly-system-update-and-reboot.sh
 EOF
 
-  chmod +x "${SCRIPTS_DIR}/trusttunnel-cli.sh"
-  ln -sf "${SCRIPTS_DIR}/trusttunnel-cli.sh" /usr/local/bin/trusttunnel-cli
-  log_info "CLI интерфейс создан (trusttunnel-cli)"
-}
+  cat >/etc/systemd/system/weekly-system-update.timer <<'EOF'
+[Unit]
+Description=Weekly system update and reboot timer
 
-# ============================================
-# ФИНАЛЬНАЯ КОНФИГУРАЦИЯ
-# ============================================
-final_setup() {
-  log_section "⚡ ФИНАЛЬНАЯ КОНФИГУРАЦИЯ"
+[Timer]
+OnCalendar=weekly
+Persistent=true
 
-  cat > /etc/logrotate.d/trusttunnel << 'EOF'
-/var/log/trusttunnel/*.log {
-  daily
-  rotate 14
-  compress
-  delaycompress
-  notifempty
-  create 0640 root root
-}
+[Install]
+WantedBy=timers.target
 EOF
 
-  cat > /etc/security/limits.d/99-trusttunnel.conf << 'EOF'
-* soft nofile 1000000
-* hard nofile 1000000
+  systemctl daemon-reload
+  systemctl enable weekly-system-update.timer
+  systemctl start weekly-system-update.timer
+  log_ok "Таймер обновления системы настроен."
+}
+
+create_certbot_renew_timer() {
+  log_info "Создаю сервис и таймер обновления сертификатов..."
+  cat >/usr/local/sbin/certbot-renew-with-ufw-and-copy.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+DOMAIN_FILE="/opt/trusttunnel/config/domain.txt"
+if [[ ! -f "$DOMAIN_FILE" ]]; then
+  exit 0
+fi
+DOMAIN="$(cat "$DOMAIN_FILE")"
+
+ufw allow 80/tcp || true
+certbot renew --quiet || true
+ufw deny 80/tcp || true
+
+SRC_DIR="/etc/letsencrypt/live/${DOMAIN}"
+CERT_DIR="/opt/trusttunnel/certs"
+
+if [[ -f "${SRC_DIR}/fullchain.pem" && -f "${SRC_DIR}/privkey.pem" ]]; then
+  cp "${SRC_DIR}/fullchain.pem" "${CERT_DIR}/cert.pem"
+  cp "${SRC_DIR}/privkey.pem" "${CERT_DIR}/key.pem"
+  chmod 600 "${CERT_DIR}/cert.pem" "${CERT_DIR}/key.pem"
+  /bin/systemctl restart trusttunnel.service || true
+fi
+EOF
+  chmod +x /usr/local/sbin/certbot-renew-with-ufw-and-copy.sh
+
+  cat >/etc/systemd/system/certbot-renew-ufw.service <<'EOF'
+[Unit]
+Description=Renew Let's Encrypt certificates with temporary UFW 80 open and copy to TrustTunnel
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/certbot-renew-with-ufw-and-copy.sh
 EOF
 
-  log_info "Финальная конфигурация завершена"
+  cat >/etc/systemd/system/certbot-renew-ufw.timer <<'EOF'
+[Unit]
+Description=Periodic certificate renewal with UFW 80 open
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable certbot-renew-ufw.timer
+  systemctl start certbot-renew-ufw.timer
+  log_ok "Таймер обновления сертификатов настроен."
 }
 
-# ============================================
-# ИТОГОВЫЙ ВЫВОД
-# ============================================
-show_summary() {
-  clear_screen
-  log_section "✅ УСТАНОВКА ЗАВЕРШЕНА УСПЕШНО!"
-  echo ""
-  echo -e "${CYAN}Информация о сервере:${NC}"
-  echo " IP адрес:       $SERVER_IP"
-  echo " Домен:          $DOMAIN"
-  echo " Порт VPN:       $VPN_PORT"
-  echo " Email:          $EMAIL"
-  echo " Пользователей:  $NUM_USERS"
-  echo ""
-  echo -e "${CYAN}Файлы:${NC}"
-  echo " ${CONFIG_DIR}/vpn.toml"
-  echo " ${CONFIG_DIR}/hosts.toml"
-  echo " ${CONFIG_DIR}/credentials.toml"
-  echo " Лог: ${LOG_DIR}/endpoint.log"
-  echo ""
-  echo -e "${CYAN}Команды управления:${NC}"
-  echo " trusttunnel-cli status"
-  echo " trusttunnel-cli users list"
-  echo " trusttunnel-cli users add john"
-  echo " trusttunnel-cli users delete john"
-  echo " trusttunnel-cli logs"
-  echo " trusttunnel-cli restart"
-  echo " trusttunnel-cli backup"
-  echo " trusttunnel-cli restore"
-  echo " trusttunnel-cli update"
-  echo ""
-  echo -e "${CYAN}Systemd:${NC}"
-  echo " systemctl status trusttunnel"
-  echo " systemctl restart trusttunnel"
-  echo ""
-  echo -e "${GREEN}Сервер готов к использованию!${NC}"
-  echo ""
-}
-
-# ============================================
-# MAIN
-# ============================================
 main() {
-  check_root
-  mkdir -p "$(dirname "$INSTALL_LOG")"
-  : > "$INSTALL_LOG"
+  require_root
 
-  clear_screen
-  log_section "TRUSTTUNNEL AUTO-INSTALLER v$SCRIPT_VERSION"
-  echo "Установка TrustTunnel Endpoint на Ubuntu Server 24.04"
-  echo ""
+  echo -e "${GREEN}=== Расширенный установщик TrustTunnel Endpoint ===${RESET}"
+  echo "Будет выполнено:"
+  echo " - обновление системы, установка зависимостей"
+  echo " - включение BBR"
+  echo " - настройка UFW, Fail2Ban"
+  echo " - установка TrustTunnel Endpoint из GitHub Releases (x86_64)"
+  echo " - создание 10 пользователей"
+  echo " - создание vpn.toml, hosts.toml, credentials.toml"
+  echo " - получение и копирование сертификатов Let's Encrypt"
+  echo " - создание systemd-сервиса TrustTunnel"
+  echo " - настройка еженедельных обновлений TrustTunnel, Ubuntu и сертификатов"
+  echo " - еженедельная перезагрузка сервера"
+  echo
+  pause
 
-  check_system
-  prompt_parameters
-  create_directories
+  local SERVER_IP DOMAIN EMAIL PORT
+  ask_input "Введите IP сервера" SERVER_IP "$(hostname -I | awk '{print $1}')"
+  ask_input "Введите доменное имя (FQDN, например vpn.example.com)" DOMAIN ""
+  ask_input "Введите email для Let's Encrypt" EMAIL "admin@${DOMAIN}"
+  ask_input "Введите порт для TrustTunnel (TCP+UDP)" PORT "443"
+
+  if [[ -z "$DOMAIN" ]]; then
+    log_err "Домен обязателен для работы TLS и Let's Encrypt."
+    exit 1
+  fi
+
+  echo "$DOMAIN" >/opt/trusttunnel-domain.tmp 2>/dev/null || true
+
   update_system
-  install_dependencies
-  configure_kernel
-  setup_firewall
-  setup_fail2ban
-  setup_certbot
+  enable_bbr
+  configure_ufw "$PORT"
+  configure_fail2ban
   install_trusttunnel_binary
-  create_trusttunnel_config
-  create_systemd_service
-  create_backup_and_restore
-  create_trusttunnel_update
-  create_cli
-  final_setup
+  generate_credentials
+  generate_vpn_config "$PORT"
+  generate_hosts_config "$DOMAIN"
 
-  systemctl restart trusttunnel.service
-  show_summary
+  mkdir -p /opt/trusttunnel/config
+  echo "$DOMAIN" >/opt/trusttunnel/config/domain.txt
+
+  obtain_initial_certificate "$DOMAIN" "$EMAIL" || log_warn "Сертификат не был успешно получен, проверьте настройки DNS и порт 80."
+
+  create_trusttunnel_service
+  create_trusttunnel_update_timer
+  create_system_update_reboot_timer
+  create_certbot_renew_timer
+
+  echo
+  log_ok "Установка TrustTunnel завершена."
+  echo "Проверьте статус сервиса: systemctl status trusttunnel"
+  echo "Проверьте таймеры: systemctl list-timers | grep trusttunnel"
 }
 
 main "$@"
