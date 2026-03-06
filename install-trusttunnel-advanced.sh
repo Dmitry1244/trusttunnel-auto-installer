@@ -1,33 +1,57 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
-echo "======================================"
-echo " TrustTunnel Advanced Auto Installer"
-echo "======================================"
+LOG_FILE="/var/log/trusttunnel-advanced-install.log"
 
-if [ "$EUID" -ne 0 ]; then
-  echo "Run as root"
-  exit
-fi
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-echo "[1/8] Updating system..."
+log()  { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; }
 
-apt update -y
-apt upgrade -y
+cleanup_on_error() {
+  err "Скрипт завершился с ошибкой на строке $1"
+  err "Смотри лог: $LOG_FILE"
+}
+trap 'cleanup_on_error $LINENO' ERR
 
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-echo "[2/8] Installing TrustTunnel..."
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    err "Запусти скрипт от root"
+    exit 1
+  fi
+}
 
-curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s -
+check_os() {
+  if [[ ! -f /etc/os-release ]]; then
+    err "Не удалось определить ОС"
+    exit 1
+  fi
 
-cp trusttunnel.service.template /etc/systemd/system/trusttunnel.service || true
-systemctl daemon-reload
-systemctl enable --now trusttunnel
+  . /etc/os-release
 
+  if [[ "${ID:-}" != "ubuntu" ]]; then
+    warn "Скрипт рассчитан на Ubuntu. Обнаружено: ${PRETTY_NAME:-unknown}"
+  else
+    ok "Обнаружена ОС: ${PRETTY_NAME}"
+  fi
+}
 
-echo "[3/8] Enabling BBR..."
+get_default_iface() {
+  ip route 2>/dev/null | awk '/default/ {print $5; exit}'
+}
 
-cat >/etc/sysctl.d/99-trusttunnel.conf <<EOF
+enable_sysctl_tuning() {
+  log "Настраиваю sysctl для VPN/сети..."
+
+  cat >/etc/sysctl.d/99-trusttunnel-advanced.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max=67108864
@@ -37,86 +61,193 @@ net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_mtu_probing=1
 EOF
 
-sysctl --system
+  sysctl --system >/dev/null
+  ok "BBR и сетевой тюнинг применены"
+}
 
+install_ufw() {
+  log "Устанавливаю и настраиваю UFW..."
 
-echo "[4/8] Installing UFW..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get install -y ufw
 
-apt install -y ufw
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
 
-ufw --force reset
+  ufw allow 22/tcp
+  ufw allow 80/tcp
+  ufw allow 443/tcp
 
-ufw default deny incoming
-ufw default allow outgoing
+  ufw logging on
+  ufw --force enable
 
-ufw allow 22/tcp
-ufw allow 80/tcp
-ufw allow 443/tcp
+  ok "UFW настроен"
+  ufw status verbose || true
+}
 
-ufw logging on
-ufw --force enable
+install_fail2ban() {
+  log "Устанавливаю и настраиваю Fail2Ban..."
 
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y fail2ban
 
-echo "[5/8] Installing Fail2Ban..."
-
-apt install -y fail2ban
-
-cat >/etc/fail2ban/jail.local <<EOF
+  cat >/etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
 bantime = 10m
 findtime = 10m
 maxretry = 5
 backend = systemd
+ignoreip = 127.0.0.1/8
 
 [sshd]
 enabled = true
 port = 22
+filter = sshd
 logpath = /var/log/auth.log
 maxretry = 5
 EOF
 
-systemctl enable fail2ban
-systemctl restart fail2ban
+  systemctl enable fail2ban
+  systemctl restart fail2ban
 
+  ok "Fail2Ban настроен"
+}
 
-echo "[6/8] Enabling TrustTunnel AntiDPI..."
+install_trusttunnel() {
+  log "Устанавливаю TrustTunnel..."
 
-CONFIG="/opt/trusttunnel/vpn.toml"
+  curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s -
 
-if [ -f "$CONFIG" ]; then
+  if [[ ! -d /opt/trusttunnel ]]; then
+    err "Папка /opt/trusttunnel не найдена после установки"
+    exit 1
+  fi
 
-if grep -q "antidpi" "$CONFIG"; then
-sed -i 's/antidpi.*/antidpi = true/' "$CONFIG"
-else
-echo "antidpi = true" >> "$CONFIG"
-fi
+  ok "TrustTunnel установлен в /opt/trusttunnel"
+}
 
-systemctl restart trusttunnel
+prepare_trusttunnel_service() {
+  log "Пробую подготовить systemd unit для TrustTunnel..."
 
-fi
+  local template="/opt/trusttunnel/trusttunnel.service.template"
+  local target="/etc/systemd/system/trusttunnel.service"
 
+  if [[ -f "$template" ]]; then
+    cp -f "$template" "$target"
+    systemctl daemon-reload
+    ok "Systemd unit подготовлен: $target"
+    warn "Сервис пока не запускаю. Сначала выполни setup_wizard вручную."
+  else
+    warn "Файл $template не найден. Возможно, он появится после setup_wizard."
+  fi
+}
 
-echo "[7/8] Applying network tuning..."
+enable_antidpi_if_possible() {
+  local config="/opt/trusttunnel/vpn.toml"
 
-INTERFACE=$(ip route | grep default | awk '{print $5}' | head -n1)
+  if [[ ! -f "$config" ]]; then
+    warn "Конфиг $config пока не найден. antidpi будет удобнее включить после setup_wizard."
+    return 0
+  fi
 
-ip link set dev $INTERFACE txqueuelen 10000 || true
+  log "Включаю antidpi в $config..."
 
-for q in /sys/class/net/$INTERFACE/queues/rx-*; do
-echo ffffffff > $q/rps_cpus || true
-done
+  cp -a "$config" "${config}.bak.$(date +%Y%m%d-%H%M%S)"
 
+  if grep -qE '^\s*antidpi\s*=' "$config"; then
+    sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$config"
+  else
+    printf '\nantidpi = true\n' >> "$config"
+  fi
 
-echo "[8/8] Done!"
+  ok "antidpi включён"
+}
 
-echo "--------------------------------------"
-echo "TrustTunnel installed and optimized"
-echo "--------------------------------------"
+apply_interface_tuning() {
+  local iface
+  iface="$(get_default_iface || true)"
 
-echo
-echo "Check service:"
-echo "systemctl status trusttunnel"
+  if [[ -z "${iface:-}" ]]; then
+    warn "Не удалось определить сетевой интерфейс по умолчанию. Пропускаю txqueuelen и RPS."
+    return 0
+  fi
 
-echo
-echo "Speed test:"
-echo "curl -s https://raw.githubusercontent.com/sivel/speedtest-cli/master/speedtest.py | python3"
+  log "Применяю тюнинг сетевого интерфейса: $iface"
+
+  ip link set dev "$iface" txqueuelen 10000 || warn "Не удалось выставить txqueuelen для $iface"
+
+  if compgen -G "/sys/class/net/$iface/queues/rx-*" > /dev/null; then
+    for q in /sys/class/net/"$iface"/queues/rx-*; do
+      echo ffffffff > "$q/rps_cpus" || true
+    done
+    ok "RPS включён для $iface"
+  else
+    warn "RX-очереди для $iface не найдены, RPS пропущен"
+  fi
+}
+
+show_summary() {
+  local iface
+  iface="$(get_default_iface || true)"
+
+  echo
+  echo "=================================================="
+  echo " Установка завершена"
+  echo "=================================================="
+  echo "Лог: $LOG_FILE"
+  echo
+  echo "Что уже сделано:"
+  echo "  - система обновлена"
+  echo "  - UFW установлен и включён"
+  echo "  - Fail2Ban установлен и включён"
+  echo "  - BBR и сетевой тюнинг применены"
+  echo "  - TrustTunnel установлен"
+  [[ -n "${iface:-}" ]] && echo "  - сетевой интерфейс: $iface"
+  echo
+  echo "Что сделать дальше вручную:"
+  echo "  1) cd /opt/trusttunnel"
+  echo "  2) ./setup_wizard"
+  echo
+  echo "После завершения setup_wizard выполни:"
+  echo "  sudo cp /opt/trusttunnel/trusttunnel.service.template /etc/systemd/system/trusttunnel.service"
+  echo "  sudo systemctl daemon-reload"
+  echo "  sudo systemctl enable --now trusttunnel"
+  echo
+  echo "Если после setup_wizard появится /opt/trusttunnel/vpn.toml,"
+  echo "можно включить antidpi так:"
+  echo "  sudo sed -i -E 's/^\\s*antidpi\\s*=.*/antidpi = true/' /opt/trusttunnel/vpn.toml || echo 'antidpi = true' | sudo tee -a /opt/trusttunnel/vpn.toml"
+  echo
+  echo "Проверки:"
+  echo "  sysctl net.ipv4.tcp_congestion_control"
+  echo "  ufw status verbose"
+  echo "  systemctl status fail2ban --no-pager"
+  echo "  systemctl status trusttunnel --no-pager"
+  echo "=================================================="
+}
+
+main() {
+  require_root
+  check_os
+
+  log "Старт установки. Лог пишется в $LOG_FILE"
+
+  export DEBIAN_FRONTEND=noninteractive
+
+  log "Обновляю систему..."
+  apt-get update -y
+  apt-get upgrade -y
+  ok "Система обновлена"
+
+  enable_sysctl_tuning
+  install_ufw
+  install_fail2ban
+  install_trusttunnel
+  prepare_trusttunnel_service
+  enable_antidpi_if_possible
+  apply_interface_tuning
+  show_summary
+}
+
+main "$@"
