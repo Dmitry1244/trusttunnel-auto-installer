@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-set -Euo pipefail
+set -Eeuo pipefail
 
-VERSION="1.0.0"
+VERSION="2.0.0"
 SCRIPT_NAME="TrustTunnel Interactive Installer"
+SCRIPT_FILE_NAME="install-trusttunnel-advanced.sh"
+RAW_URL="https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-advanced.sh"
 LOG_FILE="/var/log/trusttunnel-installer.log"
 MODE="main"
 
 if [[ "${1:-}" == "--post-setup" ]]; then
   MODE="post"
 fi
+
+export TERM="${TERM:-xterm-256color}"
 
 if [[ -t 1 ]]; then
   RED='\033[0;31m'
@@ -31,6 +35,15 @@ ok()   { echo -e "${GREEN}[ OK ]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()  { echo -e "${RED}[ERR ]${NC} $*"; }
 
+on_unexpected_error() {
+  local exit_code="$?"
+  local line_no="$1"
+  err "Непредвиденная ошибка на строке ${line_no}. Код выхода: ${exit_code}"
+  err "Смотри лог: ${LOG_FILE}"
+  exit "$exit_code"
+}
+trap 'on_unexpected_error $LINENO' ERR
+
 banner() {
   clear 2>/dev/null || true
   echo -e "${CYAN}${BOLD}"
@@ -43,13 +56,15 @@ banner() {
    ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
   echo -e "${NC}${BOLD}${SCRIPT_NAME} v${VERSION}${NC}"
+  echo -e "${BOLD}ОТ GREAT DIMITRIUS${NC}"
   echo "Лог: $LOG_FILE"
   echo
 }
 
 require_root() {
   if [[ ${EUID} -ne 0 ]]; then
-    err "Запусти скрипт от root: sudo bash $0"
+    err "Запусти скрипт от root"
+    echo "Пример: sudo bash ${SCRIPT_FILE_NAME}"
     exit 1
   fi
 }
@@ -80,9 +95,9 @@ handle_step_failure() {
   err "Шаг завершился с ошибкой: $step_name"
   echo
   echo "Что можно сделать дальше:"
-  echo "  1) исправить проблему вручную и продолжить"
-  echo "  2) пропустить этот шаг"
-  echo "  3) прервать установку"
+  echo "  1) исправить проблему вручную и повторить"
+  echo "  2) пропустить шаг"
+  echo "  3) завершить установку"
   echo
   local answer
   while true; do
@@ -117,7 +132,7 @@ run_step() {
   fi
 
   if handle_step_failure "$step_name"; then
-    log "Повтори шаг после ручного исправления: $step_name"
+    log "Повтор шага: $step_name"
     if "$fn"; then
       ok "Шаг выполнен после повтора: $step_name"
       return 0
@@ -150,11 +165,8 @@ check_os() {
     ok "Обнаружена ОС: ${PRETTY_NAME}"
   fi
 
-  command -v systemctl >/dev/null 2>&1 || {
-    err "systemctl не найден"
-    return 1
-  }
-
+  command -v systemctl >/dev/null 2>&1 || { err "systemctl не найден"; return 1; }
+  command -v bash >/dev/null 2>&1 || { err "bash не найден"; return 1; }
   return 0
 }
 
@@ -165,7 +177,7 @@ update_system() {
 
 install_base_packages() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y curl ca-certificates ufw fail2ban iproute2 gawk sed grep coreutils procps
+  apt-get install -y curl ca-certificates ufw fail2ban iproute2 gawk sed grep coreutils procps iputils-ping
 
   command -v curl >/dev/null 2>&1 || return 1
   command -v ufw >/dev/null 2>&1 || return 1
@@ -187,21 +199,18 @@ net.ipv4.tcp_mtu_probing=1
 EOF_SYSCTL
 
   sysctl --system >/dev/null
-
   [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] || return 1
   [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] || return 1
 }
 
 configure_ufw() {
-  ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-  ufw allow 22/tcp
-  ufw allow 80/tcp
-  ufw allow 443/tcp
-  ufw logging on
-  ufw --force enable
-
+  ufw allow 22/tcp >/dev/null 2>&1 || true
+  ufw allow 80/tcp >/dev/null 2>&1 || true
+  ufw allow 443/tcp >/dev/null 2>&1 || true
+  ufw logging on >/dev/null 2>&1 || true
+  ufw --force enable >/dev/null 2>&1 || true
   ufw status | grep -q "Status: active"
 }
 
@@ -210,12 +219,9 @@ _disable_ping_file() {
   local tmp
   tmp="$(mktemp)"
 
-  if [[ ! -f "$file" ]]; then
-    rm -f "$tmp"
-    return 1
-  fi
+  [[ -f "$file" ]] || { rm -f "$tmp"; return 1; }
 
-  cp -a "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -an "$file" "${file}.bak.initial" >/dev/null 2>&1 || true
 
   awk '
     /# ok icmp codes for INPUT/ { print; block=7; next }
@@ -253,8 +259,9 @@ disable_ping() {
 
   if [[ $changed -eq 1 ]]; then
     ok "Ping отключён через UFW before.rules"
+  else
+    warn "Не удалось изменить before.rules или изменения уже были внесены"
   fi
-
   return 0
 }
 
@@ -275,15 +282,57 @@ logpath = /var/log/auth.log
 maxretry = 5
 EOF_F2B
 
-  systemctl enable fail2ban >/dev/null 2>&1
+  systemctl enable fail2ban >/dev/null 2>&1 || true
   systemctl restart fail2ban
   systemctl is-active --quiet fail2ban
 }
 
 install_trusttunnel() {
-  curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s -
+  if [[ -x /opt/trusttunnel/trusttunnel_endpoint ]]; then
+    ok "TrustTunnel уже установлен, пропускаю повторную установку"
+    return 0
+  fi
 
+  curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s -
   [[ -x /opt/trusttunnel/trusttunnel_endpoint ]]
+}
+
+show_port_conflicts() {
+  local found=0
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    echo "  $line"
+    found=1
+  done < <(ss -tulpn 2>/dev/null | grep -E ':(80|443)\s' || true)
+
+  [[ $found -eq 1 ]]
+}
+
+prepare_for_wizard_ports() {
+  local had_trusttunnel=0
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^trusttunnel\.service'; then
+    if systemctl is-active --quiet trusttunnel; then
+      warn "Сервис trusttunnel сейчас запущен. Для setup_wizard его лучше временно остановить."
+      if confirm_step "Остановить trusttunnel перед setup_wizard?"; then
+        systemctl stop trusttunnel
+        had_trusttunnel=1
+        ok "trusttunnel остановлен"
+      fi
+    fi
+  fi
+
+  if show_port_conflicts; then
+    warn "Порты 80/443 уже кем-то заняты. setup_wizard может не пройти проверку или Let's Encrypt."
+    echo
+    ss -tulpn 2>/dev/null | grep -E ':(80|443)\s' || true
+    echo
+    if ! confirm_step "Продолжить запуск setup_wizard несмотря на занятые порты?"; then
+      return 1
+    fi
+  fi
+
+  return 0
 }
 
 run_setup_wizard() {
@@ -292,37 +341,47 @@ run_setup_wizard() {
     return 1
   fi
 
+  if [[ ! -e /dev/tty ]]; then
+    err "TTY не найден. setup_wizard нужно запускать в обычном интерактивном терминале."
+    return 1
+  fi
+
+  prepare_for_wizard_ports || return 1
+
   echo
   echo "Сейчас запустится интерактивный setup_wizard TrustTunnel."
-  echo "Во время wizard не закрывай терминал."
+  echo "Он будет запущен напрямую через /dev/tty, без вывода через tee."
+  echo "Если экран моргал раньше, это исправлено этим способом."
   echo
   pause
 
+  local rc=0
   (
-    cd /opt/trusttunnel
-    ./setup_wizard
-  )
+    cd /opt/trusttunnel || exit 1
+    export TERM="${TERM:-xterm-256color}"
+    stty sane < /dev/tty > /dev/tty 2>/dev/tty || true
+    ./setup_wizard < /dev/tty > /dev/tty 2>&1
+  ) || rc=$?
 
-  [[ -f /opt/trusttunnel/vpn.toml ]] || {
-    err "После setup_wizard не найден /opt/trusttunnel/vpn.toml"
+  stty sane < /dev/tty > /dev/tty 2>/dev/tty || true
+  echo
+
+  [[ $rc -eq 0 ]] || {
+    err "setup_wizard завершился с ошибкой"
     return 1
   }
 
-  [[ -f /opt/trusttunnel/hosts.toml ]] || {
-    err "После setup_wizard не найден /opt/trusttunnel/hosts.toml"
-    return 1
-  }
+  [[ -f /opt/trusttunnel/vpn.toml ]] || { err "После setup_wizard не найден /opt/trusttunnel/vpn.toml"; return 1; }
+  [[ -f /opt/trusttunnel/hosts.toml ]] || { err "После setup_wizard не найден /opt/trusttunnel/hosts.toml"; return 1; }
+  return 0
 }
 
 configure_antidpi() {
   local config="/opt/trusttunnel/vpn.toml"
 
-  [[ -f "$config" ]] || {
-    err "$config не найден"
-    return 1
-  }
+  [[ -f "$config" ]] || { err "$config не найден"; return 1; }
 
-  cp -a "$config" "${config}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -an "$config" "${config}.bak.initial" >/dev/null 2>&1 || true
 
   if grep -qE '^\s*antidpi\s*=' "$config"; then
     sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$config"
@@ -377,27 +436,38 @@ apply_interface_tuning() {
   return 0
 }
 
+check_trusttunnel_port_conflicts() {
+  local lines
+  lines="$(ss -tulpn 2>/dev/null | grep -E ':(443)\s' || true)"
+
+  if [[ -z "$lines" ]]; then
+    return 0
+  fi
+
+  if echo "$lines" | grep -q 'trusttunnel_endpoint'; then
+    return 0
+  fi
+
+  warn "Порт 443 уже занят другим процессом:"
+  echo "$lines"
+  return 1
+}
+
 post_setup_finalize() {
-  [[ -x /opt/trusttunnel/trusttunnel_endpoint ]] || {
-    err "Не найден /opt/trusttunnel/trusttunnel_endpoint"
-    return 1
-  }
-
-  [[ -f /opt/trusttunnel/vpn.toml ]] || {
-    err "Не найден /opt/trusttunnel/vpn.toml"
-    return 1
-  }
-
-  [[ -f /opt/trusttunnel/hosts.toml ]] || {
-    err "Не найден /opt/trusttunnel/hosts.toml"
-    return 1
-  }
+  [[ -x /opt/trusttunnel/trusttunnel_endpoint ]] || { err "Не найден /opt/trusttunnel/trusttunnel_endpoint"; return 1; }
+  [[ -f /opt/trusttunnel/vpn.toml ]] || { err "Не найден /opt/trusttunnel/vpn.toml"; return 1; }
+  [[ -f /opt/trusttunnel/hosts.toml ]] || { err "Не найден /opt/trusttunnel/hosts.toml"; return 1; }
 
   run_step "Включить antidpi = true" configure_antidpi
   run_step "Создать systemd unit trusttunnel.service" write_service_unit
 
+  if ! check_trusttunnel_port_conflicts; then
+    err "Сначала освободи порт 443, затем запусти post-setup ещё раз"
+    return 1
+  fi
+
   systemctl daemon-reload
-  systemctl enable trusttunnel >/dev/null 2>&1
+  systemctl enable trusttunnel >/dev/null 2>&1 || true
   systemctl restart trusttunnel
 
   sleep 2
@@ -420,14 +490,14 @@ main_summary() {
   echo "============================================================"
   echo "Базовая установка завершена."
   echo
-  echo "Если ты уже прошёл setup_wizard и созданы vpn.toml и hosts.toml,"
-  echo "можно сразу выполнить post-setup этим же файлом:"
+  echo "Если setup_wizard уже пройден и созданы vpn.toml и hosts.toml,"
+  echo "выполни post-setup одной из команд:"
   echo
-  echo "  sudo bash $0 --post-setup"
+  echo "Локальный запуск, если файл сохранён на сервере:"
+  echo "  sudo bash ./install-trusttunnel-advanced.sh --post-setup"
   echo
-  echo "Если запускаешь скрипт через GitHub raw URL, post-setup потом так:"
-  echo
-  echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-interactive-final.sh) --post-setup"
+  echo "Запуск через GitHub raw URL:"
+  echo "  bash <(curl -fsSL ${RAW_URL}) --post-setup"
   echo
   echo "Проверки:"
   echo "  sysctl net.ipv4.tcp_congestion_control"
