@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 LOG_FILE="/var/log/trusttunnel-advanced-install.log"
+POST_SETUP_SCRIPT="/root/trusttunnel-post-setup.sh"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -48,6 +49,14 @@ get_default_iface() {
   ip route 2>/dev/null | awk '/default/ {print $5; exit}'
 }
 
+update_system() {
+  log "Обновляю систему..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get upgrade -y
+  ok "Система обновлена"
+}
+
 enable_sysctl_tuning() {
   log "Настраиваю sysctl для VPN/сети..."
 
@@ -69,7 +78,6 @@ install_ufw() {
   log "Устанавливаю и настраиваю UFW..."
 
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
   apt-get install -y ufw
 
   ufw --force reset
@@ -84,7 +92,6 @@ install_ufw() {
   ufw --force enable
 
   ok "UFW настроен"
-  ufw status verbose || true
 }
 
 install_fail2ban() {
@@ -115,25 +122,25 @@ EOF
   ok "Fail2Ban настроен"
 }
 
-disable_ping() {
-  log "Отключаю ping (ICMP echo-request)..."
+disable_ping_ufw() {
+  log "Отключаю ping через UFW..."
 
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y iptables-persistent
-
-  if ! iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null; then
-    iptables -I INPUT 1 -p icmp --icmp-type echo-request -j DROP
+  if [[ ! -f /etc/ufw/before.rules ]]; then
+    warn "/etc/ufw/before.rules не найден, пропускаю отключение ping"
+    return 0
   fi
 
-  if ! ip6tables -C INPUT -p ipv6-icmp --icmpv6-type echo-request -j DROP 2>/dev/null; then
-    ip6tables -I INPUT 1 -p ipv6-icmp --icmpv6-type echo-request -j DROP
+  if grep -q "icmp-type echo-request -j DROP" /etc/ufw/before.rules 2>/dev/null; then
+    ok "Ping уже отключён в UFW"
+    return 0
   fi
 
-  mkdir -p /etc/iptables
-  iptables-save > /etc/iptables/rules.v4
-  ip6tables-save > /etc/iptables/rules.v6
+  cp -a /etc/ufw/before.rules "/etc/ufw/before.rules.bak.$(date +%Y%m%d-%H%M%S)"
 
-  ok "Ping отключён для IPv4 и IPv6"
+  sed -i '/# ok icmp codes for INPUT/,+7 s/ACCEPT/DROP/g' /etc/ufw/before.rules
+  ufw reload || true
+
+  ok "Ping отключён через UFW"
 }
 
 install_trusttunnel() {
@@ -149,7 +156,7 @@ install_trusttunnel() {
   ok "TrustTunnel установлен в /opt/trusttunnel"
 }
 
-prepare_trusttunnel_service() {
+prepare_trusttunnel_service_if_exists() {
   log "Пробую подготовить systemd unit для TrustTunnel..."
 
   local template="/opt/trusttunnel/trusttunnel.service.template"
@@ -159,31 +166,10 @@ prepare_trusttunnel_service() {
     cp -f "$template" "$target"
     systemctl daemon-reload
     ok "Systemd unit подготовлен: $target"
-    warn "Сервис пока не запускаю. Сначала выполни setup_wizard вручную."
+    warn "Сервис пока не запускаю. Сначала выполни setup_wizard, затем post-setup скрипт."
   else
-    warn "Файл $template не найден. Возможно, он появится после setup_wizard."
+    warn "Файл $template не найден. Это нормально, если он появится после setup_wizard."
   fi
-}
-
-enable_antidpi_if_possible() {
-  local config="/opt/trusttunnel/vpn.toml"
-
-  if [[ ! -f "$config" ]]; then
-    warn "Конфиг $config пока не найден. antidpi будет удобнее включить после setup_wizard."
-    return 0
-  fi
-
-  log "Включаю antidpi в $config..."
-
-  cp -a "$config" "${config}.bak.$(date +%Y%m%d-%H%M%S)"
-
-  if grep -qE '^\s*antidpi\s*=' "$config"; then
-    sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$config"
-  else
-    printf '\nantidpi = true\n' >> "$config"
-  fi
-
-  ok "antidpi включён"
 }
 
 apply_interface_tuning() {
@@ -209,13 +195,86 @@ apply_interface_tuning() {
   fi
 }
 
+create_post_setup_script() {
+  log "Создаю post-setup скрипт: $POST_SETUP_SCRIPT"
+
+  cat >"$POST_SETUP_SCRIPT" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG="/opt/trusttunnel/vpn.toml"
+TEMPLATE="/opt/trusttunnel/trusttunnel.service.template"
+SERVICE="/etc/systemd/system/trusttunnel.service"
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log()  { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+
+if [[ "${EUID}" -ne 0 ]]; then
+  err "Запусти скрипт от root"
+  exit 1
+fi
+
+log "Запуск TrustTunnel post-setup..."
+
+if [[ ! -d /opt/trusttunnel ]]; then
+  err "/opt/trusttunnel не найден"
+  exit 1
+fi
+
+if [[ ! -f "$TEMPLATE" ]]; then
+  err "$TEMPLATE не найден"
+  err "Сначала выполни: cd /opt/trusttunnel && ./setup_wizard"
+  exit 1
+fi
+
+cp -f "$TEMPLATE" "$SERVICE"
+systemctl daemon-reload
+ok "Systemd unit установлен"
+
+if [[ -f "$CONFIG" ]]; then
+  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+
+  if grep -qE '^\s*antidpi\s*=' "$CONFIG"; then
+    sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$CONFIG"
+  else
+    printf '\nantidpi = true\n' >> "$CONFIG"
+  fi
+
+  ok "antidpi включён"
+else
+  warn "$CONFIG не найден, antidpi пропущен"
+fi
+
+systemctl enable --now trusttunnel
+ok "TrustTunnel включён и запущен"
+
+echo
+echo "===== STATUS ====="
+systemctl status trusttunnel --no-pager || true
+echo
+echo "===== LAST LOGS ====="
+journalctl -u trusttunnel -n 50 --no-pager || true
+EOF
+
+  chmod +x "$POST_SETUP_SCRIPT"
+  ok "Post-setup скрипт создан"
+}
+
 show_summary() {
   local iface
   iface="$(get_default_iface || true)"
 
   echo
   echo "=================================================="
-  echo " Установка завершена"
+  echo " Основной installer завершён"
   echo "=================================================="
   echo "Лог: $LOG_FILE"
   echo
@@ -223,29 +282,22 @@ show_summary() {
   echo "  - система обновлена"
   echo "  - UFW установлен и включён"
   echo "  - Fail2Ban установлен и включён"
+  echo "  - ping отключён через UFW"
   echo "  - BBR и сетевой тюнинг применены"
-  echo "  - ping отключён"
   echo "  - TrustTunnel установлен"
+  echo "  - создан post-setup скрипт: $POST_SETUP_SCRIPT"
   [[ -n "${iface:-}" ]] && echo "  - сетевой интерфейс: $iface"
   echo
-  echo "Что сделать дальше вручную:"
+  echo "Что делать дальше:"
   echo "  1) cd /opt/trusttunnel"
   echo "  2) ./setup_wizard"
-  echo
-  echo "После завершения setup_wizard выполни:"
-  echo "  sudo cp /opt/trusttunnel/trusttunnel.service.template /etc/systemd/system/trusttunnel.service"
-  echo "  sudo systemctl daemon-reload"
-  echo "  sudo systemctl enable --now trusttunnel"
-  echo
-  echo "Если после setup_wizard появится /opt/trusttunnel/vpn.toml,"
-  echo "можно включить antidpi так:"
-  echo "  sudo sed -i -E 's/^\\s*antidpi\\s*=.*/antidpi = true/' /opt/trusttunnel/vpn.toml || echo 'antidpi = true' | sudo tee -a /opt/trusttunnel/vpn.toml"
+  echo "  3) sudo bash $POST_SETUP_SCRIPT"
   echo
   echo "Проверки:"
   echo "  sysctl net.ipv4.tcp_congestion_control"
-  echo "  ufw status verbose"
-  echo "  systemctl status fail2ban --no-pager"
-  echo "  systemctl status trusttunnel --no-pager"
+  echo "  sudo ufw status verbose"
+  echo "  sudo systemctl status fail2ban --no-pager"
+  echo "  sudo systemctl status trusttunnel --no-pager"
   echo "=================================================="
 }
 
@@ -255,21 +307,15 @@ main() {
 
   log "Старт установки. Лог пишется в $LOG_FILE"
 
-  export DEBIAN_FRONTEND=noninteractive
-
-  log "Обновляю систему..."
-  apt-get update -y
-  apt-get upgrade -y
-  ok "Система обновлена"
-
+  update_system
   enable_sysctl_tuning
   install_ufw
   install_fail2ban
-  disable_ping
+  disable_ping_ufw
   install_trusttunnel
-  prepare_trusttunnel_service
-  enable_antidpi_if_possible
+  prepare_trusttunnel_service_if_exists
   apply_interface_tuning
+  create_post_setup_script
   show_summary
 }
 
