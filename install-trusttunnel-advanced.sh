@@ -115,6 +115,27 @@ EOF
   ok "Fail2Ban настроен"
 }
 
+disable_ping() {
+  log "Отключаю ping (ICMP echo-request)..."
+
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y iptables-persistent
+
+  if ! iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null; then
+    iptables -I INPUT 1 -p icmp --icmp-type echo-request -j DROP
+  fi
+
+  if ! ip6tables -C INPUT -p ipv6-icmp --icmpv6-type echo-request -j DROP 2>/dev/null; then
+    ip6tables -I INPUT 1 -p ipv6-icmp --icmpv6-type echo-request -j DROP
+  fi
+
+  mkdir -p /etc/iptables
+  iptables-save > /etc/iptables/rules.v4
+  ip6tables-save > /etc/iptables/rules.v6
+
+  ok "Ping отключён для IPv4 и IPv6"
+}
+
 install_trusttunnel() {
   log "Устанавливаю TrustTunnel..."
 
@@ -203,6 +224,7 @@ show_summary() {
   echo "  - UFW установлен и включён"
   echo "  - Fail2Ban установлен и включён"
   echo "  - BBR и сетевой тюнинг применены"
+  echo "  - ping отключён"
   echo "  - TrustTunnel установлен"
   [[ -n "${iface:-}" ]] && echo "  - сетевой интерфейс: $iface"
   echo
@@ -243,6 +265,7 @@ main() {
   enable_sysctl_tuning
   install_ufw
   install_fail2ban
+  disable_ping
   install_trusttunnel
   prepare_trusttunnel_service
   enable_antidpi_if_possible
