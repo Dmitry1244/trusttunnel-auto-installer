@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 LOG_FILE="/var/log/trusttunnel-advanced-install.log"
 POST_SETUP_SCRIPT="/root/trusttunnel-post-setup.sh"
+AUTO_POST_SETUP_RUNNER="/root/trusttunnel-auto-post-setup-check.sh"
+AUTO_POST_SETUP_FLAG="/var/lib/trusttunnel-post-setup.done"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -173,7 +175,6 @@ prepare_trusttunnel_service_if_exists() {
 
     systemctl daemon-reload
     ok "Systemd unit подготовлен: $target"
-    warn "Сервис пока не запускаю. Сначала выполни setup_wizard, затем post-setup скрипт."
   else
     warn "Файл $template не найден. Это нормально, если он появится после setup_wizard."
   fi
@@ -213,6 +214,7 @@ CONFIG="/opt/trusttunnel/vpn.toml"
 HOSTS="/opt/trusttunnel/hosts.toml"
 TEMPLATE="/opt/trusttunnel/trusttunnel.service.template"
 SERVICE="/etc/systemd/system/trusttunnel.service"
+FLAG="/var/lib/trusttunnel-post-setup.done"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -230,6 +232,13 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
+mkdir -p /var/lib
+
+if [[ -f "$FLAG" ]]; then
+  ok "Post-setup уже был выполнен ранее"
+  exit 0
+fi
+
 log "Запуск TrustTunnel post-setup..."
 
 if [[ ! -d /opt/trusttunnel ]]; then
@@ -245,13 +254,13 @@ fi
 
 if [[ ! -f "$CONFIG" ]]; then
   err "$CONFIG не найден"
-  err "setup_wizard не завершён или не создал vpn.toml"
+  err "setup_wizard ещё не завершён или не создал vpn.toml"
   exit 1
 fi
 
 if [[ ! -f "$HOSTS" ]]; then
   err "$HOSTS не найден"
-  err "setup_wizard не завершён или не создал hosts.toml"
+  err "setup_wizard ещё не завершён или не создал hosts.toml"
   exit 1
 fi
 
@@ -266,12 +275,12 @@ if ! grep -q '^WorkingDirectory=/opt/trusttunnel$' "$SERVICE"; then
   fi
 fi
 
+cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+
 if grep -qE '^\s*antidpi\s*=' "$CONFIG"; then
-  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
   sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$CONFIG"
   ok "antidpi включён"
 else
-  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
   printf '\nantidpi = true\n' >> "$CONFIG"
   ok "antidpi добавлен"
 fi
@@ -284,6 +293,7 @@ sleep 2
 
 if systemctl is-active --quiet trusttunnel; then
   ok "TrustTunnel успешно запущен"
+  touch "$FLAG"
 else
   err "TrustTunnel не запустился"
   echo
@@ -300,17 +310,77 @@ else
   journalctl -u trusttunnel -n 50 --no-pager || true
   exit 1
 fi
-
-echo
-echo "===== STATUS ====="
-systemctl status trusttunnel --no-pager || true
-echo
-echo "===== LAST LOGS ====="
-journalctl -u trusttunnel -n 50 --no-pager || true
 EOF
 
   chmod +x "$POST_SETUP_SCRIPT"
   ok "Post-setup скрипт создан"
+}
+
+create_auto_post_setup_runner() {
+  log "Создаю авто-проверку post-setup: $AUTO_POST_SETUP_RUNNER"
+
+  cat >"$AUTO_POST_SETUP_RUNNER" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+CONFIG="/opt/trusttunnel/vpn.toml"
+HOSTS="/opt/trusttunnel/hosts.toml"
+FLAG="/var/lib/trusttunnel-post-setup.done"
+POST="/root/trusttunnel-post-setup.sh"
+LOG="/var/log/trusttunnel-auto-post-setup.log"
+
+exec >>"$LOG" 2>&1
+
+echo "[$(date '+%F %T')] check started"
+
+if [[ -f "$FLAG" ]]; then
+  echo "[$(date '+%F %T')] already completed"
+  exit 0
+fi
+
+if [[ -f "$CONFIG" && -f "$HOSTS" ]]; then
+  echo "[$(date '+%F %T')] config detected, running post-setup"
+  bash "$POST"
+else
+  echo "[$(date '+%F %T')] config not ready yet"
+fi
+EOF
+
+  chmod +x "$AUTO_POST_SETUP_RUNNER"
+  ok "Авто-проверка создана"
+}
+
+create_auto_post_setup_systemd() {
+  log "Создаю systemd unit и timer для автозапуска post-setup..."
+
+  cat >/etc/systemd/system/trusttunnel-auto-post-setup.service <<'EOF'
+[Unit]
+Description=Auto run TrustTunnel post-setup when config files appear
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/root/trusttunnel-auto-post-setup-check.sh
+EOF
+
+  cat >/etc/systemd/system/trusttunnel-auto-post-setup.timer <<'EOF'
+[Unit]
+Description=Periodic check for TrustTunnel setup completion
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30sec
+Unit=trusttunnel-auto-post-setup.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now trusttunnel-auto-post-setup.timer
+
+  ok "Таймер авто-post-setup включён"
 }
 
 show_summary() {
@@ -331,17 +401,18 @@ show_summary() {
   echo "  - BBR и сетевой тюнинг применены"
   echo "  - TrustTunnel установлен"
   echo "  - создан post-setup скрипт: $POST_SETUP_SCRIPT"
+  echo "  - включён авто-запуск post-setup после setup_wizard"
   [[ -n "${iface:-}" ]] && echo "  - сетевой интерфейс: $iface"
   echo
-  echo "Что делать дальше:"
-  echo "  1) cd /opt/trusttunnel"
-  echo "  2) ./setup_wizard"
-  echo "  3) sudo bash $POST_SETUP_SCRIPT"
+  echo "Теперь тебе нужно только:"
+  echo "  cd /opt/trusttunnel"
+  echo "  ./setup_wizard"
+  echo
+  echo "После появления vpn.toml и hosts.toml post-setup запустится автоматически."
   echo
   echo "Проверки:"
-  echo "  sysctl net.ipv4.tcp_congestion_control"
-  echo "  sudo ufw status verbose"
-  echo "  sudo systemctl status fail2ban --no-pager"
+  echo "  sudo systemctl status trusttunnel-auto-post-setup.timer --no-pager"
+  echo "  sudo journalctl -u trusttunnel-auto-post-setup.service -n 50 --no-pager"
   echo "  sudo systemctl status trusttunnel --no-pager"
   echo "=================================================="
 }
@@ -360,6 +431,8 @@ main() {
   prepare_trusttunnel_service_if_exists
   apply_interface_tuning
   create_post_setup_script
+  create_auto_post_setup_runner
+  create_auto_post_setup_systemd
   show_summary
 }
 
