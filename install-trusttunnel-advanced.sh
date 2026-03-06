@@ -130,12 +130,12 @@ disable_ping_ufw() {
     return 0
   fi
 
-  if grep -q "icmp-type echo-request -j DROP" /etc/ufw/before.rules 2>/dev/null; then
+  cp -a /etc/ufw/before.rules "/etc/ufw/before.rules.bak.$(date +%Y%m%d-%H%M%S)"
+
+  if grep -A7 '# ok icmp codes for INPUT' /etc/ufw/before.rules | grep -q 'DROP'; then
     ok "Ping уже отключён в UFW"
     return 0
   fi
-
-  cp -a /etc/ufw/before.rules "/etc/ufw/before.rules.bak.$(date +%Y%m%d-%H%M%S)"
 
   sed -i '/# ok icmp codes for INPUT/,+7 s/ACCEPT/DROP/g' /etc/ufw/before.rules
   ufw reload || true
@@ -164,6 +164,13 @@ prepare_trusttunnel_service_if_exists() {
 
   if [[ -f "$template" ]]; then
     cp -f "$template" "$target"
+
+    if ! grep -q '^WorkingDirectory=/opt/trusttunnel$' "$target"; then
+      if grep -q '^\[Service\]' "$target"; then
+        sed -i '/^\[Service\]/a WorkingDirectory=/opt/trusttunnel' "$target"
+      fi
+    fi
+
     systemctl daemon-reload
     ok "Systemd unit подготовлен: $target"
     warn "Сервис пока не запускаю. Сначала выполни setup_wizard, затем post-setup скрипт."
@@ -203,6 +210,7 @@ create_post_setup_script() {
 set -Eeuo pipefail
 
 CONFIG="/opt/trusttunnel/vpn.toml"
+HOSTS="/opt/trusttunnel/hosts.toml"
 TEMPLATE="/opt/trusttunnel/trusttunnel.service.template"
 SERVICE="/etc/systemd/system/trusttunnel.service"
 
@@ -235,26 +243,63 @@ if [[ ! -f "$TEMPLATE" ]]; then
   exit 1
 fi
 
-cp -f "$TEMPLATE" "$SERVICE"
-systemctl daemon-reload
-ok "Systemd unit установлен"
-
-if [[ -f "$CONFIG" ]]; then
-  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
-
-  if grep -qE '^\s*antidpi\s*=' "$CONFIG"; then
-    sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$CONFIG"
-  else
-    printf '\nantidpi = true\n' >> "$CONFIG"
-  fi
-
-  ok "antidpi включён"
-else
-  warn "$CONFIG не найден, antidpi пропущен"
+if [[ ! -f "$CONFIG" ]]; then
+  err "$CONFIG не найден"
+  err "setup_wizard не завершён или не создал vpn.toml"
+  exit 1
 fi
 
-systemctl enable --now trusttunnel
-ok "TrustTunnel включён и запущен"
+if [[ ! -f "$HOSTS" ]]; then
+  err "$HOSTS не найден"
+  err "setup_wizard не завершён или не создал hosts.toml"
+  exit 1
+fi
+
+cp -f "$TEMPLATE" "$SERVICE"
+
+if ! grep -q '^WorkingDirectory=/opt/trusttunnel$' "$SERVICE"; then
+  if grep -q '^\[Service\]' "$SERVICE"; then
+    sed -i '/^\[Service\]/a WorkingDirectory=/opt/trusttunnel' "$SERVICE"
+  else
+    err "Секция [Service] не найдена в $SERVICE"
+    exit 1
+  fi
+fi
+
+if grep -qE '^\s*antidpi\s*=' "$CONFIG"; then
+  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+  sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$CONFIG"
+  ok "antidpi включён"
+else
+  cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
+  printf '\nantidpi = true\n' >> "$CONFIG"
+  ok "antidpi добавлен"
+fi
+
+systemctl daemon-reload
+systemctl enable trusttunnel
+systemctl restart trusttunnel
+
+sleep 2
+
+if systemctl is-active --quiet trusttunnel; then
+  ok "TrustTunnel успешно запущен"
+else
+  err "TrustTunnel не запустился"
+  echo
+  echo "===== UNIT FILE ====="
+  cat "$SERVICE" || true
+  echo
+  echo "===== FILES ====="
+  ls -l /opt/trusttunnel || true
+  echo
+  echo "===== STATUS ====="
+  systemctl status trusttunnel --no-pager || true
+  echo
+  echo "===== LAST LOGS ====="
+  journalctl -u trusttunnel -n 50 --no-pager || true
+  exit 1
+fi
 
 echo
 echo "===== STATUS ====="
@@ -304,7 +349,6 @@ show_summary() {
 main() {
   require_root
   check_os
-
   log "Старт установки. Лог пишется в $LOG_FILE"
 
   update_system
