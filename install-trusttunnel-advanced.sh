@@ -1,68 +1,182 @@
 #!/usr/bin/env bash
-set -Eeuo pipefail
+set -Euo pipefail
 
-LOG_FILE="/var/log/trusttunnel-advanced-install.log"
-POST_SETUP_SCRIPT="/root/trusttunnel-post-setup.sh"
-AUTO_POST_SETUP_RUNNER="/root/trusttunnel-auto-post-setup-check.sh"
-AUTO_POST_SETUP_FLAG="/var/lib/trusttunnel-post-setup.done"
+VERSION="1.0.0"
+SCRIPT_NAME="TrustTunnel Interactive Installer"
+LOG_FILE="/var/log/trusttunnel-installer.log"
+MODE="main"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+if [[ "${1:-}" == "--post-setup" ]]; then
+  MODE="post"
+fi
 
-log()  { echo -e "${BLUE}[INFO]${NC} $*"; }
-ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; }
+if [[ -t 1 ]]; then
+  RED='\033[0;31m'
+  GREEN='\033[0;32m'
+  YELLOW='\033[1;33m'
+  BLUE='\033[0;34m'
+  CYAN='\033[0;36m'
+  BOLD='\033[1m'
+  NC='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
+fi
 
-cleanup_on_error() {
-  err "Скрипт завершился с ошибкой на строке $1"
-  err "Смотри лог: $LOG_FILE"
-}
-trap 'cleanup_on_error $LINENO' ERR
-
+mkdir -p "$(dirname "$LOG_FILE")"
+touch "$LOG_FILE" 2>/dev/null || LOG_FILE="/tmp/trusttunnel-installer.log"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
+log()  { echo -e "${BLUE}[INFO]${NC} $*"; }
+ok()   { echo -e "${GREEN}[ OK ]${NC} $*"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()  { echo -e "${RED}[ERR ]${NC} $*"; }
+
+banner() {
+  clear 2>/dev/null || true
+  echo -e "${CYAN}${BOLD}"
+  cat <<'BANNER'
+████████╗██████╗ ██╗   ██╗███████╗████████╗████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
+╚══██╔══╝██╔══██╗██║   ██║██╔════╝╚══██╔══╝╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
+   ██║   ██████╔╝██║   ██║███████╗   ██║      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
+   ██║   ██╔══██╗██║   ██║╚════██║   ██║      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
+   ██║   ██║  ██║╚██████╔╝███████║   ██║      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
+   ╚═╝   ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
+BANNER
+  echo -e "${NC}${BOLD}${SCRIPT_NAME} v${VERSION}${NC}"
+  echo "Лог: $LOG_FILE"
+  echo
+}
+
 require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    err "Запусти скрипт от root"
+  if [[ ${EUID} -ne 0 ]]; then
+    err "Запусти скрипт от root: sudo bash $0"
     exit 1
   fi
+}
+
+pause() {
+  echo
+  read -r -p "Нажми Enter для продолжения..." _unused
+}
+
+confirm_step() {
+  local message="$1"
+  local answer
+  while true; do
+    echo
+    read -r -p "$message [Y/n/s/q]: " answer
+    answer="${answer:-Y}"
+    case "$answer" in
+      Y|y|Д|д) return 0 ;;
+      N|n|Н|н|S|s|К|к) return 1 ;;
+      Q|q|Й|й) echo; warn "Установка остановлена пользователем."; exit 0 ;;
+      *) echo "Введи Y, n, s или q." ;;
+    esac
+  done
+}
+
+handle_step_failure() {
+  local step_name="$1"
+  err "Шаг завершился с ошибкой: $step_name"
+  echo
+  echo "Что можно сделать дальше:"
+  echo "  1) исправить проблему вручную и продолжить"
+  echo "  2) пропустить этот шаг"
+  echo "  3) прервать установку"
+  echo
+  local answer
+  while true; do
+    read -r -p "Выбери [c]ontinue / [s]kip / [q]uit: " answer
+    answer="${answer:-q}"
+    case "$answer" in
+      c|C|с|С) return 0 ;;
+      s|S|ы|Ы) return 1 ;;
+      q|Q|й|Й) exit 1 ;;
+      *) echo "Введи c, s или q." ;;
+    esac
+  done
+}
+
+run_step() {
+  local step_name="$1"
+  local fn="$2"
+
+  echo
+  echo "────────────────────────────────────────────────────────────"
+  echo -e "${BOLD}$step_name${NC}"
+  echo "────────────────────────────────────────────────────────────"
+
+  if ! confirm_step "Выполнить этот шаг?"; then
+    warn "Шаг пропущен: $step_name"
+    return 0
+  fi
+
+  if "$fn"; then
+    ok "Шаг выполнен: $step_name"
+    return 0
+  fi
+
+  if handle_step_failure "$step_name"; then
+    log "Повтори шаг после ручного исправления: $step_name"
+    if "$fn"; then
+      ok "Шаг выполнен после повтора: $step_name"
+      return 0
+    fi
+  fi
+
+  warn "Шаг пропущен после ошибки: $step_name"
+  return 0
+}
+
+show_system_info() {
+  . /etc/os-release
+  echo "Система: ${PRETTY_NAME:-unknown}"
+  echo "Режим:   $MODE"
+  echo "Дата:    $(date '+%F %T')"
+  echo "Ядро:    $(uname -r)"
+  echo
 }
 
 check_os() {
   if [[ ! -f /etc/os-release ]]; then
     err "Не удалось определить ОС"
-    exit 1
+    return 1
   fi
 
   . /etc/os-release
-
   if [[ "${ID:-}" != "ubuntu" ]]; then
-    warn "Скрипт рассчитан на Ubuntu. Обнаружено: ${PRETTY_NAME:-unknown}"
+    warn "Скрипт протестирован на Ubuntu. Обнаружено: ${PRETTY_NAME:-unknown}"
   else
     ok "Обнаружена ОС: ${PRETTY_NAME}"
   fi
-}
 
-get_default_iface() {
-  ip route 2>/dev/null | awk '/default/ {print $5; exit}'
+  command -v systemctl >/dev/null 2>&1 || {
+    err "systemctl не найден"
+    return 1
+  }
+
+  return 0
 }
 
 update_system() {
-  log "Обновляю систему..."
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get upgrade -y
-  ok "Система обновлена"
+  apt-get update -y && apt-get upgrade -y
 }
 
-enable_sysctl_tuning() {
-  log "Настраиваю sysctl для VPN/сети..."
+install_base_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get install -y curl ca-certificates ufw fail2ban iproute2 gawk sed grep coreutils procps
 
-  cat >/etc/sysctl.d/99-trusttunnel-advanced.conf <<'EOF'
+  command -v curl >/dev/null 2>&1 || return 1
+  command -v ufw >/dev/null 2>&1 || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  command -v ip >/dev/null 2>&1 || return 1
+  command -v awk >/dev/null 2>&1 || return 1
+  command -v sed >/dev/null 2>&1 || return 1
+}
+
+apply_sysctl_tuning() {
+  cat >/etc/sysctl.d/99-trusttunnel-advanced.conf <<'EOF_SYSCTL'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 net.core.rmem_max=67108864
@@ -70,39 +184,82 @@ net.core.wmem_max=67108864
 net.core.netdev_max_backlog=250000
 net.ipv4.tcp_fastopen=3
 net.ipv4.tcp_mtu_probing=1
-EOF
+EOF_SYSCTL
 
   sysctl --system >/dev/null
-  ok "BBR и сетевой тюнинг применены"
+
+  [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]] || return 1
+  [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null)" == "fq" ]] || return 1
 }
 
-install_ufw() {
-  log "Устанавливаю и настраиваю UFW..."
-
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y ufw
-
+configure_ufw() {
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
-
   ufw allow 22/tcp
   ufw allow 80/tcp
   ufw allow 443/tcp
-
   ufw logging on
   ufw --force enable
 
-  ok "UFW настроен"
+  ufw status | grep -q "Status: active"
 }
 
-install_fail2ban() {
-  log "Устанавливаю и настраиваю Fail2Ban..."
+_disable_ping_file() {
+  local file="$1"
+  local tmp
+  tmp="$(mktemp)"
 
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get install -y fail2ban
+  if [[ ! -f "$file" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
 
-  cat >/etc/fail2ban/jail.local <<'EOF'
+  cp -a "$file" "${file}.bak.$(date +%Y%m%d-%H%M%S)"
+
+  awk '
+    /# ok icmp codes for INPUT/ { print; block=7; next }
+    block > 0 {
+      gsub(/ACCEPT/, "DROP")
+      print
+      block--
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+
+  if cmp -s "$file" "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+  return 0
+}
+
+disable_ping() {
+  local changed=0
+
+  if _disable_ping_file /etc/ufw/before.rules; then
+    changed=1
+  fi
+
+  if [[ -f /etc/ufw/before6.rules ]]; then
+    _disable_ping_file /etc/ufw/before6.rules || true
+  fi
+
+  ufw reload >/dev/null 2>&1 || true
+
+  if [[ $changed -eq 1 ]]; then
+    ok "Ping отключён через UFW before.rules"
+  fi
+
+  return 0
+}
+
+configure_fail2ban() {
+  cat >/etc/fail2ban/jail.local <<'EOF_F2B'
 [DEFAULT]
 bantime = 10m
 findtime = 10m
@@ -116,324 +273,226 @@ port = 22
 filter = sshd
 logpath = /var/log/auth.log
 maxretry = 5
-EOF
+EOF_F2B
 
-  systemctl enable fail2ban
+  systemctl enable fail2ban >/dev/null 2>&1
   systemctl restart fail2ban
-
-  ok "Fail2Ban настроен"
-}
-
-disable_ping_ufw() {
-  log "Отключаю ping через UFW..."
-
-  if [[ ! -f /etc/ufw/before.rules ]]; then
-    warn "/etc/ufw/before.rules не найден, пропускаю отключение ping"
-    return 0
-  fi
-
-  cp -a /etc/ufw/before.rules "/etc/ufw/before.rules.bak.$(date +%Y%m%d-%H%M%S)"
-
-  if grep -A7 '# ok icmp codes for INPUT' /etc/ufw/before.rules | grep -q 'DROP'; then
-    ok "Ping уже отключён в UFW"
-    return 0
-  fi
-
-  sed -i '/# ok icmp codes for INPUT/,+7 s/ACCEPT/DROP/g' /etc/ufw/before.rules
-  ufw reload || true
-
-  ok "Ping отключён через UFW"
+  systemctl is-active --quiet fail2ban
 }
 
 install_trusttunnel() {
-  log "Устанавливаю TrustTunnel..."
-
   curl -fsSL https://raw.githubusercontent.com/TrustTunnel/TrustTunnel/refs/heads/master/scripts/install.sh | sh -s -
 
-  if [[ ! -d /opt/trusttunnel ]]; then
-    err "Папка /opt/trusttunnel не найдена после установки"
-    exit 1
-  fi
-
-  ok "TrustTunnel установлен в /opt/trusttunnel"
+  [[ -x /opt/trusttunnel/trusttunnel_endpoint ]]
 }
 
-prepare_trusttunnel_service_if_exists() {
-  log "Пробую подготовить systemd unit для TrustTunnel..."
-
-  local template="/opt/trusttunnel/trusttunnel.service.template"
-  local target="/etc/systemd/system/trusttunnel.service"
-
-  if [[ -f "$template" ]]; then
-    cp -f "$template" "$target"
-
-    if ! grep -q '^WorkingDirectory=/opt/trusttunnel$' "$target"; then
-      if grep -q '^\[Service\]' "$target"; then
-        sed -i '/^\[Service\]/a WorkingDirectory=/opt/trusttunnel' "$target"
-      fi
-    fi
-
-    systemctl daemon-reload
-    ok "Systemd unit подготовлен: $target"
-  else
-    warn "Файл $template не найден. Это нормально, если он появится после setup_wizard."
+run_setup_wizard() {
+  if [[ ! -x /opt/trusttunnel/setup_wizard ]]; then
+    err "/opt/trusttunnel/setup_wizard не найден"
+    return 1
   fi
+
+  echo
+  echo "Сейчас запустится интерактивный setup_wizard TrustTunnel."
+  echo "Во время wizard не закрывай терминал."
+  echo
+  pause
+
+  (
+    cd /opt/trusttunnel
+    ./setup_wizard
+  )
+
+  [[ -f /opt/trusttunnel/vpn.toml ]] || {
+    err "После setup_wizard не найден /opt/trusttunnel/vpn.toml"
+    return 1
+  }
+
+  [[ -f /opt/trusttunnel/hosts.toml ]] || {
+    err "После setup_wizard не найден /opt/trusttunnel/hosts.toml"
+    return 1
+  }
+}
+
+configure_antidpi() {
+  local config="/opt/trusttunnel/vpn.toml"
+
+  [[ -f "$config" ]] || {
+    err "$config не найден"
+    return 1
+  }
+
+  cp -a "$config" "${config}.bak.$(date +%Y%m%d-%H%M%S)"
+
+  if grep -qE '^\s*antidpi\s*=' "$config"; then
+    sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$config"
+  else
+    printf '\nantidpi = true\n' >> "$config"
+  fi
+
+  grep -qE '^\s*antidpi\s*=\s*true\s*$' "$config"
+}
+
+write_service_unit() {
+  cat >/etc/systemd/system/trusttunnel.service <<'EOF_UNIT'
+[Unit]
+Description=TrustTunnel endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/trusttunnel
+ExecStart=/opt/trusttunnel/trusttunnel_endpoint vpn.toml hosts.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
+  grep -q '^WorkingDirectory=/opt/trusttunnel$' /etc/systemd/system/trusttunnel.service || return 1
+  grep -q '^ExecStart=/opt/trusttunnel/trusttunnel_endpoint vpn.toml hosts.toml$' /etc/systemd/system/trusttunnel.service || return 1
 }
 
 apply_interface_tuning() {
   local iface
-  iface="$(get_default_iface || true)"
+  iface="$(ip route 2>/dev/null | awk '/default/ {print $5; exit}')"
 
-  if [[ -z "${iface:-}" ]]; then
-    warn "Не удалось определить сетевой интерфейс по умолчанию. Пропускаю txqueuelen и RPS."
+  if [[ -z "$iface" ]]; then
+    warn "Не удалось определить сетевой интерфейс по умолчанию"
     return 0
   fi
 
-  log "Применяю тюнинг сетевого интерфейса: $iface"
+  ip link set dev "$iface" txqueuelen 10000 || true
 
-  ip link set dev "$iface" txqueuelen 10000 || warn "Не удалось выставить txqueuelen для $iface"
-
-  if compgen -G "/sys/class/net/$iface/queues/rx-*" > /dev/null; then
+  if compgen -G "/sys/class/net/$iface/queues/rx-*" >/dev/null; then
     for q in /sys/class/net/"$iface"/queues/rx-*; do
       echo ffffffff > "$q/rps_cpus" || true
     done
-    ok "RPS включён для $iface"
-  else
-    warn "RX-очереди для $iface не найдены, RPS пропущен"
   fi
+
+  ok "Сетевой тюнинг применён к интерфейсу: $iface"
+  return 0
 }
 
-create_post_setup_script() {
-  log "Создаю post-setup скрипт: $POST_SETUP_SCRIPT"
+post_setup_finalize() {
+  [[ -x /opt/trusttunnel/trusttunnel_endpoint ]] || {
+    err "Не найден /opt/trusttunnel/trusttunnel_endpoint"
+    return 1
+  }
 
-  cat >"$POST_SETUP_SCRIPT" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
+  [[ -f /opt/trusttunnel/vpn.toml ]] || {
+    err "Не найден /opt/trusttunnel/vpn.toml"
+    return 1
+  }
 
-CONFIG="/opt/trusttunnel/vpn.toml"
-HOSTS="/opt/trusttunnel/hosts.toml"
-TEMPLATE="/opt/trusttunnel/trusttunnel.service.template"
-SERVICE="/etc/systemd/system/trusttunnel.service"
-FLAG="/var/lib/trusttunnel-post-setup.done"
+  [[ -f /opt/trusttunnel/hosts.toml ]] || {
+    err "Не найден /opt/trusttunnel/hosts.toml"
+    return 1
+  }
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log()  { echo -e "${BLUE}[INFO]${NC} $*"; }
-ok()   { echo -e "${GREEN}[OK]${NC} $*"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
-err()  { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-
-if [[ "${EUID}" -ne 0 ]]; then
-  err "Запусти скрипт от root"
-  exit 1
-fi
-
-mkdir -p /var/lib
-
-if [[ -f "$FLAG" ]]; then
-  ok "Post-setup уже был выполнен ранее"
-  exit 0
-fi
-
-log "Запуск TrustTunnel post-setup..."
-
-if [[ ! -d /opt/trusttunnel ]]; then
-  err "/opt/trusttunnel не найден"
-  exit 1
-fi
-
-if [[ ! -f "$TEMPLATE" ]]; then
-  err "$TEMPLATE не найден"
-  err "Сначала выполни: cd /opt/trusttunnel && ./setup_wizard"
-  exit 1
-fi
-
-if [[ ! -f "$CONFIG" ]]; then
-  err "$CONFIG не найден"
-  err "setup_wizard ещё не завершён или не создал vpn.toml"
-  exit 1
-fi
-
-if [[ ! -f "$HOSTS" ]]; then
-  err "$HOSTS не найден"
-  err "setup_wizard ещё не завершён или не создал hosts.toml"
-  exit 1
-fi
-
-cp -f "$TEMPLATE" "$SERVICE"
-
-if ! grep -q '^WorkingDirectory=/opt/trusttunnel$' "$SERVICE"; then
-  if grep -q '^\[Service\]' "$SERVICE"; then
-    sed -i '/^\[Service\]/a WorkingDirectory=/opt/trusttunnel' "$SERVICE"
-  else
-    err "Секция [Service] не найдена в $SERVICE"
-    exit 1
-  fi
-fi
-
-cp -a "$CONFIG" "${CONFIG}.bak.$(date +%Y%m%d-%H%M%S)"
-
-if grep -qE '^\s*antidpi\s*=' "$CONFIG"; then
-  sed -i -E 's/^\s*antidpi\s*=.*/antidpi = true/' "$CONFIG"
-  ok "antidpi включён"
-else
-  printf '\nantidpi = true\n' >> "$CONFIG"
-  ok "antidpi добавлен"
-fi
-
-systemctl daemon-reload
-systemctl enable trusttunnel
-systemctl restart trusttunnel
-
-sleep 2
-
-if systemctl is-active --quiet trusttunnel; then
-  ok "TrustTunnel успешно запущен"
-  touch "$FLAG"
-else
-  err "TrustTunnel не запустился"
-  echo
-  echo "===== UNIT FILE ====="
-  cat "$SERVICE" || true
-  echo
-  echo "===== FILES ====="
-  ls -l /opt/trusttunnel || true
-  echo
-  echo "===== STATUS ====="
-  systemctl status trusttunnel --no-pager || true
-  echo
-  echo "===== LAST LOGS ====="
-  journalctl -u trusttunnel -n 50 --no-pager || true
-  exit 1
-fi
-EOF
-
-  chmod +x "$POST_SETUP_SCRIPT"
-  ok "Post-setup скрипт создан"
-}
-
-create_auto_post_setup_runner() {
-  log "Создаю авто-проверку post-setup: $AUTO_POST_SETUP_RUNNER"
-
-  cat >"$AUTO_POST_SETUP_RUNNER" <<'EOF'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-
-CONFIG="/opt/trusttunnel/vpn.toml"
-HOSTS="/opt/trusttunnel/hosts.toml"
-FLAG="/var/lib/trusttunnel-post-setup.done"
-POST="/root/trusttunnel-post-setup.sh"
-LOG="/var/log/trusttunnel-auto-post-setup.log"
-
-exec >>"$LOG" 2>&1
-
-echo "[$(date '+%F %T')] check started"
-
-if [[ -f "$FLAG" ]]; then
-  echo "[$(date '+%F %T')] already completed"
-  exit 0
-fi
-
-if [[ -f "$CONFIG" && -f "$HOSTS" ]]; then
-  echo "[$(date '+%F %T')] config detected, running post-setup"
-  bash "$POST"
-else
-  echo "[$(date '+%F %T')] config not ready yet"
-fi
-EOF
-
-  chmod +x "$AUTO_POST_SETUP_RUNNER"
-  ok "Авто-проверка создана"
-}
-
-create_auto_post_setup_systemd() {
-  log "Создаю systemd unit и timer для автозапуска post-setup..."
-
-  cat >/etc/systemd/system/trusttunnel-auto-post-setup.service <<'EOF'
-[Unit]
-Description=Auto run TrustTunnel post-setup when config files appear
-After=network.target
-
-[Service]
-Type=oneshot
-ExecStart=/root/trusttunnel-auto-post-setup-check.sh
-EOF
-
-  cat >/etc/systemd/system/trusttunnel-auto-post-setup.timer <<'EOF'
-[Unit]
-Description=Periodic check for TrustTunnel setup completion
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=30sec
-Unit=trusttunnel-auto-post-setup.service
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
+  run_step "Включить antidpi = true" configure_antidpi
+  run_step "Создать systemd unit trusttunnel.service" write_service_unit
 
   systemctl daemon-reload
-  systemctl enable --now trusttunnel-auto-post-setup.timer
+  systemctl enable trusttunnel >/dev/null 2>&1
+  systemctl restart trusttunnel
 
-  ok "Таймер авто-post-setup включён"
+  sleep 2
+  systemctl is-active --quiet trusttunnel || {
+    err "Сервис trusttunnel не запустился"
+    systemctl status trusttunnel --no-pager || true
+    journalctl -u trusttunnel -n 50 --no-pager || true
+    return 1
+  }
+
+  ok "TrustTunnel успешно запущен"
+  systemctl status trusttunnel --no-pager || true
+  return 0
 }
 
-show_summary() {
-  local iface
-  iface="$(get_default_iface || true)"
-
+main_summary() {
   echo
-  echo "=================================================="
-  echo " Основной installer завершён"
-  echo "=================================================="
-  echo "Лог: $LOG_FILE"
+  echo "============================================================"
+  echo "Готово"
+  echo "============================================================"
+  echo "Базовая установка завершена."
   echo
-  echo "Что уже сделано:"
-  echo "  - система обновлена"
-  echo "  - UFW установлен и включён"
-  echo "  - Fail2Ban установлен и включён"
-  echo "  - ping отключён через UFW"
-  echo "  - BBR и сетевой тюнинг применены"
-  echo "  - TrustTunnel установлен"
-  echo "  - создан post-setup скрипт: $POST_SETUP_SCRIPT"
-  echo "  - включён авто-запуск post-setup после setup_wizard"
-  [[ -n "${iface:-}" ]] && echo "  - сетевой интерфейс: $iface"
+  echo "Если ты уже прошёл setup_wizard и созданы vpn.toml и hosts.toml,"
+  echo "можно сразу выполнить post-setup этим же файлом:"
   echo
-  echo "Теперь тебе нужно только:"
-  echo "  cd /opt/trusttunnel"
-  echo "  ./setup_wizard"
+  echo "  sudo bash $0 --post-setup"
   echo
-  echo "После появления vpn.toml и hosts.toml post-setup запустится автоматически."
+  echo "Если запускаешь скрипт через GitHub raw URL, post-setup потом так:"
+  echo
+  echo "  bash <(curl -fsSL https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-interactive-final.sh) --post-setup"
   echo
   echo "Проверки:"
-  echo "  sudo systemctl status trusttunnel-auto-post-setup.timer --no-pager"
-  echo "  sudo journalctl -u trusttunnel-auto-post-setup.service -n 50 --no-pager"
+  echo "  sysctl net.ipv4.tcp_congestion_control"
+  echo "  sudo ufw status verbose"
+  echo "  sudo systemctl status fail2ban --no-pager"
+  echo "============================================================"
+}
+
+post_summary() {
+  echo
+  echo "============================================================"
+  echo "Post-setup завершён"
+  echo "============================================================"
+  echo "Проверки:"
   echo "  sudo systemctl status trusttunnel --no-pager"
-  echo "=================================================="
+  echo "  sudo journalctl -u trusttunnel -n 50 --no-pager"
+  echo "  sudo ss -tulpn | grep -E ':80|:443'"
+  echo "============================================================"
+}
+
+run_main_mode() {
+  run_step "Проверить ОС и systemd" check_os
+  run_step "Обновить систему" update_system
+  run_step "Установить базовые пакеты" install_base_packages
+  run_step "Включить BBR и сетевой тюнинг" apply_sysctl_tuning
+  run_step "Настроить UFW (22, 80, 443)" configure_ufw
+  run_step "Отключить ping" disable_ping
+  run_step "Настроить Fail2Ban" configure_fail2ban
+  run_step "Установить TrustTunnel" install_trusttunnel
+  run_step "Применить тюнинг сетевого интерфейса" apply_interface_tuning
+
+  if confirm_step "Запустить setup_wizard прямо сейчас?"; then
+    if run_setup_wizard; then
+      ok "setup_wizard завершён и конфиги найдены"
+      if confirm_step "Сразу выполнить post-setup и запустить сервис?"; then
+        post_setup_finalize
+      else
+        warn "Post-setup пропущен. Его можно выполнить позже этим же файлом с ключом --post-setup."
+      fi
+    else
+      warn "setup_wizard не завершён. Его можно запустить позже вручную: cd /opt/trusttunnel && ./setup_wizard"
+    fi
+  else
+    warn "setup_wizard пропущен. Позже выполни: cd /opt/trusttunnel && ./setup_wizard"
+  fi
+
+  main_summary
+}
+
+run_post_mode() {
+  run_step "Проверить ОС и systemd" check_os
+  post_setup_finalize
+  post_summary
 }
 
 main() {
   require_root
-  check_os
-  log "Старт установки. Лог пишется в $LOG_FILE"
+  banner
+  show_system_info
 
-  update_system
-  enable_sysctl_tuning
-  install_ufw
-  install_fail2ban
-  disable_ping_ufw
-  install_trusttunnel
-  prepare_trusttunnel_service_if_exists
-  apply_interface_tuning
-  create_post_setup_script
-  create_auto_post_setup_runner
-  create_auto_post_setup_systemd
-  show_summary
+  if [[ "$MODE" == "post" ]]; then
+    run_post_mode
+  else
+    run_main_mode
+  fi
 }
 
 main "$@"
