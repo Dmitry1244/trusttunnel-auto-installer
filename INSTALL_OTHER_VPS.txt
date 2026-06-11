@@ -4,6 +4,7 @@
 Этот файл объясняет, как поднять такую же рабочую конфигурацию на новом сервере:
 
 - TrustTunnel на выбранном TCP-порту, по умолчанию 443;
+- актуальную версию TrustTunnel из latest GitHub release;
 - выбор порта TrustTunnel, если нужен порт отличный от 443;
 - обновление системы перед установкой;
 - HTTP/2 и, по выбору, QUIC/HTTP3;
@@ -123,12 +124,22 @@ ssh -t -p 49222 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.
 3) Установить или переустановить только WARP
 4) Удалить только WARP и переключить TrustTunnel на direct
 5) Показать статус
+6) Обновить только TrustTunnel endpoint
 0) Выход
 
 Для обычной установки или повторной переустановки выбирай 1.
+Для обновления TrustTunnel без пересоздания клиентов выбирай 6.
 
 Пункт 2 удаляет TrustTunnel/WARP и клиентские файлы, но не удаляет SSH и fail2ban.
 Пункт 4 удаляет только WARP и переводит TrustTunnel на прямой выход direct.
+
+По умолчанию ставится актуальная версия TrustTunnel:
+
+TT_VERSION=latest
+
+Если нужно поставить конкретную версию, можно запускать так:
+
+TT_VERSION=v1.0.33 bash /tmp/install-trusttunnel-warp.sh
 
 
 4. Если SSH-порт нестандартный
@@ -151,7 +162,7 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMA
 - обновляет список пакетов;
 - обновляет систему через apt-get upgrade, если ты выбрал этот пункт;
 - ставит нужные пакеты;
-- скачивает TrustTunnel endpoint;
+- скачивает актуальный TrustTunnel endpoint из latest GitHub release;
 - скачивает wgcf и wireproxy для WARP;
 - регистрирует WARP-профиль;
 - запускает WARP как локальный SOCKS5 proxy;
@@ -165,6 +176,7 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMA
 - если включен QUIC/HTTP3, создает два TOML-файла на клиента: http2 и http3;
 - собирает ZIP-архив с клиентскими конфигами;
 - настраивает firewall;
+- включает автоперезапуск systemd-сервисов через Restart=always;
 - меняет SSH-порт, если ты выбрал этот пункт;
 - ставит и включает fail2ban для SSH;
 - включает BBR.
