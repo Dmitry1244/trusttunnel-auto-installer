@@ -125,13 +125,23 @@ ssh -t -p 49222 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.
 4) Удалить только WARP и переключить TrustTunnel на direct
 5) Показать статус
 6) Обновить только TrustTunnel endpoint
+7) Проверить WARP
+8) Включить WARP
+9) Отключить WARP без удаления
 0) Выход
 
 Для обычной установки или повторной переустановки выбирай 1.
 Для обновления TrustTunnel без пересоздания клиентов выбирай 6.
 
+После установки главное меню можно открыть командой:
+
+trusttunnel-menu
+
 Пункт 2 удаляет TrustTunnel/WARP и клиентские файлы, но не удаляет SSH и fail2ban.
 Пункт 4 удаляет только WARP и переводит TrustTunnel на прямой выход direct.
+Пункт 7 проверяет WARP и показывает прямой IP сервера и WARP IP.
+Пункт 8 включает WARP и переключает TrustTunnel на WARP/SOCKS.
+Пункт 9 отключает WARP без удаления файлов и переключает TrustTunnel на direct.
 
 По умолчанию ставится актуальная версия TrustTunnel:
 
