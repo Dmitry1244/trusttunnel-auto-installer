@@ -8,7 +8,8 @@
 - клиенты client01, client02 и т.д.;
 - готовые TOML-файлы для импорта в клиент;
 - firewall: открыт только SSH-порт и 443/tcp;
-- fail2ban для защиты SSH от перебора паролей.
+- fail2ban для защиты SSH от перебора паролей;
+- BBR для TCP-производительности.
 
 
 1. Что нужно подготовить
@@ -138,7 +139,8 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMA
 - создает TOML-файлы клиентов;
 - собирает ZIP-архив с клиентскими конфигами;
 - настраивает firewall;
-- ставит и включает fail2ban для SSH.
+- ставит и включает fail2ban для SSH;
+- включает BBR.
 
 
 6. Где будут файлы клиентов
@@ -198,6 +200,7 @@ trusttunnel-status
 - порт 443 слушается;
 - Direct public IP показывает IP VPS;
 - WARP public IP показывает другой IP, обычно Cloudflare/WARP.
+- TCP congestion control показывает bbr.
 
 Если WARP public IP совпадает с IP VPS, значит WARP не работает.
 
@@ -246,6 +249,33 @@ QUIC/HTTP3 в этом простом варианте не включается
 То есть если кто-то 5 раз ошибется с SSH-паролем за 10 минут, его IP будет забанен на 1 час.
 
 TrustTunnel fail2ban не трогает.
+
+
+9.2. Что такое BBR
+------------------
+
+BBR - это алгоритм управления TCP-соединениями в Linux.
+
+Для TrustTunnel в режиме HTTP/2 это полезно, потому что трафик идет по TCP.
+Обычно BBR дает более стабильную скорость и лучше работает на каналах с задержкой.
+
+Скрипт добавляет файл:
+
+/etc/sysctl.d/99-trusttunnel-bbr.conf
+
+И включает:
+
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+
+Проверить можно так:
+
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc
+
+Нормально:
+
+net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
 
 
 10. Как изменить количество клиентов
