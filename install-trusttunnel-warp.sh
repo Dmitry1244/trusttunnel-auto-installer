@@ -14,6 +14,7 @@ DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-admin@example.com}"
 CLIENTS="${CLIENTS:-}"
 SSH_PORT="${SSH_PORT:-}"
+CHANGE_SSH_PORT="${CHANGE_SSH_PORT:-}"
 ENABLE_WARP="${ENABLE_WARP:-}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
 ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
@@ -96,13 +97,32 @@ ask_yes_no() {
   done
 }
 
+detect_current_ssh_port() {
+  if [ -n "${SSH_CONNECTION:-}" ]; then
+    set -- $SSH_CONNECTION
+    if [ $# -ge 4 ]; then
+      printf '%s' "$4"
+      return
+    fi
+  fi
+  printf '22'
+}
+
 collect_config() {
+  local detected_ssh_port
+  detected_ssh_port="$(detect_current_ssh_port)"
+
   echo
   echo "=== Установка TrustTunnel + WARP ==="
   echo
   ask_required DOMAIN "Домен для TrustTunnel, например vpn.example.com: "
   ask_default CLIENTS "Сколько клиентов создать" "21"
-  ask_default SSH_PORT "SSH-порт сервера" "22"
+  ask_yes_no CHANGE_SSH_PORT "Поменять SSH-порт сервера" "1"
+  if [ "$CHANGE_SSH_PORT" = "1" ]; then
+    ask_default SSH_PORT "Новый SSH-порт сервера" "49222"
+  else
+    ask_default SSH_PORT "Текущий SSH-порт, который нужно оставить открытым" "$detected_ssh_port"
+  fi
   ask_yes_no ENABLE_SYSTEM_UPGRADE "Обновить систему перед установкой" "1"
   ask_yes_no ENABLE_WARP "Включить WARP для скрытия IP сервера от сайтов" "1"
   ask_yes_no ENABLE_FAIL2BAN "Включить fail2ban для защиты SSH" "1"
@@ -123,7 +143,8 @@ collect_config() {
   echo "Параметры установки:"
   echo "- Домен: ${DOMAIN}"
   echo "- Клиентов: ${CLIENTS}"
-  echo "- SSH-порт: ${SSH_PORT}"
+  echo "- Менять SSH-порт: ${CHANGE_SSH_PORT}"
+  echo "- SSH-порт для firewall/fail2ban: ${SSH_PORT}"
   echo "- Обновить систему: ${ENABLE_SYSTEM_UPGRADE}"
   echo "- WARP: ${ENABLE_WARP}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
@@ -443,6 +464,41 @@ configure_firewall() {
   ufw --force enable
 }
 
+configure_ssh_port() {
+  if [ "$CHANGE_SSH_PORT" != "1" ]; then
+    return
+  fi
+
+  local sshd_bin ssh_service
+  sshd_bin="$(command -v sshd || true)"
+  if [ -z "$sshd_bin" ] && [ -x /usr/sbin/sshd ]; then
+    sshd_bin="/usr/sbin/sshd"
+  fi
+  if [ -z "$sshd_bin" ]; then
+    echo "sshd not found, skipping SSH port change." >&2
+    return
+  fi
+
+  if grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' /etc/ssh/sshd_config 2>/dev/null; then
+    mkdir -p /etc/ssh/sshd_config.d
+    cat > /etc/ssh/sshd_config.d/99-trusttunnel-port.conf <<EOF
+Port ${SSH_PORT}
+EOF
+  else
+    cp /etc/ssh/sshd_config "/etc/ssh/sshd_config.backup.$(date +%Y%m%d%H%M%S)"
+    sed -i 's/^[[:space:]]*Port[[:space:]].*/# &/' /etc/ssh/sshd_config
+    printf '\nPort %s\n' "$SSH_PORT" >> /etc/ssh/sshd_config
+  fi
+
+  "$sshd_bin" -t
+  if systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+    ssh_service="ssh"
+  else
+    ssh_service="sshd"
+  fi
+  systemctl restart "$ssh_service"
+}
+
 configure_fail2ban() {
   if [ "$ENABLE_FAIL2BAN" != "1" ]; then
     return
@@ -479,7 +535,7 @@ echo "Services:"
 systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
 echo
 echo "Listening:"
-ss -lntup | grep -E ':(443|40000|40001)\b' || true
+ss -lntup | grep -E ':(443|40000|40001|22|49222)\b|sshd' || true
 echo
 echo "Direct public IP:"
 curl -4 -sS --max-time 8 https://ifconfig.me || true
@@ -512,6 +568,7 @@ main() {
   write_clients
   write_systemd
   configure_firewall
+  configure_ssh_port
   configure_fail2ban
   configure_bbr
   write_tools
