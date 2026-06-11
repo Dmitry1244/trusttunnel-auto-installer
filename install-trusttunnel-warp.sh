@@ -14,6 +14,7 @@ DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-admin@example.com}"
 CLIENTS="${CLIENTS:-}"
 SSH_PORT="${SSH_PORT:-}"
+ENDPOINT_PORT="${ENDPOINT_PORT:-}"
 CHANGE_SSH_PORT="${CHANGE_SSH_PORT:-}"
 ENABLE_WARP="${ENABLE_WARP:-}"
 ENABLE_QUIC="${ENABLE_QUIC:-}"
@@ -99,6 +100,21 @@ ask_yes_no() {
   done
 }
 
+validate_port() {
+  local name="$1"
+  local value="$2"
+  case "$value" in
+    ''|*[!0-9]*)
+      echo "${name} должен быть числом от 1 до 65535." >&2
+      exit 1
+      ;;
+  esac
+  if [ "$value" -lt 1 ] || [ "$value" -gt 65535 ]; then
+    echo "${name} должен быть числом от 1 до 65535." >&2
+    exit 1
+  fi
+}
+
 detect_current_ssh_port() {
   if [ -n "${SSH_CONNECTION:-}" ]; then
     set -- $SSH_CONNECTION
@@ -147,22 +163,28 @@ collect_config() {
   echo
   ask_required DOMAIN "Домен для TrustTunnel, например vpn.example.com: "
   ask_default CLIENTS "Сколько клиентов создать" "21"
+  ask_default ENDPOINT_PORT "Порт TrustTunnel для клиентов" "443"
   ask_yes_no CHANGE_SSH_PORT "Поменять SSH-порт сервера" "1"
   if [ "$CHANGE_SSH_PORT" = "1" ]; then
     ask_default SSH_PORT "Новый SSH-порт сервера" "49222"
   else
     ask_default SSH_PORT "Текущий SSH-порт, который нужно оставить открытым" "$detected_ssh_port"
   fi
+  validate_port "Порт TrustTunnel" "$ENDPOINT_PORT"
+  validate_port "SSH-порт" "$SSH_PORT"
   ask_yes_no ENABLE_SYSTEM_UPGRADE "Обновить систему перед установкой" "1"
   ask_yes_no ENABLE_WARP "Включить WARP для скрытия IP сервера от сайтов" "1"
-  ask_yes_no ENABLE_QUIC "Включить QUIC/HTTP3 на UDP 443" "1"
+  ask_yes_no ENABLE_QUIC "Включить QUIC/HTTP3 на UDP-порту TrustTunnel" "1"
   ask_yes_no ENABLE_FAIL2BAN "Включить fail2ban для защиты SSH" "1"
 
   if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
     echo
     echo "Скрипт сбросит UFW firewall и откроет только:"
     echo "- ${SSH_PORT}/tcp для SSH"
-    echo "- 443/tcp для TrustTunnel"
+    echo "- ${ENDPOINT_PORT}/tcp для TrustTunnel"
+    if [ "$ENABLE_QUIC" = "1" ]; then
+      echo "- ${ENDPOINT_PORT}/udp для TrustTunnel QUIC/HTTP3"
+    fi
     ask_yes_no CONFIRM_FIREWALL_RESET "Продолжить" "0"
   fi
   if [ "$CONFIRM_FIREWALL_RESET" != "1" ]; then
@@ -174,6 +196,7 @@ collect_config() {
   echo "Параметры установки:"
   echo "- Домен: ${DOMAIN}"
   echo "- Клиентов: ${CLIENTS}"
+  echo "- Порт TrustTunnel: ${ENDPOINT_PORT}"
   echo "- Менять SSH-порт: ${CHANGE_SSH_PORT}"
   echo "- SSH-порт для firewall/fail2ban: ${SSH_PORT}"
   echo "- Обновить систему: ${ENABLE_SYSTEM_UPGRADE}"
@@ -382,7 +405,7 @@ EOF
 write_server_config() {
   mkdir -p "$TT_DIR"
   cat > "$TT_DIR/vpn.toml" <<EOF
-listen_address = "0.0.0.0:443"
+listen_address = "0.0.0.0:${ENDPOINT_PORT}"
 credentials_file = "credentials.toml"
 rules_file = "rules.toml"
 ipv6_available = true
@@ -492,7 +515,7 @@ EOF
 hostname = "${DOMAIN}"
 
 # Endpoint addresses in IP:port or hostname:port format
-addresses = ["${DOMAIN}:443"]
+addresses = ["${DOMAIN}:${ENDPOINT_PORT}"]
 
 # Custom SNI value for TLS handshake.
 custom_sni = ""
@@ -566,9 +589,9 @@ configure_firewall() {
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow "${SSH_PORT}/tcp" comment "SSH"
-  ufw allow 443/tcp comment "TrustTunnel TCP"
+  ufw allow "${ENDPOINT_PORT}/tcp" comment "TrustTunnel TCP"
   if [ "$ENABLE_QUIC" = "1" ]; then
-    ufw allow 443/udp comment "TrustTunnel QUIC"
+    ufw allow "${ENDPOINT_PORT}/udp" comment "TrustTunnel QUIC"
   fi
   ufw --force enable
 }
@@ -660,8 +683,19 @@ remove_warp_only() {
   trusttunnel-status 2>/dev/null || true
 }
 
+current_endpoint_port() {
+  local config="$TT_DIR/vpn.toml"
+  if [ -f "$config" ]; then
+    sed -nE 's/^[[:space:]]*listen_address[[:space:]]*=[[:space:]]*"[^:"]+:([0-9]+)".*/\1/p' "$config" | head -1
+    return
+  fi
+  printf '443'
+}
+
 remove_all() {
-  confirm_action "Будут удалены TrustTunnel, WARP, клиентские файлы и порт 443 из UFW. SSH/fail2ban не удаляются."
+  confirm_action "Будут удалены TrustTunnel, WARP, клиентские файлы и порт TrustTunnel из UFW. SSH/fail2ban не удаляются."
+  local endpoint_port
+  endpoint_port="$(current_endpoint_port)"
   systemctl disable --now trusttunnel 2>/dev/null || true
   systemctl disable --now warp-wireproxy 2>/dev/null || true
   rm -f /etc/systemd/system/trusttunnel.service
@@ -670,8 +704,8 @@ remove_all() {
   rm -rf "$TT_DIR" "$WARP_DIR" "$CLIENT_DIR"
   rm -f /root/trusttunnel-clients-*.zip
   rm -f /usr/local/sbin/trusttunnel-status
-  ufw delete allow 443/tcp 2>/dev/null || true
-  ufw delete allow 443/udp 2>/dev/null || true
+  ufw delete allow "${endpoint_port}/tcp" 2>/dev/null || true
+  ufw delete allow "${endpoint_port}/udp" 2>/dev/null || true
   echo "TrustTunnel и WARP удалены. SSH и fail2ban оставлены без изменений."
 }
 
@@ -715,6 +749,40 @@ echo "TCP congestion control:"
 sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
 EOF
   chmod 0755 /usr/local/sbin/trusttunnel-status
+}
+
+print_mobile_instructions() {
+  echo
+  echo "=== Инструкция для мобильного клиента ==="
+  echo
+  echo "Самый простой способ:"
+  echo "1) Скачай архив клиентов с сервера:"
+  echo "   /root/trusttunnel-clients-${DOMAIN}.zip"
+  echo "2) Распакуй архив на телефоне."
+  echo "3) Импортируй TOML-файл нужного клиента в TrustTunnel app."
+  echo
+  echo "Рекомендуемый файл для проверки:"
+  echo "   client01-http2.toml"
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    echo
+    echo "Если хочешь QUIC/HTTP3:"
+    echo "   client01-http3.toml"
+    echo "   Для QUIC/HTTP3 должен проходить UDP-порт ${ENDPOINT_PORT}."
+  fi
+  echo
+  echo "Если вводишь вручную:"
+  echo "   Address: ${DOMAIN}:${ENDPOINT_PORT}"
+  echo "   Domain name from server certificate: ${DOMAIN}"
+  echo "   Custom SNI: пусто"
+  echo "   Username/Password: смотри clients-credentials.txt"
+  echo "   Protocol: HTTP/2"
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    echo "   Protocol также можно выбрать: QUIC/HTTP3"
+  fi
+  echo "   Self-signed certificate: server-cert.pem"
+  echo
+  echo "Файл паролей:"
+  echo "   ${CLIENT_DIR}/clients-credentials.txt"
 }
 
 main() {
@@ -768,7 +836,7 @@ main() {
 
   echo
   echo "ГОТОВО"
-  echo "Домен: ${DOMAIN}:443"
+  echo "Домен: ${DOMAIN}:${ENDPOINT_PORT}"
   echo "Клиентов: ${CLIENTS}"
   echo "Файлы клиентов: ${CLIENT_DIR}"
   echo "ZIP клиентов: /root/trusttunnel-clients-${DOMAIN}.zip"
@@ -780,6 +848,7 @@ main() {
   fi
   echo
   trusttunnel-status || true
+  print_mobile_instructions
 }
 
 main "$@"
