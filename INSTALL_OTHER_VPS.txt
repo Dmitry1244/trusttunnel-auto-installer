@@ -1,0 +1,289 @@
+Установка TrustTunnel + WARP на другой VPS
+==========================================
+
+Этот файл объясняет, как поднять такую же рабочую конфигурацию на новом сервере:
+
+- TrustTunnel на порту 443/tcp;
+- выходящий трафик через WARP, чтобы сайты не видели IP VPS;
+- клиенты client01, client02 и т.д.;
+- готовые TOML-файлы для импорта в клиент;
+- firewall: открыт только SSH-порт и 443/tcp;
+- fail2ban для защиты SSH от перебора паролей.
+
+
+1. Что нужно подготовить
+-----------------------
+
+Нужны:
+
+- новый VPS с Ubuntu или Debian;
+- root-доступ по SSH;
+- домен, который указывает на IP нового VPS;
+- файл install-trusttunnel-warp.sh из этой папки.
+
+Важно: перед настройкой домен уже должен вести на новый VPS.
+
+Пример:
+
+Если IP нового VPS:
+
+1.2.3.4
+
+а домен:
+
+myvpn.example.com
+
+то A-запись домена должна быть:
+
+myvpn.example.com -> 1.2.3.4
+
+
+2. Где запускать команду
+-----------------------
+
+Есть два варианта.
+
+Вариант A: зайти на новый VPS по SSH и запустить команду уже внутри сервера.
+
+Вариант B: запустить команду с Windows через PowerShell.
+
+Если скрипт лежит локально в этой папке, используй команды из разделов 3 и 4.
+Если скрипт будет лежать на GitHub, используй раздел 3.1.
+
+Для локального запуска с Windows открой папку:
+
+
+C:\Users\Admin\Documents\Trusttunnel
+
+В PowerShell:
+
+cd C:\Users\Admin\Documents\Trusttunnel
+
+
+3. Самая простая команда установки
+----------------------------------
+
+Если SSH на новом сервере работает на обычном порту 22:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 22 root@NEW_SERVER_IP "DOMAIN=YOUR_DOMAIN CLIENTS=21 SSH_PORT=22 ENABLE_WARP=1 bash -s"
+
+Замени:
+
+- NEW_SERVER_IP на IP нового VPS;
+- YOUR_DOMAIN на домен нового сервера.
+
+Пример:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 22 root@1.2.3.4 "DOMAIN=myvpn.example.com CLIENTS=21 SSH_PORT=22 ENABLE_WARP=1 bash -s"
+
+
+3.1. Запуск одной командой с GitHub
+-----------------------------------
+
+Когда скрипт будет загружен в GitHub, у него будет raw-ссылка вида:
+
+https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh
+
+Если ты уже подключился к VPS по SSH, запусти на сервере:
+
+curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh
+
+Скрипт задаст вопросы:
+
+- домен;
+- количество клиентов;
+- SSH-порт;
+- включать ли WARP;
+- включать ли fail2ban;
+- подтверждение сброса firewall.
+
+Если хочешь запустить с Windows PowerShell без ручного входа на сервер, используй ssh -t:
+
+ssh -t -p 22 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
+
+Если SSH-порт 49222:
+
+ssh -t -p 49222 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
+
+Важно: для интерактивного режима не используй curl ... | bash.
+Лучше сначала скачать файл через curl -o, потом запускать bash.
+
+
+4. Если SSH-порт нестандартный
+------------------------------
+
+Если SSH-порт, например, 49222, укажи его в двух местах:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@NEW_SERVER_IP "DOMAIN=YOUR_DOMAIN CLIENTS=21 SSH_PORT=49222 ENABLE_WARP=1 bash -s"
+
+Пример:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMAIN=myvpn.example.com CLIENTS=21 SSH_PORT=49222 ENABLE_WARP=1 bash -s"
+
+
+5. Что делает скрипт
+--------------------
+
+Скрипт автоматически:
+
+- ставит нужные пакеты;
+- скачивает TrustTunnel endpoint;
+- скачивает wgcf и wireproxy для WARP;
+- регистрирует WARP-профиль;
+- запускает WARP как локальный SOCKS5 proxy;
+- создает сертификат под твой домен;
+- настраивает TrustTunnel на HTTP/2;
+- направляет исходящий трафик TrustTunnel через WARP;
+- создает клиентов client01...clientXX;
+- создает TOML-файлы клиентов;
+- собирает ZIP-архив с клиентскими конфигами;
+- настраивает firewall;
+- ставит и включает fail2ban для SSH.
+
+
+6. Где будут файлы клиентов
+---------------------------
+
+После установки на сервере появятся:
+
+/root/trusttunnel-clients/
+
+и ZIP-архив:
+
+/root/trusttunnel-clients-YOUR_DOMAIN.zip
+
+Пример:
+
+/root/trusttunnel-clients-myvpn.example.com.zip
+
+
+7. Как скачать ZIP с клиентами на Windows
+-----------------------------------------
+
+Из PowerShell на своем ПК:
+
+scp -P 22 root@NEW_SERVER_IP:/root/trusttunnel-clients-YOUR_DOMAIN.zip .
+
+Пример:
+
+scp -P 22 root@1.2.3.4:/root/trusttunnel-clients-myvpn.example.com.zip .
+
+Если SSH-порт 49222:
+
+scp -P 49222 root@1.2.3.4:/root/trusttunnel-clients-myvpn.example.com.zip .
+
+Файл скачается в текущую папку PowerShell.
+
+
+8. Как проверить сервер после установки
+---------------------------------------
+
+Подключись к серверу:
+
+ssh -p 22 root@NEW_SERVER_IP
+
+или, если нестандартный порт:
+
+ssh -p 49222 root@NEW_SERVER_IP
+
+На сервере выполни:
+
+trusttunnel-status
+
+Нормальный результат:
+
+- trusttunnel active;
+- warp-wireproxy active;
+- fail2ban active;
+- порт 443 слушается;
+- Direct public IP показывает IP VPS;
+- WARP public IP показывает другой IP, обычно Cloudflare/WARP.
+
+Если WARP public IP совпадает с IP VPS, значит WARP не работает.
+
+Чтобы отдельно проверить защиту SSH:
+
+fail2ban-client status sshd
+
+Нормально, если видишь jail sshd и строки вроде:
+
+- Currently failed;
+- Total failed;
+- Currently banned;
+- Banned IP list.
+
+
+9. Какие порты будут открыты
+----------------------------
+
+Скрипт сбрасывает UFW firewall и открывает только:
+
+- SSH_PORT/tcp;
+- 443/tcp.
+
+Например, если SSH_PORT=49222:
+
+- 49222/tcp;
+- 443/tcp.
+
+QUIC/HTTP3 в этом простом варианте не включается.
+Рабочий и стабильный режим: HTTP/2.
+
+
+9.1. Как работает fail2ban
+--------------------------
+
+Скрипт включает fail2ban только для SSH.
+
+Параметры:
+
+- jail: sshd;
+- порт: тот, который указан в SSH_PORT;
+- maxretry: 5 ошибок;
+- findtime: 10 минут;
+- bantime: 1 час.
+
+То есть если кто-то 5 раз ошибется с SSH-паролем за 10 минут, его IP будет забанен на 1 час.
+
+TrustTunnel fail2ban не трогает.
+
+
+10. Как изменить количество клиентов
+------------------------------------
+
+По умолчанию:
+
+CLIENTS=21
+
+Если нужно 10 клиентов:
+
+CLIENTS=10
+
+Пример:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 22 root@1.2.3.4 "DOMAIN=myvpn.example.com CLIENTS=10 SSH_PORT=22 ENABLE_WARP=1 bash -s"
+
+
+11. Важные замечания
+--------------------
+
+- Скрипт рассчитан на чистый Ubuntu/Debian VPS.
+- Скрипт может перезаписать существующие настройки TrustTunnel на сервере.
+- Скрипт сбрасывает UFW firewall rules.
+- Скрипт ставит fail2ban и перезаписывает /etc/fail2ban/jail.d/sshd.local.
+- Сертификат self-signed, но он встроен в каждый TOML-файл клиента.
+- Для Android/Windows импортируй TOML-файл нужного клиента.
+- Один клиент = один логин и пароль.
+- Если клиентский конфиг утек, меняй пароль только этому клиенту.
+
+
+12. Быстрый шаблон
+------------------
+
+Скопируй команду, замени IP, домен и SSH-порт:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p SSH_PORT root@SERVER_IP "DOMAIN=DOMAIN_NAME CLIENTS=21 SSH_PORT=SSH_PORT ENABLE_WARP=1 bash -s"
+
+Пример:
+
+Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMAIN=myvpn.example.com CLIENTS=21 SSH_PORT=49222 ENABLE_WARP=1 bash -s"
