@@ -21,10 +21,8 @@
 Зайди на сервер по SSH и выполни:
 
 ```bash
-curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh
+curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh
 ```
-
-Замени `GITHUB_USER/REPO_NAME` на свой GitHub-репозиторий.
 
 После запуска появится начальное меню:
 
@@ -42,13 +40,13 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 ## Запуск с Windows PowerShell
 
 ```powershell
-ssh -t -p 22 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
+ssh -t -p 22 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
 ```
 
 Если SSH-порт нестандартный:
 
 ```powershell
-ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
+ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
 ```
 
 ## Что спросит скрипт
