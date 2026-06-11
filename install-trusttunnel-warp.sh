@@ -16,6 +16,7 @@ CLIENTS="${CLIENTS:-}"
 SSH_PORT="${SSH_PORT:-}"
 ENABLE_WARP="${ENABLE_WARP:-}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
+ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
 TT_VERSION="${TT_VERSION:-v1.0.33}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
@@ -102,6 +103,7 @@ collect_config() {
   ask_required DOMAIN "Домен для TrustTunnel, например vpn.example.com: "
   ask_default CLIENTS "Сколько клиентов создать" "21"
   ask_default SSH_PORT "SSH-порт сервера" "22"
+  ask_yes_no ENABLE_SYSTEM_UPGRADE "Обновить систему перед установкой" "1"
   ask_yes_no ENABLE_WARP "Включить WARP для скрытия IP сервера от сайтов" "1"
   ask_yes_no ENABLE_FAIL2BAN "Включить fail2ban для защиты SSH" "1"
 
@@ -122,6 +124,7 @@ collect_config() {
   echo "- Домен: ${DOMAIN}"
   echo "- Клиентов: ${CLIENTS}"
   echo "- SSH-порт: ${SSH_PORT}"
+  echo "- Обновить систему: ${ENABLE_SYSTEM_UPGRADE}"
   echo "- WARP: ${ENABLE_WARP}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
   echo
@@ -130,6 +133,9 @@ collect_config() {
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt-get update
+  if [ "$ENABLE_SYSTEM_UPGRADE" = "1" ]; then
+    apt-get upgrade -y
+  fi
   local packages
   packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 zip coreutils sed grep gawk"
   if [ "$ENABLE_FAIL2BAN" = "1" ]; then
@@ -517,6 +523,11 @@ main() {
   echo "Файлы клиентов: ${CLIENT_DIR}"
   echo "ZIP клиентов: /root/trusttunnel-clients-${DOMAIN}.zip"
   echo "Команда проверки: trusttunnel-status"
+  if [ -f /var/run/reboot-required ]; then
+    echo
+    echo "ВНИМАНИЕ: после обновления системы сервер просит перезагрузку."
+    echo "Проверь подключение и при удобном моменте выполни: reboot"
+  fi
   echo
   trusttunnel-status || true
 }
