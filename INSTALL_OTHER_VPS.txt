@@ -365,6 +365,7 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 22 root@1.2.3.4 "DOMAIN=
 - Скрипт может перезаписать существующие настройки TrustTunnel на сервере.
 - Скрипт сбрасывает UFW firewall rules.
 - Скрипт ставит fail2ban и перезаписывает /etc/fail2ban/jail.d/sshd.local.
+- При смене SSH-порта не закрывай текущую SSH-сессию, пока не проверишь новый вход.
 - Сертификат self-signed, но он встроен в каждый TOML-файл клиента.
 - Для Android/Windows импортируй TOML-файл нужного клиента.
 - Один клиент = один логин и пароль.
