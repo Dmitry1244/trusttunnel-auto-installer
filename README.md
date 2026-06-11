@@ -5,6 +5,7 @@
 Что настраивает:
 
 - TrustTunnel на выбранном TCP-порту, по умолчанию `443`;
+- актуальную версию TrustTunnel из latest GitHub release;
 - обновление системы перед установкой;
 - WARP через `wireproxy`, чтобы сайты видели WARP/Cloudflare IP, а не IP VPS;
 - HTTP/2 и опционально QUIC/HTTP3;
@@ -32,10 +33,12 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 3) Установить или переустановить только WARP
 4) Удалить только WARP и переключить TrustTunnel на direct
 5) Показать статус
+6) Обновить только TrustTunnel endpoint
 0) Выход
 ```
 
 Для обычной установки выбирай `1`.
+Для обновления TrustTunnel без пересоздания клиентов выбирай `6`.
 
 ## Запуск с Windows PowerShell
 
@@ -63,6 +66,12 @@ ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh h
 - подтверждение сброса UFW firewall.
 
 В конце скрипт выводит короткую инструкцию для мобильного клиента: какой TOML импортировать, какой адрес/порт вводить вручную, где лежит `server-cert.pem` и где смотреть логины/пароли.
+
+По умолчанию используется `TT_VERSION=latest`. Если нужно поставить конкретную версию:
+
+```bash
+TT_VERSION=v1.0.33 bash /tmp/install-trusttunnel-warp.sh
+```
 
 ## Где будут клиенты
 
@@ -105,6 +114,7 @@ trusttunnel-status
 - выбранный UDP-порт слушается, если включен QUIC/HTTP3;
 - WARP public IP отличается от IP VPS.
 - `net.ipv4.tcp_congestion_control = bbr`.
+- systemd service использует `Restart=always`.
 
 ## Важно
 
