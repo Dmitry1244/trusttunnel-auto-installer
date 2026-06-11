@@ -211,12 +211,15 @@ collect_config() {
 confirm_action() {
   local message="$1"
   local answer=""
-  prompt_value "$message Напиши YES для подтверждения: "
+  prompt_value "$message Напиши YES/yes/да для подтверждения: "
   answer="$REPLY_VALUE"
-  if [ "$answer" != "YES" ]; then
-    echo "Отменено."
-    exit 1
-  fi
+  case "$answer" in
+    YES|yes|Yes|Y|y|да|Да|ДА|д|Д) return ;;
+    *)
+      echo "Отменено."
+      exit 1
+      ;;
+  esac
 }
 
 install_packages() {
