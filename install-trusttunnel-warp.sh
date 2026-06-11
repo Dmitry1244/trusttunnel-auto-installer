@@ -634,6 +634,9 @@ configure_ssh_port() {
   fi
 
   local sshd_bin ssh_service
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
+
   sshd_bin="$(command -v sshd || true)"
   if [ -z "$sshd_bin" ] && [ -x /usr/sbin/sshd ]; then
     sshd_bin="/usr/sbin/sshd"
@@ -884,8 +887,8 @@ main() {
   write_server_config
   write_clients
   write_systemd
-  configure_firewall
   configure_ssh_port
+  configure_firewall
   configure_fail2ban
   configure_bbr
   write_tools
