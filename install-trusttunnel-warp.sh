@@ -772,11 +772,13 @@ show_status() {
     trusttunnel-status
     return
   fi
+  local endpoint_port
+  endpoint_port="$(current_endpoint_port)"
   echo "Services:"
   systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
   echo
   echo "Listening:"
-  ss -lntup | grep -E ':(443|40000|40001|22|49222)\b|sshd' || true
+  ss -lntup | grep -E ":(${endpoint_port}|40000|40001|22|49222)\b|sshd|trusttunnel" || true
   echo
   echo "UFW:"
   ufw status 2>/dev/null || true
@@ -789,8 +791,16 @@ set -euo pipefail
 echo "Services:"
 systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
 echo
+endpoint_port="$(sed -nE 's/^[[:space:]]*listen_address[[:space:]]*=[[:space:]]*"[^:"]+:([0-9]+)".*/\1/p' /opt/trusttunnel/vpn.toml 2>/dev/null | head -1)"
+endpoint_port="${endpoint_port:-443}"
+echo "TrustTunnel endpoint port:"
+echo "$endpoint_port"
+echo
 echo "Listening:"
-ss -lntup | grep -E ':(443|40000|40001|22|49222)\b|sshd' || true
+ss -lntup | grep -E ":(${endpoint_port}|40000|40001|22|49222)\b|sshd|trusttunnel" || true
+echo
+echo "TrustTunnel config:"
+grep -E '^[[:space:]]*listen_address|^\[listen_protocols\.(http2|quic)\]' /opt/trusttunnel/vpn.toml 2>/dev/null || true
 echo
 echo "Direct public IP:"
 curl -4 -sS --max-time 8 https://ifconfig.me || true
@@ -805,6 +815,9 @@ fail2ban-client status sshd 2>/dev/null || true
 echo
 echo "TCP congestion control:"
 sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
+echo
+echo "Recent TrustTunnel logs:"
+journalctl -u trusttunnel -n 20 --no-pager 2>/dev/null || true
 EOF
   chmod 0755 /usr/local/sbin/trusttunnel-status
 }
@@ -841,6 +854,25 @@ print_mobile_instructions() {
   echo
   echo "Файл паролей:"
   echo "   ${CLIENT_DIR}/clients-credentials.txt"
+}
+
+verify_endpoint_listening() {
+  echo
+  echo "=== Проверка TrustTunnel endpoint ==="
+  if ss -lntup | grep -Eq ":${ENDPOINT_PORT}\b.*trusttunnel|trusttunnel.*:${ENDPOINT_PORT}\b"; then
+    echo "OK: TrustTunnel слушает TCP-порт ${ENDPOINT_PORT}."
+  else
+    echo "ВНИМАНИЕ: TrustTunnel TCP-порт ${ENDPOINT_PORT} не найден в LISTEN."
+    echo "Последние логи trusttunnel:"
+    journalctl -u trusttunnel -n 60 --no-pager 2>/dev/null || true
+  fi
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    if ss -lunp | grep -Eq ":${ENDPOINT_PORT}\b.*trusttunnel|trusttunnel.*:${ENDPOINT_PORT}\b"; then
+      echo "OK: TrustTunnel слушает UDP-порт ${ENDPOINT_PORT} для QUIC/HTTP3."
+    else
+      echo "ВНИМАНИЕ: TrustTunnel UDP-порт ${ENDPOINT_PORT} не найден в LISTEN."
+    fi
+  fi
 }
 
 main() {
@@ -910,6 +942,7 @@ main() {
   fi
   echo
   trusttunnel-status || true
+  verify_endpoint_listening
   print_mobile_instructions
 }
 
