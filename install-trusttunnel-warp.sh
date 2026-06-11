@@ -19,6 +19,7 @@ ENABLE_WARP="${ENABLE_WARP:-}"
 ENABLE_QUIC="${ENABLE_QUIC:-}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
 ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
+ACTION="${ACTION:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
 TT_VERSION="${TT_VERSION:-v1.0.33}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
@@ -109,6 +110,34 @@ detect_current_ssh_port() {
   printf '22'
 }
 
+choose_action() {
+  if [ -n "$ACTION" ]; then
+    return
+  fi
+
+  while true; do
+    echo
+    echo "=== TrustTunnel auto-installer ==="
+    echo "1) Установить или переустановить TrustTunnel"
+    echo "2) Удалить TrustTunnel и WARP"
+    echo "3) Установить или переустановить только WARP"
+    echo "4) Удалить только WARP и переключить TrustTunnel на direct"
+    echo "5) Показать статус"
+    echo "0) Выход"
+    echo
+    prompt_value "Выбери действие [1]: "
+    case "${REPLY_VALUE:-1}" in
+      1) ACTION="install"; return ;;
+      2) ACTION="remove-all"; return ;;
+      3) ACTION="install-warp"; return ;;
+      4) ACTION="remove-warp"; return ;;
+      5) ACTION="status"; return ;;
+      0) ACTION="exit"; return ;;
+      *) echo "Нужно выбрать 0, 1, 2, 3, 4 или 5." ;;
+    esac
+  done
+}
+
 collect_config() {
   local detected_ssh_port
   detected_ssh_port="$(detect_current_ssh_port)"
@@ -152,6 +181,17 @@ collect_config() {
   echo "- QUIC/HTTP3: ${ENABLE_QUIC}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
   echo
+}
+
+confirm_action() {
+  local message="$1"
+  local answer=""
+  prompt_value "$message Напиши YES для подтверждения: "
+  answer="$REPLY_VALUE"
+  if [ "$answer" != "YES" ]; then
+    echo "Отменено."
+    exit 1
+  fi
 }
 
 install_packages() {
@@ -253,6 +293,62 @@ generate_warp_profile() {
 BindAddress = ${SOCKS_ADDR}
 EOF
   chmod 0600 "$WARP_DIR/wireproxy.conf"
+}
+
+write_warp_systemd() {
+  cat > /etc/systemd/system/warp-wireproxy.service <<EOF
+[Unit]
+Description=WARP SOCKS5 proxy for TrustTunnel outbound
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WARP_DIR}
+ExecStart=${WARP_DIR}/bin/wireproxy -c ${WARP_DIR}/wireproxy.conf -i ${WARP_HEALTH_ADDR}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now warp-wireproxy
+}
+
+switch_trusttunnel_forwarder() {
+  local mode="$1"
+  local config="$TT_DIR/vpn.toml"
+  local tmp
+  if [ ! -f "$config" ]; then
+    return
+  fi
+
+  cp "$config" "$config.backup.$(date +%Y%m%d%H%M%S)"
+  tmp="$(mktemp)"
+  awk -v mode="$mode" -v socks_addr="$SOCKS_ADDR" '
+    BEGIN { inserted = 0; skip = 0 }
+    /^\[forward_protocol\.socks5\]$/ { skip = 1; next }
+    /^\[forward_protocol\.direct\]$/ { skip = 1; next }
+    skip && /^\[/ { skip = 0 }
+    skip { next }
+    { print }
+    /^\[forward_protocol\]$/ && !inserted {
+      print ""
+      if (mode == "socks5") {
+        print "[forward_protocol.socks5]"
+        print "address = \"" socks_addr "\""
+        print "extended_auth = false"
+      } else {
+        print "[forward_protocol.direct]"
+      }
+      inserted = 1
+    }
+  ' "$config" > "$tmp"
+  cat "$tmp" > "$config"
+  rm -f "$tmp"
+  systemctl restart trusttunnel 2>/dev/null || true
 }
 
 write_certs() {
@@ -440,23 +536,7 @@ EOF
 
 write_systemd() {
   if [ "$ENABLE_WARP" = "1" ]; then
-    cat > /etc/systemd/system/warp-wireproxy.service <<EOF
-[Unit]
-Description=WARP SOCKS5 proxy for TrustTunnel outbound
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=${WARP_DIR}
-ExecStart=${WARP_DIR}/bin/wireproxy -c ${WARP_DIR}/wireproxy.conf -i ${WARP_HEALTH_ADDR}
-Restart=always
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    write_warp_systemd
   fi
 
   cat > /etc/systemd/system/trusttunnel.service <<EOF
@@ -478,9 +558,6 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  if [ "$ENABLE_WARP" = "1" ]; then
-    systemctl enable --now warp-wireproxy
-  fi
   systemctl enable --now trusttunnel
 }
 
@@ -559,6 +636,60 @@ EOF
   sysctl --system >/dev/null || true
 }
 
+install_or_reinstall_warp_only() {
+  ENABLE_WARP=1
+  ENABLE_FAIL2BAN=0
+  ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-0}"
+  install_packages
+  download_wireproxy
+  generate_warp_profile
+  write_warp_systemd
+  switch_trusttunnel_forwarder socks5
+  echo "WARP установлен/переустановлен."
+  trusttunnel-status 2>/dev/null || true
+}
+
+remove_warp_only() {
+  confirm_action "Будет удален WARP/wireproxy. TrustTunnel переключится на direct, если он установлен."
+  systemctl disable --now warp-wireproxy 2>/dev/null || true
+  rm -f /etc/systemd/system/warp-wireproxy.service
+  systemctl daemon-reload
+  rm -rf "$WARP_DIR"
+  switch_trusttunnel_forwarder direct
+  echo "WARP удален. TrustTunnel переключен на direct."
+  trusttunnel-status 2>/dev/null || true
+}
+
+remove_all() {
+  confirm_action "Будут удалены TrustTunnel, WARP, клиентские файлы и порт 443 из UFW. SSH/fail2ban не удаляются."
+  systemctl disable --now trusttunnel 2>/dev/null || true
+  systemctl disable --now warp-wireproxy 2>/dev/null || true
+  rm -f /etc/systemd/system/trusttunnel.service
+  rm -f /etc/systemd/system/warp-wireproxy.service
+  systemctl daemon-reload
+  rm -rf "$TT_DIR" "$WARP_DIR" "$CLIENT_DIR"
+  rm -f /root/trusttunnel-clients-*.zip
+  rm -f /usr/local/sbin/trusttunnel-status
+  ufw delete allow 443/tcp 2>/dev/null || true
+  ufw delete allow 443/udp 2>/dev/null || true
+  echo "TrustTunnel и WARP удалены. SSH и fail2ban оставлены без изменений."
+}
+
+show_status() {
+  if command -v trusttunnel-status >/dev/null 2>&1; then
+    trusttunnel-status
+    return
+  fi
+  echo "Services:"
+  systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
+  echo
+  echo "Listening:"
+  ss -lntup | grep -E ':(443|40000|40001|22|49222)\b|sshd' || true
+  echo
+  echo "UFW:"
+  ufw status 2>/dev/null || true
+}
+
 write_tools() {
   cat > /usr/local/sbin/trusttunnel-status <<'EOF'
 #!/usr/bin/env bash
@@ -588,6 +719,36 @@ EOF
 
 main() {
   need_root
+  choose_action
+  case "$ACTION" in
+    install|reinstall)
+      ;;
+    install-warp)
+      install_or_reinstall_warp_only
+      exit 0
+      ;;
+    remove-warp)
+      remove_warp_only
+      exit 0
+      ;;
+    remove-all)
+      remove_all
+      exit 0
+      ;;
+    status)
+      show_status
+      exit 0
+      ;;
+    exit)
+      echo "Выход."
+      exit 0
+      ;;
+    *)
+      echo "Unknown ACTION: $ACTION" >&2
+      exit 1
+      ;;
+  esac
+
   collect_config
   install_packages
   download_trusttunnel
