@@ -40,7 +40,8 @@ ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh h
 
 - домен TrustTunnel;
 - количество клиентов;
-- SSH-порт;
+- менять ли SSH-порт;
+- новый SSH-порт, по умолчанию `49222`;
 - обновлять ли систему перед установкой;
 - включать ли WARP;
 - включать ли fail2ban;
