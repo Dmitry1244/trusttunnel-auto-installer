@@ -140,6 +140,9 @@ choose_action() {
     echo "4) Удалить только WARP и переключить TrustTunnel на direct"
     echo "5) Показать статус"
     echo "6) Обновить только TrustTunnel endpoint"
+    echo "7) Проверить WARP"
+    echo "8) Включить WARP"
+    echo "9) Отключить WARP без удаления"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -150,8 +153,11 @@ choose_action() {
       4) ACTION="remove-warp"; return ;;
       5) ACTION="status"; return ;;
       6) ACTION="update-trusttunnel"; return ;;
+      7) ACTION="check-warp"; return ;;
+      8) ACTION="enable-warp"; return ;;
+      9) ACTION="disable-warp"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0, 1, 2, 3, 4, 5 или 6." ;;
+      *) echo "Нужно выбрать 0, 1, 2, 3, 4, 5, 6, 7, 8 или 9." ;;
     esac
   done
 }
@@ -717,6 +723,44 @@ update_trusttunnel_only() {
   trusttunnel-status 2>/dev/null || show_status
 }
 
+check_warp() {
+  echo "WARP service:"
+  systemctl --no-pager --plain is-active warp-wireproxy 2>/dev/null || true
+  echo
+  echo "WARP listener:"
+  ss -lntup | grep -E ':(40000|40001)\b|wireproxy' || true
+  echo
+  echo "Direct public IP:"
+  curl -4 -sS --max-time 8 https://ifconfig.me || true
+  echo
+  echo
+  echo "WARP public IP:"
+  if curl -x socks5h://127.0.0.1:40000 -sS --max-time 12 https://ifconfig.me; then
+    echo
+  else
+    echo "WARP SOCKS недоступен на 127.0.0.1:40000."
+  fi
+}
+
+enable_warp() {
+  if [ ! -x "$WARP_DIR/bin/wireproxy" ] || [ ! -f "$WARP_DIR/wireproxy.conf" ]; then
+    echo "WARP не установлен полностью. Запускаю установку/переустановку WARP."
+    install_or_reinstall_warp_only
+    return
+  fi
+  write_warp_systemd
+  switch_trusttunnel_forwarder socks5
+  echo "WARP включен. TrustTunnel переключен на WARP/SOCKS."
+  check_warp
+}
+
+disable_warp() {
+  systemctl disable --now warp-wireproxy 2>/dev/null || true
+  switch_trusttunnel_forwarder direct
+  echo "WARP отключен без удаления файлов. TrustTunnel переключен на direct."
+  check_warp
+}
+
 install_or_reinstall_warp_only() {
   ENABLE_WARP=1
   ENABLE_FAIL2BAN=0
@@ -785,6 +829,16 @@ show_status() {
 }
 
 write_tools() {
+  cat > /usr/local/sbin/trusttunnel-menu <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+SCRIPT_URL="https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh"
+TMP_SCRIPT="/tmp/install-trusttunnel-warp.sh"
+curl -fsSL -o "$TMP_SCRIPT" "${SCRIPT_URL}?$(date +%s)"
+bash "$TMP_SCRIPT"
+EOF
+  chmod 0755 /usr/local/sbin/trusttunnel-menu
+
   cat > /usr/local/sbin/trusttunnel-status <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -901,6 +955,18 @@ main() {
       update_trusttunnel_only
       exit 0
       ;;
+    check-warp)
+      check_warp
+      exit 0
+      ;;
+    enable-warp)
+      enable_warp
+      exit 0
+      ;;
+    disable-warp)
+      disable_warp
+      exit 0
+      ;;
     exit)
       echo "Выход."
       exit 0
@@ -935,6 +1001,7 @@ main() {
   echo "Файлы клиентов: ${CLIENT_DIR}"
   echo "ZIP клиентов: /root/trusttunnel-clients-${DOMAIN}.zip"
   echo "Команда проверки: trusttunnel-status"
+  echo "Главное меню: trusttunnel-menu"
   if [ -f /var/run/reboot-required ]; then
     echo
     echo "ВНИМАНИЕ: после обновления системы сервер просит перезагрузку."
