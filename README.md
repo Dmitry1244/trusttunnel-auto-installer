@@ -5,6 +5,7 @@
 Что настраивает:
 
 - TrustTunnel на `443/tcp`;
+- обновление системы перед установкой;
 - WARP через `wireproxy`, чтобы сайты видели WARP/Cloudflare IP, а не IP VPS;
 - клиентов `client01`, `client02` и т.д.;
 - TOML-файлы клиентов;
@@ -40,6 +41,7 @@ ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh h
 - домен TrustTunnel;
 - количество клиентов;
 - SSH-порт;
+- обновлять ли систему перед установкой;
 - включать ли WARP;
 - включать ли fail2ban;
 - подтверждение сброса UFW firewall.
