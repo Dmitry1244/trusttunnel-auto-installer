@@ -86,11 +86,11 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 22 root@1.2.3.4 "DOMAIN=
 
 Когда скрипт будет загружен в GitHub, у него будет raw-ссылка вида:
 
-https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh
+https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh
 
 Если ты уже подключился к VPS по SSH, запусти на сервере:
 
-curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh
+curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh
 
 Скрипт задаст вопросы:
 
@@ -107,11 +107,11 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 
 Если хочешь запустить с Windows PowerShell без ручного входа на сервер, используй ssh -t:
 
-ssh -t -p 22 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
+ssh -t -p 22 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
 
 Если SSH-порт 49222:
 
-ssh -t -p 49222 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/GITHUB_USER/REPO_NAME/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
+ssh -t -p 49222 root@NEW_SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh && bash /tmp/install-trusttunnel-warp.sh"
 
 Важно: для интерактивного режима не используй curl ... | bash.
 Лучше сначала скачать файл через curl -o, потом запускать bash.
