@@ -16,6 +16,7 @@ CLIENTS="${CLIENTS:-}"
 SSH_PORT="${SSH_PORT:-}"
 CHANGE_SSH_PORT="${CHANGE_SSH_PORT:-}"
 ENABLE_WARP="${ENABLE_WARP:-}"
+ENABLE_QUIC="${ENABLE_QUIC:-}"
 ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
 ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
@@ -125,6 +126,7 @@ collect_config() {
   fi
   ask_yes_no ENABLE_SYSTEM_UPGRADE "Обновить систему перед установкой" "1"
   ask_yes_no ENABLE_WARP "Включить WARP для скрытия IP сервера от сайтов" "1"
+  ask_yes_no ENABLE_QUIC "Включить QUIC/HTTP3 на UDP 443" "1"
   ask_yes_no ENABLE_FAIL2BAN "Включить fail2ban для защиты SSH" "1"
 
   if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
@@ -147,6 +149,7 @@ collect_config() {
   echo "- SSH-порт для firewall/fail2ban: ${SSH_PORT}"
   echo "- Обновить систему: ${ENABLE_SYSTEM_UPGRADE}"
   echo "- WARP: ${ENABLE_WARP}"
+  echo "- QUIC/HTTP3: ${ENABLE_QUIC}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
   echo
 }
@@ -320,6 +323,26 @@ max_frame_size = 16384
 header_table_size = 65536
 EOF
 
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    cat >> "$TT_DIR/vpn.toml" <<'EOF'
+
+[listen_protocols.quic]
+recv_udp_payload_size = 1350
+send_udp_payload_size = 1350
+initial_max_data = 104857600
+initial_max_stream_data_bidi_local = 1048576
+initial_max_stream_data_bidi_remote = 1048576
+initial_max_stream_data_uni = 1048576
+initial_max_streams_bidi = 4096
+initial_max_streams_uni = 4096
+max_connection_window = 25165824
+max_stream_window = 16777216
+disable_active_migration = true
+enable_early_data = true
+message_queue_capacity = 4096
+EOF
+  fi
+
   cat > "$TT_DIR/hosts.toml" <<EOF
 ping_hosts = []
 speedtest_hosts = []
@@ -342,7 +365,7 @@ random_password() {
 }
 
 write_clients() {
-  local cert cert_indented i user pass profile zip_path
+  local cert i user pass profile zip_path protocol protocols
   mkdir -p "$CLIENT_DIR"
   cert="$(cat "$TT_DIR/certs/cert.pem")"
   cp "$TT_DIR/certs/cert.pem" "$CLIENT_DIR/server-cert.pem"
@@ -362,8 +385,13 @@ username = "${user}"
 password = "${pass}"
 EOF
     printf '%s %s\n' "$user" "$pass" >> "$CLIENT_DIR/clients-credentials.txt"
-    profile="$CLIENT_DIR/${user}-http2.toml"
-    cat > "$profile" <<EOF
+    protocols="http2"
+    if [ "$ENABLE_QUIC" = "1" ]; then
+      protocols="http2 http3"
+    fi
+    for protocol in $protocols; do
+      profile="$CLIENT_DIR/${user}-${protocol}.toml"
+      cat > "$profile" <<EOF
 # Endpoint host name, used for TLS session establishment
 hostname = "${DOMAIN}"
 
@@ -394,11 +422,12 @@ ${cert}
 """
 
 # Protocol to be used to communicate with the endpoint [http2, http3]
-upstream_protocol = "http2"
+upstream_protocol = "${protocol}"
 
 # Is anti-DPI measures should be enabled
 anti_dpi = false
 EOF
+    done
   done
 
   chmod 0600 "$TT_DIR/credentials.toml"
@@ -461,6 +490,9 @@ configure_firewall() {
   ufw default allow outgoing
   ufw allow "${SSH_PORT}/tcp" comment "SSH"
   ufw allow 443/tcp comment "TrustTunnel TCP"
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    ufw allow 443/udp comment "TrustTunnel QUIC"
+  fi
   ufw --force enable
 }
 
