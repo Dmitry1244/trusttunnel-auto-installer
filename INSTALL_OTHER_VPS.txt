@@ -5,6 +5,7 @@
 
 - TrustTunnel на порту 443/tcp;
 - обновление системы перед установкой;
+- HTTP/2 и, по выбору, QUIC/HTTP3;
 - выходящий трафик через WARP, чтобы сайты не видели IP VPS;
 - клиенты client01, client02 и т.д.;
 - готовые TOML-файлы для импорта в клиент;
@@ -98,6 +99,7 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 - новый SSH-порт, по умолчанию 49222;
 - обновлять ли систему перед установкой;
 - включать ли WARP;
+- включать ли QUIC/HTTP3;
 - включать ли fail2ban;
 - подтверждение сброса firewall.
 
@@ -139,9 +141,11 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMA
 - запускает WARP как локальный SOCKS5 proxy;
 - создает сертификат под твой домен;
 - настраивает TrustTunnel на HTTP/2;
+- если выбрано, включает QUIC/HTTP3;
 - направляет исходящий трафик TrustTunnel через WARP;
 - создает клиентов client01...clientXX;
 - создает TOML-файлы клиентов;
+- если включен QUIC/HTTP3, создает два TOML-файла на клиента: http2 и http3;
 - собирает ZIP-архив с клиентскими конфигами;
 - настраивает firewall;
 - меняет SSH-порт, если ты выбрал этот пункт;
@@ -163,6 +167,13 @@ Get-Content -Raw .\install-trusttunnel-warp.sh | ssh -p 49222 root@1.2.3.4 "DOMA
 Пример:
 
 /root/trusttunnel-clients-myvpn.example.com.zip
+
+Если QUIC/HTTP3 включен, внутри архива будут пары файлов:
+
+client01-http2.toml
+client01-http3.toml
+
+Можно импортировать нужный вариант или выбрать протокол вручную в клиентском приложении.
 
 
 7. Как скачать ZIP с клиентами на Windows
@@ -204,6 +215,7 @@ trusttunnel-status
 - warp-wireproxy active;
 - fail2ban active;
 - порт 443 слушается;
+- 443/udp слушается, если включен QUIC/HTTP3;
 - Direct public IP показывает IP VPS;
 - WARP public IP показывает другой IP, обычно Cloudflare/WARP.
 - TCP congestion control показывает bbr.
@@ -230,6 +242,10 @@ fail2ban-client status sshd
 - SSH_PORT/tcp;
 - 443/tcp.
 
+Если включен QUIC/HTTP3, дополнительно открывается:
+
+- 443/udp.
+
 Если ты выбрал смену SSH-порта, SSH_PORT станет новым портом SSH.
 
 Например, если SSH_PORT=49222:
@@ -240,8 +256,8 @@ fail2ban-client status sshd
 Важно: порт в команде первого подключения может быть старым, например 22.
 А SSH_PORT внутри скрипта - это порт, который будет использоваться после установки.
 
-QUIC/HTTP3 в этом простом варианте не включается.
-Рабочий и стабильный режим: HTTP/2.
+Самый стабильный режим: HTTP/2.
+QUIC/HTTP3 можно включить во время установки, но он зависит от UDP-доступности у провайдера и сети клиента.
 
 
 9.1. Как работает fail2ban
