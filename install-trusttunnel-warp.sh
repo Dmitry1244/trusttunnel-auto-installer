@@ -466,6 +466,10 @@ EOF
 address = "${SOCKS_ADDR}"
 extended_auth = false
 EOF
+  else
+    cat >> "$TT_DIR/vpn.toml" <<'EOF'
+[forward_protocol.direct]
+EOF
   fi
 
   cat >> "$TT_DIR/vpn.toml" <<EOF
