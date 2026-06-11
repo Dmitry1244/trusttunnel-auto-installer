@@ -457,6 +457,14 @@ EOF
   systemctl restart fail2ban
 }
 
+configure_bbr() {
+  cat > /etc/sysctl.d/99-trusttunnel-bbr.conf <<'EOF'
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+  sysctl --system >/dev/null || true
+}
+
 write_tools() {
   cat > /usr/local/sbin/trusttunnel-status <<'EOF'
 #!/usr/bin/env bash
@@ -477,6 +485,9 @@ echo
 echo
 echo "Fail2ban SSH jail:"
 fail2ban-client status sshd 2>/dev/null || true
+echo
+echo "TCP congestion control:"
+sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
 EOF
   chmod 0755 /usr/local/sbin/trusttunnel-status
 }
@@ -496,6 +507,7 @@ main() {
   write_systemd
   configure_firewall
   configure_fail2ban
+  configure_bbr
   write_tools
 
   echo
