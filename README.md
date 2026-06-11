@@ -10,7 +10,8 @@
 - TOML-файлы клиентов;
 - ZIP-архив с клиентскими конфигами;
 - UFW firewall;
-- fail2ban для защиты SSH.
+- fail2ban для защиты SSH;
+- BBR congestion control для TCP.
 
 ## Быстрый запуск на VPS
 
@@ -73,6 +74,7 @@ trusttunnel-status
 - `fail2ban` active;
 - `443/tcp` слушается;
 - WARP public IP отличается от IP VPS.
+- `net.ipv4.tcp_congestion_control = bbr`.
 
 ## Важно
 
