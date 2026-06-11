@@ -25,6 +25,19 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 
 Замени `GITHUB_USER/REPO_NAME` на свой GitHub-репозиторий.
 
+После запуска появится начальное меню:
+
+```text
+1) Установить или переустановить TrustTunnel
+2) Удалить TrustTunnel и WARP
+3) Установить или переустановить только WARP
+4) Удалить только WARP и переключить TrustTunnel на direct
+5) Показать статус
+0) Выход
+```
+
+Для обычной установки выбирай `1`.
+
 ## Запуск с Windows PowerShell
 
 ```powershell
