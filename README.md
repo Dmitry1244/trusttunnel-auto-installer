@@ -4,10 +4,11 @@
 
 Что настраивает:
 
-- TrustTunnel на `443/tcp`;
+- TrustTunnel на выбранном TCP-порту, по умолчанию `443`;
 - обновление системы перед установкой;
 - WARP через `wireproxy`, чтобы сайты видели WARP/Cloudflare IP, а не IP VPS;
 - HTTP/2 и опционально QUIC/HTTP3;
+- выбор порта TrustTunnel, по умолчанию `443`;
 - клиентов `client01`, `client02` и т.д.;
 - TOML-файлы клиентов;
 - ZIP-архив с клиентскими конфигами;
@@ -54,6 +55,7 @@ ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh h
 
 - домен TrustTunnel;
 - количество клиентов;
+- порт TrustTunnel для клиентов, по умолчанию `443`;
 - менять ли SSH-порт;
 - новый SSH-порт, по умолчанию `49222`;
 - обновлять ли систему перед установкой;
@@ -61,6 +63,8 @@ ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh h
 - включать ли QUIC/HTTP3;
 - включать ли fail2ban;
 - подтверждение сброса UFW firewall.
+
+В конце скрипт выводит короткую инструкцию для мобильного клиента: какой TOML импортировать, какой адрес/порт вводить вручную, где лежит `server-cert.pem` и где смотреть логины/пароли.
 
 ## Где будут клиенты
 
@@ -99,8 +103,8 @@ trusttunnel-status
 - `trusttunnel` active;
 - `warp-wireproxy` active;
 - `fail2ban` active;
-- `443/tcp` слушается;
-- `443/udp` слушается, если включен QUIC/HTTP3;
+- выбранный TCP-порт TrustTunnel слушается;
+- выбранный UDP-порт слушается, если включен QUIC/HTTP3;
 - WARP public IP отличается от IP VPS.
 - `net.ipv4.tcp_congestion_control = bbr`.
 
@@ -108,7 +112,7 @@ trusttunnel-status
 
 - Скрипт рассчитан на чистый Ubuntu/Debian VPS.
 - Скрипт сбрасывает UFW firewall.
-- Открываются только SSH-порт и `443/tcp`.
-- Если включен QUIC/HTTP3, дополнительно открывается `443/udp`.
+- Открываются только SSH-порт и выбранный TCP-порт TrustTunnel.
+- Если включен QUIC/HTTP3, дополнительно открывается UDP на выбранном порту TrustTunnel.
 - Самый стабильный режим клиента: HTTP/2.
 - Сертификат self-signed, но он встроен в TOML-файлы клиентов.
