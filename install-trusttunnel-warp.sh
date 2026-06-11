@@ -874,8 +874,13 @@ echo
 echo "TCP congestion control:"
 sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc 2>/dev/null || true
 echo
-echo "Recent TrustTunnel logs:"
-journalctl -u trusttunnel -n 20 --no-pager 2>/dev/null || true
+echo "TrustTunnel logs since current start:"
+active_since="$(systemctl show trusttunnel -p ActiveEnterTimestamp --value 2>/dev/null || true)"
+if [ -n "$active_since" ]; then
+  journalctl -u trusttunnel --since "$active_since" --no-pager 2>/dev/null || true
+else
+  journalctl -u trusttunnel -n 20 --no-pager 2>/dev/null || true
+fi
 EOF
   chmod 0755 /usr/local/sbin/trusttunnel-status
 }
