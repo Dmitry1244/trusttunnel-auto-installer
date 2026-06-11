@@ -36,11 +36,20 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 4) Удалить только WARP и переключить TrustTunnel на direct
 5) Показать статус
 6) Обновить только TrustTunnel endpoint
+7) Проверить WARP
+8) Включить WARP
+9) Отключить WARP без удаления
 0) Выход
 ```
 
 Для обычной установки выбирай `1`.
 Для обновления TrustTunnel без пересоздания клиентов выбирай `6`.
+
+После установки главное меню можно открыть командой:
+
+```bash
+trusttunnel-menu
+```
 
 ## Запуск с Windows PowerShell
 
