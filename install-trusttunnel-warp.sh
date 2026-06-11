@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Интерактивный установщик TrustTunnel endpoint + WARP.
+# Целевая система: чистый Ubuntu/Debian VPS, запускать от root.
+#
+# Интерактивный запуск:
+#   bash install-trusttunnel-warp.sh
+#
+# Автоматический запуск без вопросов:
+#   CLIENTS=21 SSH_PORT=22 EMAIL=admin@example.com ENABLE_WARP=1 bash install-trusttunnel-warp.sh
+
+DOMAIN="${DOMAIN:-}"
+EMAIL="${EMAIL:-admin@example.com}"
+CLIENTS="${CLIENTS:-}"
+SSH_PORT="${SSH_PORT:-}"
+ENABLE_WARP="${ENABLE_WARP:-}"
+ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
+CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
+TT_VERSION="${TT_VERSION:-v1.0.33}"
+WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
+WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
+
+TT_DIR="/opt/trusttunnel"
+WARP_DIR="/opt/warp-proxy"
+CLIENT_DIR="/root/trusttunnel-clients"
+SOCKS_ADDR="127.0.0.1:40000"
+WARP_HEALTH_ADDR="127.0.0.1:40001"
+
+need_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "Запусти скрипт от root." >&2
+    exit 1
+  fi
+}
+
+prompt_value() {
+  local message="$1"
+  if [ -r /dev/tty ]; then
+    read -r -p "$message" REPLY_VALUE </dev/tty
+  else
+    read -r -p "$message" REPLY_VALUE
+  fi
+}
+
+ask_required() {
+  local var_name="$1"
+  local message="$2"
+  local value
+  value="$(eval "printf '%s' \"\${${var_name}:-}\"")"
+  while [ -z "$value" ]; do
+    prompt_value "$message"
+    value="$REPLY_VALUE"
+  done
+  printf -v "$var_name" '%s' "$value"
+}
+
+ask_default() {
+  local var_name="$1"
+  local message="$2"
+  local default_value="$3"
+  local value
+  value="$(eval "printf '%s' \"\${${var_name}:-}\"")"
+  if [ -n "$value" ]; then
+    return
+  fi
+  prompt_value "${message} [${default_value}]: "
+  value="${REPLY_VALUE:-$default_value}"
+  printf -v "$var_name" '%s' "$value"
+}
+
+ask_yes_no() {
+  local var_name="$1"
+  local message="$2"
+  local default_value="$3"
+  local value prompt_suffix
+  value="$(eval "printf '%s' \"\${${var_name}:-}\"")"
+  if [ "$value" = "0" ] || [ "$value" = "1" ]; then
+    return
+  fi
+  if [ "$default_value" = "1" ]; then
+    prompt_suffix="Y/n"
+  else
+    prompt_suffix="y/N"
+  fi
+  while true; do
+    prompt_value "${message} [${prompt_suffix}]: "
+    value="${REPLY_VALUE:-}"
+    case "$value" in
+      y|Y|yes|YES|Yes|д|Д|да|Да|ДА) printf -v "$var_name" '%s' "1"; return ;;
+      n|N|no|NO|No|н|Н|нет|Нет|НЕТ) printf -v "$var_name" '%s' "0"; return ;;
+      "") printf -v "$var_name" '%s' "$default_value"; return ;;
+      *) echo "Ответь y/n или да/нет." ;;
+    esac
+  done
+}
+
+collect_config() {
+  echo
+  echo "=== Установка TrustTunnel + WARP ==="
+  echo
+  ask_required DOMAIN "Домен для TrustTunnel, например vpn.example.com: "
+  ask_default CLIENTS "Сколько клиентов создать" "21"
+  ask_default SSH_PORT "SSH-порт сервера" "22"
+  ask_yes_no ENABLE_WARP "Включить WARP для скрытия IP сервера от сайтов" "1"
+  ask_yes_no ENABLE_FAIL2BAN "Включить fail2ban для защиты SSH" "1"
+
+  if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
+    echo
+    echo "Скрипт сбросит UFW firewall и откроет только:"
+    echo "- ${SSH_PORT}/tcp для SSH"
+    echo "- 443/tcp для TrustTunnel"
+    ask_yes_no CONFIRM_FIREWALL_RESET "Продолжить" "0"
+  fi
+  if [ "$CONFIRM_FIREWALL_RESET" != "1" ]; then
+    echo "Отменено."
+    exit 1
+  fi
+
+  echo
+  echo "Параметры установки:"
+  echo "- Домен: ${DOMAIN}"
+  echo "- Клиентов: ${CLIENTS}"
+  echo "- SSH-порт: ${SSH_PORT}"
+  echo "- WARP: ${ENABLE_WARP}"
+  echo "- fail2ban: ${ENABLE_FAIL2BAN}"
+  echo
+}
+
+install_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  local packages
+  packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 zip coreutils sed grep gawk"
+  if [ "$ENABLE_FAIL2BAN" = "1" ]; then
+    packages="$packages fail2ban"
+  fi
+  apt-get install -y --no-install-recommends $packages
+}
+
+download_trusttunnel() {
+  local arch asset url tmp
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) asset="trusttunnel-${TT_VERSION}-linux-x86_64.tar.gz" ;;
+    aarch64|arm64) asset="trusttunnel-${TT_VERSION}-linux-aarch64.tar.gz" ;;
+    *) echo "Unsupported CPU architecture: $arch" >&2; exit 1 ;;
+  esac
+
+  url="https://github.com/TrustTunnel/TrustTunnel/releases/download/${TT_VERSION}/${asset}"
+  tmp="$(mktemp -d)"
+  mkdir -p "$TT_DIR"
+  curl -fL "$url" -o "$tmp/trusttunnel.tar.gz"
+  tar -xzf "$tmp/trusttunnel.tar.gz" -C "$tmp"
+  find "$tmp" -type f -name trusttunnel_endpoint -exec install -m 0755 {} "$TT_DIR/trusttunnel_endpoint" \;
+  find "$tmp" -type f -name setup_wizard -exec install -m 0755 {} "$TT_DIR/setup_wizard" \; || true
+  rm -rf "$tmp"
+
+  if [ ! -x "$TT_DIR/trusttunnel_endpoint" ]; then
+    echo "Failed to install trusttunnel_endpoint." >&2
+    exit 1
+  fi
+}
+
+download_wireproxy() {
+  local arch asset url tmp
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) asset="wireproxy_linux_amd64.tar.gz" ;;
+    aarch64|arm64) asset="wireproxy_linux_arm64.tar.gz" ;;
+    *) echo "Unsupported CPU architecture for wireproxy: $arch" >&2; exit 1 ;;
+  esac
+
+  url="https://github.com/windtf/wireproxy/releases/download/${WIREPROXY_VERSION}/${asset}"
+  tmp="$(mktemp -d)"
+  mkdir -p "$WARP_DIR/bin"
+  curl -fL "$url" -o "$tmp/wireproxy.tar.gz"
+  tar -xzf "$tmp/wireproxy.tar.gz" -C "$tmp"
+  find "$tmp" -type f -name wireproxy -exec install -m 0755 {} "$WARP_DIR/bin/wireproxy" \;
+  rm -rf "$tmp"
+
+  if [ ! -x "$WARP_DIR/bin/wireproxy" ]; then
+    echo "Failed to install wireproxy." >&2
+    exit 1
+  fi
+}
+
+generate_warp_profile() {
+  if [ "$ENABLE_WARP" != "1" ]; then
+    return
+  fi
+
+  local arch wgcf_url work
+  arch="$(uname -m)"
+  case "$arch" in
+    x86_64|amd64) wgcf_url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_amd64" ;;
+    aarch64|arm64) wgcf_url="https://github.com/ViRb3/wgcf/releases/download/v${WGCF_VERSION}/wgcf_${WGCF_VERSION}_linux_arm64" ;;
+    *) echo "Unsupported CPU architecture for wgcf: $arch" >&2; exit 1 ;;
+  esac
+
+  mkdir -p "$WARP_DIR/bin" "$WARP_DIR/wgcf"
+  curl -fL "$wgcf_url" -o "$WARP_DIR/bin/wgcf"
+  chmod 0755 "$WARP_DIR/bin/wgcf"
+
+  work="$WARP_DIR/wgcf"
+  (
+    cd "$work"
+    if [ ! -f wgcf-account.toml ]; then
+      "$WARP_DIR/bin/wgcf" register --accept-tos
+    fi
+    "$WARP_DIR/bin/wgcf" generate
+  )
+
+  if [ ! -f "$work/wgcf-profile.conf" ]; then
+    echo "wgcf did not create wgcf-profile.conf." >&2
+    exit 1
+  fi
+
+  cp "$work/wgcf-profile.conf" "$WARP_DIR/wireproxy.conf"
+  cat >> "$WARP_DIR/wireproxy.conf" <<EOF
+
+[Socks5]
+BindAddress = ${SOCKS_ADDR}
+EOF
+  chmod 0600 "$WARP_DIR/wireproxy.conf"
+}
+
+write_certs() {
+  mkdir -p "$TT_DIR/certs"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$TT_DIR/certs/key.pem"
+  cat > "$TT_DIR/certs/openssl.cnf" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = v3_req
+prompt = no
+
+[dn]
+CN = ${DOMAIN}
+
+[v3_req]
+subjectAltName = @alt_names
+
+[alt_names]
+DNS.1 = ${DOMAIN}
+DNS.2 = *.${DOMAIN}
+EOF
+  openssl req -x509 -new -nodes \
+    -key "$TT_DIR/certs/key.pem" \
+    -sha256 -days 365 \
+    -out "$TT_DIR/certs/cert.pem" \
+    -config "$TT_DIR/certs/openssl.cnf"
+  chmod 0600 "$TT_DIR/certs/key.pem"
+  chmod 0644 "$TT_DIR/certs/cert.pem"
+}
+
+write_server_config() {
+  mkdir -p "$TT_DIR"
+  cat > "$TT_DIR/vpn.toml" <<EOF
+listen_address = "0.0.0.0:443"
+credentials_file = "credentials.toml"
+rules_file = "rules.toml"
+ipv6_available = true
+allow_private_network_connections = false
+tls_handshake_timeout_secs = 10
+client_listener_timeout_secs = 600
+connection_establishment_timeout_secs = 30
+tcp_connections_timeout_secs = 604800
+udp_connections_timeout_secs = 300
+speedtest_enable = false
+
+[forward_protocol]
+EOF
+
+  if [ "$ENABLE_WARP" = "1" ]; then
+    cat >> "$TT_DIR/vpn.toml" <<EOF
+[forward_protocol.socks5]
+address = "${SOCKS_ADDR}"
+extended_auth = false
+EOF
+  fi
+
+  cat >> "$TT_DIR/vpn.toml" <<EOF
+[listen_protocols]
+
+[listen_protocols.http1]
+upload_buffer_size = 32768
+
+[listen_protocols.http2]
+initial_connection_window_size = 8388608
+initial_stream_window_size = 131072
+max_concurrent_streams = 1000
+max_frame_size = 16384
+header_table_size = 65536
+EOF
+
+  cat > "$TT_DIR/hosts.toml" <<EOF
+ping_hosts = []
+speedtest_hosts = []
+reverse_proxy_hosts = []
+
+[[main_hosts]]
+hostname = "${DOMAIN}"
+cert_chain_path = "certs/cert.pem"
+private_key_path = "certs/key.pem"
+allowed_sni = []
+EOF
+
+  cat > "$TT_DIR/rules.toml" <<'EOF'
+# Empty rules file: all authenticated clients are allowed.
+EOF
+}
+
+random_password() {
+  printf 'TT-%s' "$(openssl rand -hex 12)"
+}
+
+write_clients() {
+  local cert cert_indented i user pass profile zip_path
+  mkdir -p "$CLIENT_DIR"
+  cert="$(cat "$TT_DIR/certs/cert.pem")"
+  cp "$TT_DIR/certs/cert.pem" "$CLIENT_DIR/server-cert.pem"
+
+  cat > "$TT_DIR/credentials.toml" <<'EOF'
+# Managed TrustTunnel users. One user/password per client.
+EOF
+  : > "$CLIENT_DIR/clients-credentials.txt"
+
+  for i in $(seq -w 1 "$CLIENTS"); do
+    user="client${i}"
+    pass="$(random_password)"
+    cat >> "$TT_DIR/credentials.toml" <<EOF
+
+[[client]]
+username = "${user}"
+password = "${pass}"
+EOF
+    printf '%s %s\n' "$user" "$pass" >> "$CLIENT_DIR/clients-credentials.txt"
+    profile="$CLIENT_DIR/${user}-http2.toml"
+    cat > "$profile" <<EOF
+# Endpoint host name, used for TLS session establishment
+hostname = "${DOMAIN}"
+
+# Endpoint addresses in IP:port or hostname:port format
+addresses = ["${DOMAIN}:443"]
+
+# Custom SNI value for TLS handshake.
+custom_sni = ""
+
+# Whether IPv6 traffic can be routed through the endpoint
+has_ipv6 = true
+
+# Username for authorization
+username = "${user}"
+
+# Password for authorization
+password = "${pass}"
+
+# TLS client random hex prefix for connection filtering.
+client_random_prefix = ""
+
+# Skip the endpoint certificate verification?
+skip_verification = false
+
+# Endpoint certificate in PEM format.
+certificate = """
+${cert}
+"""
+
+# Protocol to be used to communicate with the endpoint [http2, http3]
+upstream_protocol = "http2"
+
+# Is anti-DPI measures should be enabled
+anti_dpi = false
+EOF
+  done
+
+  chmod 0600 "$TT_DIR/credentials.toml"
+  chmod 0600 "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt"
+  chmod 0644 "$CLIENT_DIR/server-cert.pem"
+  zip_path="/root/trusttunnel-clients-${DOMAIN}.zip"
+  rm -f "$zip_path"
+  (cd "$CLIENT_DIR" && zip -q -r "$zip_path" .)
+}
+
+write_systemd() {
+  if [ "$ENABLE_WARP" = "1" ]; then
+    cat > /etc/systemd/system/warp-wireproxy.service <<EOF
+[Unit]
+Description=WARP SOCKS5 proxy for TrustTunnel outbound
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=${WARP_DIR}
+ExecStart=${WARP_DIR}/bin/wireproxy -c ${WARP_DIR}/wireproxy.conf -i ${WARP_HEALTH_ADDR}
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  fi
+
+  cat > /etc/systemd/system/trusttunnel.service <<EOF
+[Unit]
+Description=TrustTunnel endpoint
+After=network-online.target warp-wireproxy.service
+Wants=network-online.target warp-wireproxy.service
+
+[Service]
+Type=simple
+WorkingDirectory=${TT_DIR}
+ExecStart=${TT_DIR}/trusttunnel_endpoint --loglvl info vpn.toml hosts.toml
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  if [ "$ENABLE_WARP" = "1" ]; then
+    systemctl enable --now warp-wireproxy
+  fi
+  systemctl enable --now trusttunnel
+}
+
+configure_firewall() {
+  ufw --force reset
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${SSH_PORT}/tcp" comment "SSH"
+  ufw allow 443/tcp comment "TrustTunnel TCP"
+  ufw --force enable
+}
+
+configure_fail2ban() {
+  if [ "$ENABLE_FAIL2BAN" != "1" ]; then
+    return
+  fi
+  mkdir -p /etc/fail2ban/jail.d
+  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+[sshd]
+enabled = true
+port = ${SSH_PORT}
+filter = sshd
+backend = systemd
+maxretry = 5
+findtime = 10m
+bantime = 1h
+ignoreip = 127.0.0.1/8 ::1
+EOF
+  systemctl enable --now fail2ban
+  systemctl restart fail2ban
+}
+
+write_tools() {
+  cat > /usr/local/sbin/trusttunnel-status <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+echo "Services:"
+systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
+echo
+echo "Listening:"
+ss -lntup | grep -E ':(443|40000|40001)\b' || true
+echo
+echo "Direct public IP:"
+curl -4 -sS --max-time 8 https://ifconfig.me || true
+echo
+echo
+echo "WARP public IP:"
+curl -x socks5h://127.0.0.1:40000 -sS --max-time 12 https://ifconfig.me || true
+echo
+echo
+echo "Fail2ban SSH jail:"
+fail2ban-client status sshd 2>/dev/null || true
+EOF
+  chmod 0755 /usr/local/sbin/trusttunnel-status
+}
+
+main() {
+  need_root
+  collect_config
+  install_packages
+  download_trusttunnel
+  if [ "$ENABLE_WARP" = "1" ]; then
+    download_wireproxy
+    generate_warp_profile
+  fi
+  write_certs
+  write_server_config
+  write_clients
+  write_systemd
+  configure_firewall
+  configure_fail2ban
+  write_tools
+
+  echo
+  echo "ГОТОВО"
+  echo "Домен: ${DOMAIN}:443"
+  echo "Клиентов: ${CLIENTS}"
+  echo "Файлы клиентов: ${CLIENT_DIR}"
+  echo "ZIP клиентов: /root/trusttunnel-clients-${DOMAIN}.zip"
+  echo "Команда проверки: trusttunnel-status"
+  echo
+  trusttunnel-status || true
+}
+
+main "$@"
