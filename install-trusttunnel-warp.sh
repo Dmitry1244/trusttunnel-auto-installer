@@ -22,7 +22,7 @@ ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
 ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
 ACTION="${ACTION:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
-TT_VERSION="${TT_VERSION:-v1.0.33}"
+TT_VERSION="${TT_VERSION:-latest}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
 WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
 
@@ -139,6 +139,7 @@ choose_action() {
     echo "3) Установить или переустановить только WARP"
     echo "4) Удалить только WARP и переключить TrustTunnel на direct"
     echo "5) Показать статус"
+    echo "6) Обновить только TrustTunnel endpoint"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -148,8 +149,9 @@ choose_action() {
       3) ACTION="install-warp"; return ;;
       4) ACTION="remove-warp"; return ;;
       5) ACTION="status"; return ;;
+      6) ACTION="update-trusttunnel"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0, 1, 2, 3, 4 или 5." ;;
+      *) echo "Нужно выбрать 0, 1, 2, 3, 4, 5 или 6." ;;
     esac
   done
 }
@@ -231,18 +233,46 @@ install_packages() {
   apt-get install -y --no-install-recommends $packages
 }
 
+resolve_trusttunnel_version() {
+  if [ "$TT_VERSION" != "latest" ] && [ -n "$TT_VERSION" ]; then
+    printf '%s' "$TT_VERSION"
+    return
+  fi
+
+  local latest
+  latest="$(curl -fsSL https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest \
+    | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
+    | head -1)"
+  if [ -z "$latest" ]; then
+    echo "Не удалось определить latest TrustTunnel release через GitHub API." >&2
+    exit 1
+  fi
+  printf '%s' "$latest"
+}
+
 download_trusttunnel() {
-  local arch asset url tmp
+  local arch asset url tmp resolved_version backup_dir now
+  resolved_version="$(resolve_trusttunnel_version)"
+  echo "TrustTunnel version: ${resolved_version}"
   arch="$(uname -m)"
   case "$arch" in
-    x86_64|amd64) asset="trusttunnel-${TT_VERSION}-linux-x86_64.tar.gz" ;;
-    aarch64|arm64) asset="trusttunnel-${TT_VERSION}-linux-aarch64.tar.gz" ;;
+    x86_64|amd64) asset="trusttunnel-${resolved_version}-linux-x86_64.tar.gz" ;;
+    aarch64|arm64) asset="trusttunnel-${resolved_version}-linux-aarch64.tar.gz" ;;
     *) echo "Unsupported CPU architecture: $arch" >&2; exit 1 ;;
   esac
 
-  url="https://github.com/TrustTunnel/TrustTunnel/releases/download/${TT_VERSION}/${asset}"
+  url="https://github.com/TrustTunnel/TrustTunnel/releases/download/${resolved_version}/${asset}"
   tmp="$(mktemp -d)"
   mkdir -p "$TT_DIR"
+  backup_dir="$TT_DIR/backups"
+  mkdir -p "$backup_dir"
+  now="$(date +%Y%m%d%H%M%S)"
+  if [ -x "$TT_DIR/trusttunnel_endpoint" ]; then
+    cp "$TT_DIR/trusttunnel_endpoint" "$backup_dir/trusttunnel_endpoint.${now}" || true
+  fi
+  if [ -x "$TT_DIR/setup_wizard" ]; then
+    cp "$TT_DIR/setup_wizard" "$backup_dir/setup_wizard.${now}" || true
+  fi
   curl -fL "$url" -o "$tmp/trusttunnel.tar.gz"
   tar -xzf "$tmp/trusttunnel.tar.gz" -C "$tmp"
   find "$tmp" -type f -name trusttunnel_endpoint -exec install -m 0755 {} "$TT_DIR/trusttunnel_endpoint" \;
@@ -324,6 +354,7 @@ write_warp_systemd() {
 Description=WARP SOCKS5 proxy for TrustTunnel outbound
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -567,6 +598,7 @@ write_systemd() {
 Description=TrustTunnel endpoint
 After=network-online.target warp-wireproxy.service
 Wants=network-online.target warp-wireproxy.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -657,6 +689,26 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
   sysctl --system >/dev/null || true
+}
+
+install_download_tools() {
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends ca-certificates curl tar gzip coreutils sed
+}
+
+update_trusttunnel_only() {
+  if [ ! -d "$TT_DIR" ]; then
+    echo "TrustTunnel не найден в ${TT_DIR}. Сначала выполни установку."
+    exit 1
+  fi
+  install_download_tools
+  systemctl stop trusttunnel 2>/dev/null || true
+  download_trusttunnel
+  systemctl daemon-reload
+  systemctl restart trusttunnel
+  echo "TrustTunnel endpoint обновлен и перезапущен."
+  trusttunnel-status 2>/dev/null || show_status
 }
 
 install_or_reinstall_warp_only() {
@@ -805,6 +857,10 @@ main() {
       ;;
     status)
       show_status
+      exit 0
+      ;;
+    update-trusttunnel)
+      update_trusttunnel_only
       exit 0
       ;;
     exit)
