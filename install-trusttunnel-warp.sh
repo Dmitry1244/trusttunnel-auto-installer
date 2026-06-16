@@ -238,16 +238,39 @@ confirm_action() {
 
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  if [ "$ENABLE_SYSTEM_UPGRADE" = "1" ]; then
-    apt-get upgrade -y
+  local packages missing_packages required_commands cmd
+  if ! apt-get update; then
+    echo "Warning: apt-get update failed, using installed packages where possible." >&2
   fi
-  local packages
+  if [ "$ENABLE_SYSTEM_UPGRADE" = "1" ]; then
+    if ! apt-get upgrade -y; then
+      echo "Warning: apt-get upgrade failed, continuing without system upgrade." >&2
+    fi
+  fi
   packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 coreutils sed grep gawk"
   if [ "$ENABLE_FAIL2BAN" = "1" ]; then
     packages="$packages fail2ban"
   fi
-  apt-get install -y --no-install-recommends --no-upgrade $packages
+  if ! apt-get install -y --no-install-recommends --no-upgrade $packages; then
+    echo "Warning: apt-get install failed, checking existing commands." >&2
+  fi
+
+  required_commands="curl tar gzip openssl ufw python3 sed grep gawk"
+  missing_packages=""
+  for cmd in $required_commands; do
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+      missing_packages="$missing_packages $cmd"
+    fi
+  done
+
+  if [ "$ENABLE_FAIL2BAN" = "1" ] && ! command -v fail2ban-client >/dev/null 2>&1; then
+    missing_packages="$missing_packages fail2ban"
+  fi
+
+  if [ -n "$missing_packages" ]; then
+    echo "Missing required packages/commands:$missing_packages" >&2
+    exit 1
+  fi
 }
 
 resolve_trusttunnel_version() {
