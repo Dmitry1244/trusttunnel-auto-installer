@@ -282,14 +282,52 @@ confirm_action() {
   esac
 }
 
+normalize_apt_sources() {
+  local file
+  if [ -f /etc/apt/sources.list ]; then
+    sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+      -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+      -e 's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
+      /etc/apt/sources.list
+  fi
+
+  for file in /etc/apt/sources.list.d/*.list; do
+    [ -f "$file" ] || continue
+    sed -i \
+      -e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+      -e 's|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g' \
+      -e 's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
+      "$file"
+  done
+
+  for file in /etc/apt/sources.list.d/*.sources; do
+    [ -f "$file" ] || continue
+    sed -i \
+      -e 's|URIs:[[:space:]]*http://archive.ubuntu.com/ubuntu|URIs: https://archive.ubuntu.com/ubuntu|g' \
+      -e 's|URIs:[[:space:]]*http://security.ubuntu.com/ubuntu|URIs: https://security.ubuntu.com/ubuntu|g' \
+      -e 's|URIs:[[:space:]]*http://ports.ubuntu.com/ubuntu-ports|URIs: https://ports.ubuntu.com/ubuntu-ports|g' \
+      "$file"
+  done
+}
+
+apt_update_retry() {
+  normalize_apt_sources
+  apt-get -o Acquire::Retries=3 update
+}
+
+apt_install_retry() {
+  apt-get -o Acquire::Retries=3 install "$@"
+}
+
 install_packages() {
   export DEBIAN_FRONTEND=noninteractive
   local packages missing_packages required_commands cmd
-  if ! apt-get update; then
+  if ! apt_update_retry; then
     echo "Warning: apt-get update failed, using installed packages where possible." >&2
   fi
   if [ "$ENABLE_SYSTEM_UPGRADE" = "1" ]; then
-    if ! apt-get upgrade -y; then
+    if ! apt-get -o Acquire::Retries=3 upgrade -y; then
       echo "Warning: apt-get upgrade failed, continuing without system upgrade." >&2
     fi
   fi
@@ -300,7 +338,7 @@ install_packages() {
   if [ "$ENABLE_FAIL2BAN" = "1" ]; then
     packages="$packages fail2ban"
   fi
-  if ! apt-get install -y --no-install-recommends --no-upgrade $packages; then
+  if ! apt_install_retry -y --no-install-recommends --no-upgrade $packages; then
     echo "Warning: apt-get install failed, checking existing commands." >&2
   fi
 
@@ -1083,8 +1121,8 @@ EOF
 
 install_download_tools() {
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update
-  apt-get install -y --no-install-recommends ca-certificates curl tar gzip coreutils sed
+  apt_update_retry
+  apt_install_retry -y --no-install-recommends --no-upgrade ca-certificates curl tar gzip coreutils sed
 }
 
 update_trusttunnel_only() {
