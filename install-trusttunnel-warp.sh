@@ -23,6 +23,7 @@ ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
 ACTION="${ACTION:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
 PRESERVE_CLIENT_CONFIGS="${PRESERVE_CLIENT_CONFIGS:-}"
+CERT_MODE="${CERT_MODE:-}"
 TT_VERSION="${TT_VERSION:-latest}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
 WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
@@ -97,6 +98,41 @@ ask_yes_no() {
       n|N|no|NO|No|н|Н|нет|Нет|НЕТ) printf -v "$var_name" '%s' "0"; return ;;
       "") printf -v "$var_name" '%s' "$default_value"; return ;;
       *) echo "Ответь y/n или да/нет." ;;
+    esac
+  done
+}
+
+ask_cert_mode() {
+  if [ "$CERT_MODE" = "self-signed" ] || [ "$CERT_MODE" = "letsencrypt" ]; then
+    return
+  fi
+  if [ ! -r /dev/tty ]; then
+    CERT_MODE="self-signed"
+    return
+  fi
+
+  while true; do
+    echo
+    echo "Certificate mode:"
+    echo "1) self-signed"
+    echo "   Difference: works without port 80 and does not depend on Let's Encrypt."
+    echo "   Client uses bundled server-cert.pem."
+    echo "2) Let's Encrypt"
+    echo "   Difference: public trusted certificate."
+    echo "   Domain must point to this server and inbound 80/tcp must work during issuance."
+    prompt_value "Choose certificate mode [1]: "
+    case "${REPLY_VALUE:-1}" in
+      1|self|self-signed)
+        CERT_MODE="self-signed"
+        return
+        ;;
+      2|le|letsencrypt|lets-encrypt)
+        CERT_MODE="letsencrypt"
+        return
+        ;;
+      *)
+        echo "Choose 1 or 2."
+        ;;
     esac
   done
 }
@@ -192,6 +228,12 @@ collect_config() {
     PRESERVE_CLIENT_CONFIGS="${PRESERVE_CLIENT_CONFIGS:-0}"
   fi
 
+  ask_cert_mode
+  if [ "$CERT_MODE" = "letsencrypt" ] && { [ -z "$EMAIL" ] || [ "$EMAIL" = "admin@example.com" ]; }; then
+    EMAIL=""
+    ask_required EMAIL "Email for Let's Encrypt: "
+  fi
+
   if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
     echo
     echo "Скрипт сбросит UFW firewall и откроет только:"
@@ -218,6 +260,10 @@ collect_config() {
   echo "- WARP: ${ENABLE_WARP}"
   echo "- QUIC/HTTP3: ${ENABLE_QUIC}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
+  echo "- Certificate mode: ${CERT_MODE}"
+  if [ "$CERT_MODE" = "letsencrypt" ]; then
+    echo "- Let's Encrypt email: ${EMAIL}"
+  fi
   echo "- Preserve client configs: ${PRESERVE_CLIENT_CONFIGS}"
   echo
 }
@@ -248,6 +294,9 @@ install_packages() {
     fi
   fi
   packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 coreutils sed grep gawk"
+  if [ "$CERT_MODE" = "letsencrypt" ]; then
+    packages="$packages certbot"
+  fi
   if [ "$ENABLE_FAIL2BAN" = "1" ]; then
     packages="$packages fail2ban"
   fi
@@ -265,6 +314,9 @@ install_packages() {
 
   if [ "$ENABLE_FAIL2BAN" = "1" ] && ! command -v fail2ban-client >/dev/null 2>&1; then
     missing_packages="$missing_packages fail2ban"
+  fi
+  if [ "$CERT_MODE" = "letsencrypt" ] && ! command -v certbot >/dev/null 2>&1; then
+    missing_packages="$missing_packages certbot"
   fi
 
   if [ -n "$missing_packages" ]; then
@@ -445,11 +497,18 @@ switch_trusttunnel_forwarder() {
   systemctl restart trusttunnel 2>/dev/null || true
 }
 
-write_certs() {
+cert_matches_domain() {
+  local cert_path="$1"
+  if [ ! -f "$cert_path" ]; then
+    return 1
+  fi
+  openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | grep -Fq "CN = ${DOMAIN}"
+}
+
+write_self_signed_cert() {
   mkdir -p "$TT_DIR/certs"
   if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
-    if openssl x509 -in "$TT_DIR/certs/cert.pem" -noout -subject 2>/dev/null \
-      | grep -Fq "CN = ${DOMAIN}"; then
+    if cert_matches_domain "$TT_DIR/certs/cert.pem"; then
       echo "Using existing certificate for ${DOMAIN}."
       return
     fi
@@ -478,6 +537,128 @@ EOF
     -config "$TT_DIR/certs/openssl.cnf"
   chmod 0600 "$TT_DIR/certs/key.pem"
   chmod 0644 "$TT_DIR/certs/cert.pem"
+}
+
+write_letsencrypt_cert() {
+  local certbot_name added_ufw_rule live_dir
+  mkdir -p "$TT_DIR/certs"
+  if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
+    if cert_matches_domain "$TT_DIR/certs/cert.pem"; then
+      echo "Using existing certificate for ${DOMAIN}."
+      return
+    fi
+  fi
+
+  added_ufw_rule=0
+  if ufw status 2>/dev/null | grep -q "Status: active"; then
+    if ! ufw status numbered 2>/dev/null | grep -qE '(^|\s)80/tcp(\s|$)'; then
+      ufw allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null 2>&1 || true
+      added_ufw_rule=1
+    fi
+  fi
+
+  certbot_name="$DOMAIN"
+  if ! certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" --preferred-challenges http --keep-until-expiring --cert-name "$certbot_name"; then
+    if [ "$added_ufw_rule" = "1" ]; then
+      ufw delete allow 80/tcp >/dev/null 2>&1 || true
+    fi
+    echo "Let's Encrypt issuance failed. Check DNS for ${DOMAIN} and inbound 80/tcp reachability." >&2
+    exit 1
+  fi
+
+  if [ "$added_ufw_rule" = "1" ]; then
+    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+  fi
+
+  live_dir="/etc/letsencrypt/live/${certbot_name}"
+  if [ ! -f "${live_dir}/fullchain.pem" ] || [ ! -f "${live_dir}/privkey.pem" ]; then
+    echo "Let's Encrypt certificate files not found in ${live_dir}." >&2
+    exit 1
+  fi
+
+  cp "${live_dir}/fullchain.pem" "$TT_DIR/certs/cert.pem"
+  cp "${live_dir}/privkey.pem" "$TT_DIR/certs/key.pem"
+  chmod 0600 "$TT_DIR/certs/key.pem"
+  chmod 0644 "$TT_DIR/certs/cert.pem"
+}
+
+write_certificate_automation() {
+  cat > /usr/local/sbin/trusttunnel-cert-renew <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+TT_DIR="${TT_DIR}"
+CERT_MODE="${CERT_MODE}"
+DOMAIN="${DOMAIN}"
+EMAIL="${EMAIL}"
+
+if [ "\${CERT_MODE}" != "letsencrypt" ]; then
+  exit 0
+fi
+
+added_ufw_rule=0
+cleanup() {
+  if [ "\${added_ufw_rule}" = "1" ]; then
+    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+if ufw status 2>/dev/null | grep -q "Status: active"; then
+  if ! ufw status numbered 2>/dev/null | grep -qE '(^|[[:space:]])80/tcp([[:space:]]|$)'; then
+    ufw allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null 2>&1 || true
+    added_ufw_rule=1
+  fi
+fi
+
+certbot renew --standalone --non-interactive --deploy-hook "cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TT_DIR}/certs/cert.pem && cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TT_DIR}/certs/key.pem && chmod 0600 ${TT_DIR}/certs/key.pem && chmod 0644 ${TT_DIR}/certs/cert.pem && systemctl restart trusttunnel"
+EOF
+  chmod 0755 /usr/local/sbin/trusttunnel-cert-renew
+
+  cat > /etc/systemd/system/trusttunnel-cert-renew.service <<'EOF'
+[Unit]
+Description=Renew Let's Encrypt certificate for TrustTunnel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/trusttunnel-cert-renew
+EOF
+
+  cat > /etc/systemd/system/trusttunnel-cert-renew.timer <<'EOF'
+[Unit]
+Description=Run TrustTunnel Let's Encrypt renewal daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now trusttunnel-cert-renew.timer
+}
+
+remove_certificate_automation() {
+  systemctl disable --now trusttunnel-cert-renew.timer 2>/dev/null || true
+  rm -f /etc/systemd/system/trusttunnel-cert-renew.service
+  rm -f /etc/systemd/system/trusttunnel-cert-renew.timer
+  rm -f /usr/local/sbin/trusttunnel-cert-renew
+  systemctl daemon-reload
+}
+
+write_certs() {
+  case "${CERT_MODE:-self-signed}" in
+    letsencrypt)
+      write_letsencrypt_cert
+      ;;
+    *)
+      write_self_signed_cert
+      ;;
+  esac
 }
 
 write_server_config() {
@@ -702,10 +883,17 @@ client_random_prefix = ""
 # Skip the endpoint certificate verification?
 skip_verification = false
 
+EOF
+    if [ "$CERT_MODE" = "self-signed" ]; then
+      cat >> "$profile" <<EOF
+
 # Endpoint certificate in PEM format.
 certificate = """
 ${cert}
 """
+EOF
+    fi
+    cat >> "$profile" <<EOF
 
 # Protocol to be used to communicate with the endpoint [http2, http3]
 upstream_protocol = "${protocol}"
@@ -997,6 +1185,11 @@ remove_all() {
   rm -f /root/trusttunnel-clients-*.zip
   rm -f /usr/local/sbin/trusttunnel-menu
   rm -f /usr/local/sbin/trusttunnel-status
+  rm -f /usr/local/sbin/trusttunnel-cert-renew
+  rm -f /etc/systemd/system/trusttunnel-cert-renew.service
+  rm -f /etc/systemd/system/trusttunnel-cert-renew.timer
+  systemctl disable --now trusttunnel-cert-renew.timer 2>/dev/null || true
+  systemctl daemon-reload
   ufw delete allow "${endpoint_port}/tcp" 2>/dev/null || true
   ufw delete allow "${endpoint_port}/udp" 2>/dev/null || true
   echo "TrustTunnel и WARP удалены. SSH и fail2ban оставлены без изменений."
@@ -1084,6 +1277,14 @@ print_mobile_instructions() {
   local sample_client
   sample_client="$(primary_client_name)"
   echo
+  echo "Certificate mode: ${CERT_MODE}"
+  if [ "$CERT_MODE" = "self-signed" ]; then
+    echo "Difference: client should use bundled server-cert.pem."
+  else
+    echo "Difference: public trusted certificate from Let's Encrypt."
+    echo "Requirement: domain must point to this server and 80/tcp must work during issuance."
+  fi
+  echo
   echo "=== Инструкция для мобильного клиента ==="
   echo
   echo "Самый простой способ:"
@@ -1110,7 +1311,11 @@ print_mobile_instructions() {
   if [ "$ENABLE_QUIC" = "1" ]; then
     echo "   Protocol также можно выбрать: QUIC/HTTP3"
   fi
-  echo "   Self-signed certificate: server-cert.pem"
+  if [ "$CERT_MODE" = "self-signed" ]; then
+    echo "   Certificate file: server-cert.pem"
+  else
+    echo "   Certificate file: usually not required, but server-cert.pem is included."
+  fi
   echo
   echo "Файл паролей:"
   echo "   ${CLIENT_DIR}/clients-credentials.txt"
@@ -1199,6 +1404,11 @@ main() {
   configure_fail2ban
   configure_bbr
   write_tools
+  if [ "$CERT_MODE" = "letsencrypt" ]; then
+    write_certificate_automation
+  else
+    remove_certificate_automation
+  fi
 
   echo
   echo "ГОТОВО"
