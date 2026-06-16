@@ -1221,6 +1221,7 @@ remove_all() {
   systemctl daemon-reload
   rm -rf "$TT_DIR" "$WARP_DIR" "$CLIENT_DIR"
   rm -f /root/trusttunnel-clients-*.zip
+  rm -f /usr/local/sbin/ttmenu
   rm -f /usr/local/sbin/trusttunnel-menu
   rm -f /usr/local/sbin/trusttunnel-status
   rm -f /usr/local/sbin/trusttunnel-cert-renew
@@ -1251,13 +1252,20 @@ show_status() {
 }
 
 write_tools() {
-  cat > /usr/local/sbin/trusttunnel-menu <<'EOF'
+  cat > /usr/local/sbin/ttmenu <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_URL="https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh"
 TMP_SCRIPT="/tmp/install-trusttunnel-warp.sh"
 curl -fsSL -o "$TMP_SCRIPT" "${SCRIPT_URL}?$(date +%s)"
 bash "$TMP_SCRIPT"
+EOF
+  chmod 0755 /usr/local/sbin/ttmenu
+
+  cat > /usr/local/sbin/trusttunnel-menu <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/local/sbin/ttmenu "$@"
 EOF
   chmod 0755 /usr/local/sbin/trusttunnel-menu
 
@@ -1455,7 +1463,8 @@ main() {
   echo "Файлы клиентов: ${CLIENT_DIR}"
   echo "ZIP клиентов: /root/trusttunnel-clients-${DOMAIN}.zip"
   echo "Команда проверки: trusttunnel-status"
-  echo "Главное меню: trusttunnel-menu"
+  echo "Главное меню: ttmenu"
+  echo "Старое имя тоже работает: trusttunnel-menu"
   if [ -f /var/run/reboot-required ]; then
     echo
     echo "ВНИМАНИЕ: после обновления системы сервер просит перезагрузку."
