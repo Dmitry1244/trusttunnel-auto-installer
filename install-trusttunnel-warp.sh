@@ -113,14 +113,14 @@ ask_cert_mode() {
 
   while true; do
     echo
-    echo "Certificate mode:"
+    echo "Режим сертификата:"
     echo "1) self-signed"
-    echo "   Difference: works without port 80 and does not depend on Let's Encrypt."
-    echo "   Client uses bundled server-cert.pem."
+    echo "   Разница: работает без 80 порта и не зависит от Let's Encrypt."
+    echo "   Клиент использует вложенный файл server-cert.pem."
     echo "2) Let's Encrypt"
-    echo "   Difference: public trusted certificate."
-    echo "   Domain must point to this server and inbound 80/tcp must work during issuance."
-    prompt_value "Choose certificate mode [1]: "
+    echo "   Разница: публичный доверенный сертификат."
+    echo "   Домен должен указывать на этот сервер, а 80/tcp должен быть доступен во время выпуска."
+    prompt_value "Выбери режим сертификата [1]: "
     case "${REPLY_VALUE:-1}" in
       1|self|self-signed)
         CERT_MODE="self-signed"
@@ -131,7 +131,7 @@ ask_cert_mode() {
         return
         ;;
       *)
-        echo "Choose 1 or 2."
+        echo "Нужно выбрать 1 или 2."
         ;;
     esac
   done
@@ -231,7 +231,7 @@ collect_config() {
   ask_cert_mode
   if [ "$CERT_MODE" = "letsencrypt" ] && { [ -z "$EMAIL" ] || [ "$EMAIL" = "admin@example.com" ]; }; then
     EMAIL=""
-    ask_required EMAIL "Email for Let's Encrypt: "
+    ask_required EMAIL "Email для Let's Encrypt: "
   fi
 
   if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
@@ -260,9 +260,9 @@ collect_config() {
   echo "- WARP: ${ENABLE_WARP}"
   echo "- QUIC/HTTP3: ${ENABLE_QUIC}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
-  echo "- Certificate mode: ${CERT_MODE}"
+  echo "- Режим сертификата: ${CERT_MODE}"
   if [ "$CERT_MODE" = "letsencrypt" ]; then
-    echo "- Let's Encrypt email: ${EMAIL}"
+    echo "- Email для Let's Encrypt: ${EMAIL}"
   fi
   echo "- Preserve client configs: ${PRESERVE_CLIENT_CONFIGS}"
   echo
@@ -1323,12 +1323,12 @@ print_mobile_instructions() {
   local sample_client
   sample_client="$(primary_client_name)"
   echo
-  echo "Certificate mode: ${CERT_MODE}"
+  echo "Режим сертификата: ${CERT_MODE}"
   if [ "$CERT_MODE" = "self-signed" ]; then
-    echo "Difference: client should use bundled server-cert.pem."
+    echo "Разница: клиент должен использовать вложенный файл server-cert.pem."
   else
-    echo "Difference: public trusted certificate from Let's Encrypt."
-    echo "Requirement: domain must point to this server and 80/tcp must work during issuance."
+    echo "Разница: публичный доверенный сертификат от Let's Encrypt."
+    echo "Требование: домен должен указывать на этот сервер, а 80/tcp должен работать во время выпуска и продления."
   fi
   echo
   echo "=== Инструкция для мобильного клиента ==="
