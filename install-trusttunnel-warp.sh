@@ -33,6 +33,7 @@ WARP_DIR="/opt/warp-proxy"
 CLIENT_DIR="/root/trusttunnel-clients"
 SOCKS_ADDR="127.0.0.1:40000"
 WARP_HEALTH_ADDR="127.0.0.1:40001"
+IDENTITY_BACKUP_DIR="/root/trusttunnel-identity-backup"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -180,6 +181,9 @@ choose_action() {
     echo "7) Проверить WARP"
     echo "8) Включить WARP"
     echo "9) Отключить WARP без удаления"
+    echo "10) Полностью перерегистрировать WARP-аккаунт"
+    echo "11) Создать backup identity (сертификат и клиенты)"
+    echo "12) Восстановить identity из backup"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -193,8 +197,11 @@ choose_action() {
       7) ACTION="check-warp"; return ;;
       8) ACTION="enable-warp"; return ;;
       9) ACTION="disable-warp"; return ;;
+      10) ACTION="reregister-warp"; return ;;
+      11) ACTION="backup-identity"; return ;;
+      12) ACTION="restore-identity"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0, 1, 2, 3, 4, 5, 6, 7, 8 или 9." ;;
+      *) echo "Нужно выбрать 0-12 из меню." ;;
     esac
   done
 }
@@ -331,7 +338,7 @@ install_packages() {
       echo "Warning: apt-get upgrade failed, continuing without system upgrade." >&2
     fi
   fi
-  packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 coreutils sed grep gawk"
+  packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 coreutils sed grep gawk util-linux"
   if [ "$CERT_MODE" = "letsencrypt" ]; then
     packages="$packages certbot"
   fi
@@ -356,7 +363,6 @@ install_packages() {
   if [ "$CERT_MODE" = "letsencrypt" ] && ! command -v certbot >/dev/null 2>&1; then
     missing_packages="$missing_packages certbot"
   fi
-
   if [ -n "$missing_packages" ]; then
     echo "Missing required packages/commands:$missing_packages" >&2
     exit 1
@@ -468,7 +474,6 @@ generate_warp_profile() {
     echo "wgcf did not create wgcf-profile.conf." >&2
     exit 1
   fi
-
   cp "$work/wgcf-profile.conf" "$WARP_DIR/wireproxy.conf"
   cat >> "$WARP_DIR/wireproxy.conf" <<EOF
 
@@ -1177,6 +1182,30 @@ disable_warp() {
   check_warp
 }
 
+trusttunnel_uses_socks5() {
+  grep -q '^\[forward_protocol\.socks5\]$' "$TT_DIR/vpn.toml" 2>/dev/null
+}
+
+reregister_warp_account() {
+  confirm_action "Будет полностью удален и заново зарегистрирован WARP-аккаунт. Клиенты TrustTunnel, сертификаты и настройки TrustTunnel затронуты не будут."
+  ENABLE_WARP=1
+  ENABLE_FAIL2BAN=0
+  ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-0}"
+  install_packages
+  download_wireproxy
+  mkdir -p "$WARP_DIR/wgcf"
+  systemctl disable --now warp-wireproxy 2>/dev/null || true
+  rm -f "$WARP_DIR/wireproxy.conf"
+  rm -f "$WARP_DIR/wgcf/wgcf-account.toml" "$WARP_DIR/wgcf/wgcf-profile.conf"
+  generate_warp_profile
+  write_warp_systemd
+  if trusttunnel_uses_socks5; then
+    switch_trusttunnel_forwarder socks5
+  fi
+  echo "WARP-аккаунт полностью перерегистрирован."
+  check_warp
+}
+
 install_or_reinstall_warp_only() {
   ENABLE_WARP=1
   ENABLE_FAIL2BAN=0
@@ -1192,7 +1221,8 @@ install_or_reinstall_warp_only() {
 
 remove_warp_only() {
   confirm_action "Будет удален WARP/wireproxy. TrustTunnel переключится на direct, если он установлен."
-  systemctl disable --now warp-wireproxy 2>/dev/null || true
+  systemctl stop warp-wireproxy 2>/dev/null || true
+  systemctl disable warp-wireproxy 2>/dev/null || true
   rm -f /etc/systemd/system/warp-wireproxy.service
   systemctl daemon-reload
   rm -rf "$WARP_DIR"
@@ -1210,12 +1240,80 @@ current_endpoint_port() {
   printf '443'
 }
 
+backup_identity() {
+  local backup_name archive_path backup_domain backup_port
+  if [ ! -f "$TT_DIR/certs/cert.pem" ] || [ ! -f "$TT_DIR/certs/key.pem" ] || [ ! -f "$TT_DIR/credentials.toml" ]; then
+    echo "Не найден полный набор identity-файлов TrustTunnel для backup."
+    exit 1
+  fi
+  mkdir -p "$IDENTITY_BACKUP_DIR/certs" "$IDENTITY_BACKUP_DIR/client-files"
+  cp "$TT_DIR/certs/cert.pem" "$IDENTITY_BACKUP_DIR/certs/cert.pem"
+  cp "$TT_DIR/certs/key.pem" "$IDENTITY_BACKUP_DIR/certs/key.pem"
+  cp "$TT_DIR/credentials.toml" "$IDENTITY_BACKUP_DIR/credentials.toml"
+  cp "$TT_DIR/hosts.toml" "$IDENTITY_BACKUP_DIR/hosts.toml"
+  if [ -f "$CLIENT_DIR/clients-credentials.txt" ]; then
+    cp "$CLIENT_DIR/clients-credentials.txt" "$IDENTITY_BACKUP_DIR/client-files/clients-credentials.txt"
+  fi
+  if [ -f "$CLIENT_DIR/server-cert.pem" ]; then
+    cp "$CLIENT_DIR/server-cert.pem" "$IDENTITY_BACKUP_DIR/client-files/server-cert.pem"
+  fi
+  find "$CLIENT_DIR" -maxdepth 1 -type f -name '*.toml' -exec cp {} "$IDENTITY_BACKUP_DIR/client-files/" \; 2>/dev/null || true
+  backup_domain="$(sed -nE 's/^hostname = "([^"]+)".*/\1/p' "$TT_DIR/hosts.toml" | head -1)"
+  backup_port="$(current_endpoint_port)"
+  cat > "$IDENTITY_BACKUP_DIR/identity.env" <<EOF
+DOMAIN=${backup_domain}
+ENDPOINT_PORT=${backup_port}
+CERT_MODE=${CERT_MODE:-self-signed}
+EOF
+  backup_name="${backup_domain:-trusttunnel}-identity-backup"
+  archive_path="/root/${backup_name}.tar.gz"
+  tar -czf "$archive_path" -C "$IDENTITY_BACKUP_DIR" .
+  echo "Identity backup создан:"
+  echo "- Папка: ${IDENTITY_BACKUP_DIR}"
+  echo "- Архив: ${archive_path}"
+}
+
+restore_identity() {
+  local backup_domain backup_port current_domain current_port
+  if [ ! -f "$IDENTITY_BACKUP_DIR/certs/cert.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/certs/key.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/credentials.toml" ]; then
+    echo "Backup identity не найден в ${IDENTITY_BACKUP_DIR}."
+    exit 1
+  fi
+  mkdir -p "$TT_DIR/certs" "$CLIENT_DIR"
+  cp "$IDENTITY_BACKUP_DIR/certs/cert.pem" "$TT_DIR/certs/cert.pem"
+  cp "$IDENTITY_BACKUP_DIR/certs/key.pem" "$TT_DIR/certs/key.pem"
+  cp "$IDENTITY_BACKUP_DIR/credentials.toml" "$TT_DIR/credentials.toml"
+  if [ -f "$IDENTITY_BACKUP_DIR/hosts.toml" ]; then
+    cp "$IDENTITY_BACKUP_DIR/hosts.toml" "$TT_DIR/hosts.toml"
+  fi
+  if [ -d "$IDENTITY_BACKUP_DIR/client-files" ]; then
+    cp -f "$IDENTITY_BACKUP_DIR"/client-files/* "$CLIENT_DIR"/ 2>/dev/null || true
+  fi
+  chmod 0600 "$TT_DIR/certs/key.pem" "$TT_DIR/credentials.toml"
+  chmod 0644 "$TT_DIR/certs/cert.pem"
+  backup_domain=""
+  backup_port=""
+  current_domain="$(sed -nE 's/^hostname = "([^"]+)".*/\1/p' "$TT_DIR/hosts.toml" | head -1)"
+  current_port="$(current_endpoint_port)"
+  if [ -f "$IDENTITY_BACKUP_DIR/identity.env" ]; then
+    backup_domain="$(sed -nE 's/^DOMAIN=(.*)/\1/p' "$IDENTITY_BACKUP_DIR/identity.env" | head -1)"
+    backup_port="$(sed -nE 's/^ENDPOINT_PORT=(.*)/\1/p' "$IDENTITY_BACKUP_DIR/identity.env" | head -1)"
+  fi
+  echo "Identity восстановлен."
+  [ -n "$backup_domain" ] && echo "Backup domain: ${backup_domain}"
+  [ -n "$backup_port" ] && echo "Backup port: ${backup_port}"
+  echo "Current domain after restore: ${current_domain}"
+  echo "Current port after restore: ${current_port}"
+  systemctl restart trusttunnel 2>/dev/null || true
+}
+
 remove_all() {
   confirm_action "Будут удалены TrustTunnel, WARP, клиентские файлы и порт TrustTunnel из UFW. SSH/fail2ban не удаляются."
   local endpoint_port
   endpoint_port="$(current_endpoint_port)"
   systemctl disable --now trusttunnel 2>/dev/null || true
-  systemctl disable --now warp-wireproxy 2>/dev/null || true
+  systemctl stop warp-wireproxy 2>/dev/null || true
+  systemctl disable warp-wireproxy 2>/dev/null || true
   rm -f /etc/systemd/system/trusttunnel.service
   rm -f /etc/systemd/system/warp-wireproxy.service
   systemctl daemon-reload
@@ -1245,7 +1343,7 @@ show_status() {
   systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
   echo
   echo "Listening:"
-  ss -lntup | grep -E ":(${endpoint_port}|40000|40001|22|49222)\b|sshd|trusttunnel" || true
+  ss -lntup | grep -E ":(${endpoint_port}|40000|40001|22|49222)\b|sshd|trusttunnel|wireproxy" || true
   echo
   echo "UFW:"
   ufw status 2>/dev/null || true
@@ -1422,6 +1520,18 @@ main() {
       ;;
     disable-warp)
       disable_warp
+      exit 0
+      ;;
+    reregister-warp)
+      reregister_warp_account
+      exit 0
+      ;;
+    backup-identity)
+      backup_identity
+      exit 0
+      ;;
+    restore-identity)
+      restore_identity
       exit 0
       ;;
     exit)
