@@ -243,11 +243,11 @@ install_packages() {
     apt-get upgrade -y
   fi
   local packages
-  packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 zip coreutils sed grep gawk"
+  packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 coreutils sed grep gawk"
   if [ "$ENABLE_FAIL2BAN" = "1" ]; then
     packages="$packages fail2ban"
   fi
-  apt-get install -y --no-install-recommends $packages
+  apt-get install -y --no-install-recommends --no-upgrade $packages
 }
 
 resolve_trusttunnel_version() {
@@ -542,6 +542,30 @@ random_password() {
   printf 'TT-%s' "$(openssl rand -hex 12)"
 }
 
+create_client_archive() {
+  local source_dir="$1"
+  local archive_path="$2"
+  rm -f "$archive_path"
+  if command -v zip >/dev/null 2>&1; then
+    (cd "$source_dir" && zip -q -r "$archive_path" .)
+    return
+  fi
+
+  python3 - "$source_dir" "$archive_path" <<'PY'
+import pathlib
+import sys
+import zipfile
+
+source = pathlib.Path(sys.argv[1])
+archive = pathlib.Path(sys.argv[2])
+
+with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    for path in sorted(source.rglob("*")):
+        if path.is_file():
+            zf.write(path, path.relative_to(source))
+PY
+}
+
 client_name_by_index() {
   local index="$1"
   local width="${#CLIENTS}"
@@ -737,8 +761,7 @@ EOF
   chmod 0600 "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt"
   chmod 0644 "$CLIENT_DIR/server-cert.pem"
   zip_path="/root/trusttunnel-clients-${DOMAIN}.zip"
-  rm -f "$zip_path"
-  (cd "$CLIENT_DIR" && zip -q -r "$zip_path" .)
+  create_client_archive "$CLIENT_DIR" "$zip_path"
 }
 
 write_systemd() {
