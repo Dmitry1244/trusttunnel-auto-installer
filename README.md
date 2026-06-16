@@ -39,6 +39,9 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 7) Проверить WARP
 8) Включить WARP
 9) Отключить WARP без удаления
+10) Полностью перерегистрировать WARP-аккаунт
+11) Создать backup identity (сертификат и клиенты)
+12) Восстановить identity из backup
 0) Выход
 ```
 
@@ -46,6 +49,12 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 Для обновления TrustTunnel без пересоздания клиентов выбирай `6`.
 
 После установки главное меню можно открыть командой:
+
+```bash
+ttmenu
+```
+
+Старое имя тоже работает:
 
 ```bash
 trusttunnel-menu
@@ -134,4 +143,30 @@ trusttunnel-status
 - Открываются только SSH-порт и выбранный TCP-порт TrustTunnel.
 - Если включен QUIC/HTTP3, дополнительно открывается UDP на выбранном порту TrustTunnel.
 - Самый стабильный режим клиента: HTTP/2.
+- Если нужен WARP IP на сайтах, используй HTTP/2.
+- QUIC/HTTP3 сейчас следует считать экспериментальным режимом.
+- В связке `TrustTunnel -> WARP via SOCKS (wireproxy)` полноценный UDP outbound не гарантируется, поэтому QUIC/HTTP3 может подключаться, но не давать нормальный интернет.
 - Сертификат self-signed, но он встроен в TOML-файлы клиентов.
+
+## Identity backup
+
+Скрипт умеет сохранить и восстановить identity сервера без смены настроек на клиентах.
+
+Что сохраняется:
+
+- `cert.pem`
+- `key.pem`
+- `credentials.toml`
+- клиентские TOML и `clients-credentials.txt`
+
+Меню:
+
+- `11` — создать backup identity
+- `12` — восстановить identity из backup
+
+После backup на сервере появятся:
+
+```text
+/root/trusttunnel-identity-backup
+/root/YOUR_DOMAIN-identity-backup.tar.gz
+```
