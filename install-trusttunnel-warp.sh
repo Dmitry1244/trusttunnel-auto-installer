@@ -22,6 +22,7 @@ ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
 ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
 ACTION="${ACTION:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
+PRESERVE_CLIENT_CONFIGS="${PRESERVE_CLIENT_CONFIGS:-}"
 TT_VERSION="${TT_VERSION:-latest}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
 WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
@@ -185,6 +186,12 @@ collect_config() {
   ask_yes_no ENABLE_QUIC "Включить QUIC/HTTP3 на UDP-порту TrustTunnel" "1"
   ask_yes_no ENABLE_FAIL2BAN "Включить fail2ban для защиты SSH" "1"
 
+  if [ -f "$TT_DIR/credentials.toml" ] || [ -f "$TT_DIR/certs/cert.pem" ]; then
+    ask_yes_no PRESERVE_CLIENT_CONFIGS "Сохранить текущий сертификат и клиентские логины/пароли при переустановке" "1"
+  else
+    PRESERVE_CLIENT_CONFIGS="${PRESERVE_CLIENT_CONFIGS:-0}"
+  fi
+
   if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
     echo
     echo "Скрипт сбросит UFW firewall и откроет только:"
@@ -211,6 +218,7 @@ collect_config() {
   echo "- WARP: ${ENABLE_WARP}"
   echo "- QUIC/HTTP3: ${ENABLE_QUIC}"
   echo "- fail2ban: ${ENABLE_FAIL2BAN}"
+  echo "- Preserve client configs: ${PRESERVE_CLIENT_CONFIGS}"
   echo
 }
 
@@ -416,6 +424,13 @@ switch_trusttunnel_forwarder() {
 
 write_certs() {
   mkdir -p "$TT_DIR/certs"
+  if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
+    if openssl x509 -in "$TT_DIR/certs/cert.pem" -noout -subject 2>/dev/null \
+      | grep -Fq "CN = ${DOMAIN}"; then
+      echo "Using existing certificate for ${DOMAIN}."
+      return
+    fi
+  fi
   openssl ecparam -name prime256v1 -genkey -noout -out "$TT_DIR/certs/key.pem"
   cat > "$TT_DIR/certs/openssl.cnf" <<EOF
 [req]
@@ -527,34 +542,95 @@ random_password() {
   printf 'TT-%s' "$(openssl rand -hex 12)"
 }
 
-write_clients() {
-  local cert i user pass profile zip_path protocol protocols
-  mkdir -p "$CLIENT_DIR"
-  cert="$(cat "$TT_DIR/certs/cert.pem")"
-  cp "$TT_DIR/certs/cert.pem" "$CLIENT_DIR/server-cert.pem"
+client_name_by_index() {
+  local index="$1"
+  local width="${#CLIENTS}"
+  if [ "$width" -lt 2 ]; then
+    width=2
+  fi
+  printf "client%0${width}d" "$index"
+}
 
-  cat > "$TT_DIR/credentials.toml" <<'EOF'
-# Managed TrustTunnel users. One user/password per client.
-EOF
-  : > "$CLIENT_DIR/clients-credentials.txt"
+existing_password_for_user() {
+  local user="$1"
+  local file="${2:-}"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    return 1
+  fi
 
-  for i in $(seq -w 1 "$CLIENTS"); do
-    user="client${i}"
-    pass="$(random_password)"
-    cat >> "$TT_DIR/credentials.toml" <<EOF
+  awk -v wanted_user="$user" '
+    /^\[\[client\]\]/ {
+      current_user = ""
+      current_password = ""
+      next
+    }
+    /^[[:space:]]*username[[:space:]]*=/ {
+      current_user = $0
+      sub(/^[[:space:]]*username[[:space:]]*=[[:space:]]*"/, "", current_user)
+      sub(/".*$/, "", current_user)
+      next
+    }
+    /^[[:space:]]*password[[:space:]]*=/ {
+      current_password = $0
+      sub(/^[[:space:]]*password[[:space:]]*=[[:space:]]*"/, "", current_password)
+      sub(/".*$/, "", current_password)
+      if (current_user == wanted_user) {
+        print current_password
+        exit
+      }
+    }
+  ' "$file"
+}
 
-[[client]]
-username = "${user}"
-password = "${pass}"
-EOF
-    printf '%s %s\n' "$user" "$pass" >> "$CLIENT_DIR/clients-credentials.txt"
-    protocols="http2"
-    if [ "$ENABLE_QUIC" = "1" ]; then
-      protocols="http2 http3"
-    fi
-    for protocol in $protocols; do
-      profile="$CLIENT_DIR/${user}-${protocol}.toml"
-      cat > "$profile" <<EOF
+list_existing_clients() {
+  local file="${1:-}"
+  if [ -z "$file" ] || [ ! -f "$file" ]; then
+    return 1
+  fi
+
+  awk '
+    function flush_client() {
+      if (current_user != "" && current_password != "") {
+        print current_user, current_password
+      }
+    }
+    /^\[\[client\]\]/ {
+      flush_client()
+      current_user = ""
+      current_password = ""
+      next
+    }
+    /^[[:space:]]*username[[:space:]]*=/ {
+      current_user = $0
+      sub(/^[[:space:]]*username[[:space:]]*=[[:space:]]*"/, "", current_user)
+      sub(/".*$/, "", current_user)
+      next
+    }
+    /^[[:space:]]*password[[:space:]]*=/ {
+      current_password = $0
+      sub(/^[[:space:]]*password[[:space:]]*=[[:space:]]*"/, "", current_password)
+      sub(/".*$/, "", current_password)
+      next
+    }
+    END {
+      flush_client()
+    }
+  ' "$file"
+}
+
+write_client_profiles() {
+  local cert="$1"
+  local user="$2"
+  local pass="$3"
+  local profile protocol protocols
+  protocols="http2"
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    protocols="http2 http3"
+  fi
+
+  for protocol in $protocols; do
+    profile="$CLIENT_DIR/${user}-${protocol}.toml"
+    cat > "$profile" <<EOF
 # Endpoint host name, used for TLS session establishment
 hostname = "${DOMAIN}"
 
@@ -590,8 +666,72 @@ upstream_protocol = "${protocol}"
 # Is anti-DPI measures should be enabled
 anti_dpi = false
 EOF
-    done
   done
+}
+
+write_clients() {
+  local cert existing_clients existing_count existing_credentials generated_count index pass target_clients user zip_path
+  mkdir -p "$CLIENT_DIR"
+  rm -f "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt" "$CLIENT_DIR/server-cert.pem" 2>/dev/null || true
+  cert="$(cat "$TT_DIR/certs/cert.pem")"
+  cp "$TT_DIR/certs/cert.pem" "$CLIENT_DIR/server-cert.pem"
+  existing_credentials=""
+  existing_clients=""
+  if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/credentials.toml" ]; then
+    existing_credentials="$(mktemp)"
+    cp "$TT_DIR/credentials.toml" "$existing_credentials"
+    existing_clients="$(mktemp)"
+    list_existing_clients "$existing_credentials" > "$existing_clients" || true
+  fi
+
+  cat > "$TT_DIR/credentials.toml" <<'EOF'
+# Managed TrustTunnel users. One user/password per client.
+EOF
+  : > "$CLIENT_DIR/clients-credentials.txt"
+
+  target_clients="$CLIENTS"
+  if [ -n "$existing_clients" ] && [ -s "$existing_clients" ]; then
+    existing_count="$(wc -l < "$existing_clients" | tr -d '[:space:]')"
+    if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ "$existing_count" -gt "$target_clients" ]; then
+      target_clients="$existing_count"
+    fi
+  fi
+
+  generated_count=0
+  if [ -n "$existing_clients" ] && [ -s "$existing_clients" ]; then
+    while read -r user pass; do
+      if [ -z "$user" ] || [ "$generated_count" -ge "$target_clients" ]; then
+        continue
+      fi
+      generated_count=$((generated_count + 1))
+      cat >> "$TT_DIR/credentials.toml" <<EOF
+
+[[client]]
+username = "${user}"
+password = "${pass}"
+EOF
+      printf '%s %s\n' "$user" "$pass" >> "$CLIENT_DIR/clients-credentials.txt"
+      write_client_profiles "$cert" "$user" "$pass"
+    done < "$existing_clients"
+  fi
+
+  index=$((generated_count + 1))
+  while [ "$index" -le "$target_clients" ]; do
+    user="$(client_name_by_index "$index")"
+    pass="$(random_password)"
+    cat >> "$TT_DIR/credentials.toml" <<EOF
+
+[[client]]
+username = "${user}"
+password = "${pass}"
+EOF
+    printf '%s %s\n' "$user" "$pass" >> "$CLIENT_DIR/clients-credentials.txt"
+    write_client_profiles "$cert" "$user" "$pass"
+    index=$((index + 1))
+  done
+
+  rm -f "$existing_credentials"
+  rm -f "$existing_clients"
 
   chmod 0600 "$TT_DIR/credentials.toml"
   chmod 0600 "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt"
@@ -809,6 +949,7 @@ remove_all() {
   systemctl daemon-reload
   rm -rf "$TT_DIR" "$WARP_DIR" "$CLIENT_DIR"
   rm -f /root/trusttunnel-clients-*.zip
+  rm -f /usr/local/sbin/trusttunnel-menu
   rm -f /usr/local/sbin/trusttunnel-status
   ufw delete allow "${endpoint_port}/tcp" 2>/dev/null || true
   ufw delete allow "${endpoint_port}/udp" 2>/dev/null || true
@@ -885,7 +1026,17 @@ EOF
   chmod 0755 /usr/local/sbin/trusttunnel-status
 }
 
+primary_client_name() {
+  if [ -f "$CLIENT_DIR/clients-credentials.txt" ]; then
+    awk 'NF { print $1; exit }' "$CLIENT_DIR/clients-credentials.txt"
+    return
+  fi
+  printf 'client01'
+}
+
 print_mobile_instructions() {
+  local sample_client
+  sample_client="$(primary_client_name)"
   echo
   echo "=== Инструкция для мобильного клиента ==="
   echo
@@ -896,11 +1047,11 @@ print_mobile_instructions() {
   echo "3) Импортируй TOML-файл нужного клиента в TrustTunnel app."
   echo
   echo "Рекомендуемый файл для проверки:"
-  echo "   client01-http2.toml"
+  echo "   ${sample_client}-http2.toml"
   if [ "$ENABLE_QUIC" = "1" ]; then
     echo
     echo "Если хочешь QUIC/HTTP3:"
-    echo "   client01-http3.toml"
+    echo "   ${sample_client}-http3.toml"
     echo "   Для QUIC/HTTP3 должен проходить UDP-порт ${ENDPOINT_PORT}."
   fi
   echo
@@ -997,8 +1148,8 @@ main() {
   write_server_config
   write_clients
   write_systemd
-  configure_ssh_port
   configure_firewall
+  configure_ssh_port
   configure_fail2ban
   configure_bbr
   write_tools
