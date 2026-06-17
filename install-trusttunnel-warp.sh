@@ -24,6 +24,7 @@ ACTION="${ACTION:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
 PRESERVE_CLIENT_CONFIGS="${PRESERVE_CLIENT_CONFIGS:-}"
 CERT_MODE="${CERT_MODE:-}"
+FORCE_CERT_RENEW="${FORCE_CERT_RENEW:-0}"
 TT_VERSION="${TT_VERSION:-latest}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
 WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
@@ -187,6 +188,8 @@ choose_action() {
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
+    echo "13) Обновить сертификат вручную"
+    echo "14) Сменить режим сертификата (Let's Encrypt / self-signed)"
     case "${REPLY_VALUE:-1}" in
       1) ACTION="install"; return ;;
       2) ACTION="remove-all"; return ;;
@@ -200,6 +203,8 @@ choose_action() {
       10) ACTION="reregister-warp"; return ;;
       11) ACTION="backup-identity"; return ;;
       12) ACTION="restore-identity"; return ;;
+      13) ACTION="renew-certificate"; return ;;
+      14) ACTION="switch-certificate-mode"; return ;;
       0) ACTION="exit"; return ;;
       *) echo "Нужно выбрать 0-12 из меню." ;;
     esac
@@ -550,7 +555,7 @@ cert_matches_domain() {
 
 write_self_signed_cert() {
   mkdir -p "$TT_DIR/certs"
-  if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
+  if [ "${FORCE_CERT_RENEW:-0}" != "1" ] && [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
     if cert_matches_domain "$TT_DIR/certs/cert.pem"; then
       echo "Using existing certificate for ${DOMAIN}."
       return
@@ -585,7 +590,7 @@ EOF
 write_letsencrypt_cert() {
   local certbot_name added_ufw_rule live_dir
   mkdir -p "$TT_DIR/certs"
-  if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
+  if [ "${FORCE_CERT_RENEW:-0}" != "1" ] && [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
     if cert_matches_domain "$TT_DIR/certs/cert.pem"; then
       echo "Using existing certificate for ${DOMAIN}."
       return
@@ -601,7 +606,7 @@ write_letsencrypt_cert() {
   fi
 
   certbot_name="$DOMAIN"
-  if ! certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" --preferred-challenges http --keep-until-expiring --cert-name "$certbot_name"; then
+  if ! certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" --preferred-challenges http $([ "${FORCE_CERT_RENEW:-0}" = "1" ] && printf '%s' '--force-renewal' || printf '%s' '--keep-until-expiring') --cert-name "$certbot_name"; then
     if [ "$added_ufw_rule" = "1" ]; then
       ufw delete allow 80/tcp >/dev/null 2>&1 || true
     fi
@@ -1240,8 +1245,169 @@ current_endpoint_port() {
   printf '443'
 }
 
+current_domain() {
+  if [ -f "$TT_DIR/hosts.toml" ]; then
+    sed -nE 's/^hostname = "([^"]+)".*/\1/p' "$TT_DIR/hosts.toml" | head -1
+    return
+  fi
+  printf '%s' "${DOMAIN:-}"
+}
+
+current_client_count() {
+  if [ -f "$TT_DIR/credentials.toml" ]; then
+    awk 'BEGIN { n = 0 } /^\[\[client\]\]/ { n++ } END { print (n > 0 ? n : 1) }' "$TT_DIR/credentials.toml"
+    return
+  fi
+  printf '1'
+}
+
+current_quic_enabled() {
+  if [ -f "$TT_DIR/vpn.toml" ] && grep -q '^\[listen_protocols\.quic\]' "$TT_DIR/vpn.toml"; then
+    printf '1'
+    return
+  fi
+  printf '0'
+}
+
+detect_current_cert_mode() {
+  local cert_path domain issuer subject live_dir expected_issuer
+  cert_path="$TT_DIR/certs/cert.pem"
+  domain="$(current_domain)"
+  if [ ! -f "$cert_path" ]; then
+    printf 'self-signed'
+    return
+  fi
+
+  if [ -n "$domain" ]; then
+    live_dir="/etc/letsencrypt/live/${domain}"
+    if [ -f "${live_dir}/fullchain.pem" ] && cmp -s "$cert_path" "${live_dir}/fullchain.pem"; then
+      printf 'letsencrypt'
+      return
+    fi
+  fi
+
+  issuer="$(openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null || true)"
+  subject="$(openssl x509 -in "$cert_path" -noout -subject 2>/dev/null || true)"
+  expected_issuer="${subject/subject=/issuer=}"
+  if [ -n "$issuer" ] && [ "$issuer" = "$expected_issuer" ]; then
+    printf 'self-signed'
+    return
+  fi
+  if printf '%s\n' "$issuer" | grep -qi "let's encrypt\|ISRG"; then
+    printf 'letsencrypt'
+    return
+  fi
+  if [ -f /etc/systemd/system/trusttunnel-cert-renew.timer ]; then
+    printf 'letsencrypt'
+    return
+  fi
+  printf 'self-signed'
+}
+
+load_current_trusttunnel_context() {
+  if [ ! -f "$TT_DIR/vpn.toml" ] || [ ! -f "$TT_DIR/hosts.toml" ] || [ ! -f "$TT_DIR/credentials.toml" ]; then
+    echo "TrustTunnel config not found in ${TT_DIR}." >&2
+    exit 1
+  fi
+  DOMAIN="$(current_domain)"
+  ENDPOINT_PORT="$(current_endpoint_port)"
+  CLIENTS="$(current_client_count)"
+  ENABLE_QUIC="$(current_quic_enabled)"
+  CERT_MODE="$(detect_current_cert_mode)"
+  PRESERVE_CLIENT_CONFIGS=1
+}
+
+ensure_letsencrypt_packages() {
+  export DEBIAN_FRONTEND=noninteractive
+  if command -v certbot >/dev/null 2>&1; then
+    return
+  fi
+  if ! apt_update_retry; then
+    echo "Warning: apt-get update failed before certbot install." >&2
+  fi
+  apt_install_retry -y --no-install-recommends --no-upgrade certbot
+  if ! command -v certbot >/dev/null 2>&1; then
+    echo "certbot install failed." >&2
+    exit 1
+  fi
+}
+
+renew_certificate_manually() {
+  local current_mode
+  load_current_trusttunnel_context
+  current_mode="$CERT_MODE"
+
+  case "$current_mode" in
+    letsencrypt)
+      ask_required EMAIL "Email for Let's Encrypt: "
+      ensure_letsencrypt_packages
+      FORCE_CERT_RENEW=1
+      write_letsencrypt_cert
+      write_certificate_automation
+      systemctl restart trusttunnel
+      echo "Let's Encrypt certificate updated manually."
+      ;;
+    *)
+      confirm_action "Будет выпущен новый self-signed сертификат. Клиентам потребуется обновленный TOML или новый server-cert.pem."
+      FORCE_CERT_RENEW=1
+      write_self_signed_cert
+      write_clients
+      remove_certificate_automation
+      systemctl restart trusttunnel
+      echo "Self-signed certificate regenerated. Client files updated in ${CLIENT_DIR}."
+      ;;
+  esac
+}
+
+switch_certificate_mode() {
+  local current_mode target_mode
+  load_current_trusttunnel_context
+  current_mode="$CERT_MODE"
+  if [ "$CERT_MODE" != "self-signed" ] && [ "$CERT_MODE" != "letsencrypt" ]; then
+    if [ ! -r /dev/tty ]; then
+      echo "For non-interactive certificate switch set CERT_MODE=self-signed or CERT_MODE=letsencrypt." >&2
+      exit 1
+    fi
+    CERT_MODE=""
+    ask_cert_mode
+  fi
+  target_mode="$CERT_MODE"
+
+  if [ "$target_mode" = "$current_mode" ]; then
+    echo "Certificate mode already set to ${current_mode}."
+    return
+  fi
+
+  case "$target_mode" in
+    letsencrypt)
+      confirm_action "Будет выполнен переход на Let's Encrypt. Во время выпуска сертификата временно откроется 80/tcp. Клиентские TOML будут обновлены."
+      ask_required EMAIL "Email for Let's Encrypt: "
+      ensure_letsencrypt_packages
+      FORCE_CERT_RENEW=1
+      write_letsencrypt_cert
+      write_clients
+      write_certificate_automation
+      systemctl restart trusttunnel
+      echo "Switched certificate mode to Let's Encrypt."
+      ;;
+    self-signed)
+      confirm_action "Будет выполнен переход на self-signed сертификат. Клиентам понадобится обновленный TOML или новый server-cert.pem."
+      FORCE_CERT_RENEW=1
+      write_self_signed_cert
+      write_clients
+      remove_certificate_automation
+      systemctl restart trusttunnel
+      echo "Switched certificate mode to self-signed."
+      ;;
+    *)
+      echo "Unsupported certificate mode: ${target_mode}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 backup_identity() {
-  local backup_name archive_path backup_domain backup_port
+  local backup_name archive_path backup_domain backup_port backup_cert_mode
   if [ ! -f "$TT_DIR/certs/cert.pem" ] || [ ! -f "$TT_DIR/certs/key.pem" ] || [ ! -f "$TT_DIR/credentials.toml" ]; then
     echo "Не найден полный набор identity-файлов TrustTunnel для backup."
     exit 1
@@ -1260,10 +1426,11 @@ backup_identity() {
   find "$CLIENT_DIR" -maxdepth 1 -type f -name '*.toml' -exec cp {} "$IDENTITY_BACKUP_DIR/client-files/" \; 2>/dev/null || true
   backup_domain="$(sed -nE 's/^hostname = "([^"]+)".*/\1/p' "$TT_DIR/hosts.toml" | head -1)"
   backup_port="$(current_endpoint_port)"
+  backup_cert_mode="$(detect_current_cert_mode)"
   cat > "$IDENTITY_BACKUP_DIR/identity.env" <<EOF
 DOMAIN=${backup_domain}
 ENDPOINT_PORT=${backup_port}
-CERT_MODE=${CERT_MODE:-self-signed}
+CERT_MODE=${backup_cert_mode}
 EOF
   backup_name="${backup_domain:-trusttunnel}-identity-backup"
   archive_path="/root/${backup_name}.tar.gz"
@@ -1274,7 +1441,7 @@ EOF
 }
 
 restore_identity() {
-  local backup_domain backup_port current_domain current_port
+  local backup_domain backup_port backup_cert_mode current_domain current_port
   if [ ! -f "$IDENTITY_BACKUP_DIR/certs/cert.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/certs/key.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/credentials.toml" ]; then
     echo "Backup identity не найден в ${IDENTITY_BACKUP_DIR}."
     exit 1
@@ -1298,12 +1465,24 @@ restore_identity() {
   if [ -f "$IDENTITY_BACKUP_DIR/identity.env" ]; then
     backup_domain="$(sed -nE 's/^DOMAIN=(.*)/\1/p' "$IDENTITY_BACKUP_DIR/identity.env" | head -1)"
     backup_port="$(sed -nE 's/^ENDPOINT_PORT=(.*)/\1/p' "$IDENTITY_BACKUP_DIR/identity.env" | head -1)"
+    backup_cert_mode="$(sed -nE 's/^CERT_MODE=(.*)/\1/p' "$IDENTITY_BACKUP_DIR/identity.env" | head -1)"
+  fi
+  if [ -n "$backup_cert_mode" ]; then
+    CERT_MODE="$backup_cert_mode"
+  else
+    CERT_MODE="$(detect_current_cert_mode)"
   fi
   echo "Identity восстановлен."
   [ -n "$backup_domain" ] && echo "Backup domain: ${backup_domain}"
   [ -n "$backup_port" ] && echo "Backup port: ${backup_port}"
   echo "Current domain after restore: ${current_domain}"
   echo "Current port after restore: ${current_port}"
+  if [ "$CERT_MODE" = "letsencrypt" ]; then
+    DOMAIN="${current_domain:-$backup_domain}"
+    write_certificate_automation
+  else
+    remove_certificate_automation
+  fi
   systemctl restart trusttunnel 2>/dev/null || true
 }
 
@@ -1532,6 +1711,14 @@ main() {
       ;;
     restore-identity)
       restore_identity
+      exit 0
+      ;;
+    renew-certificate)
+      renew_certificate_manually
+      exit 0
+      ;;
+    switch-certificate-mode)
+      switch_certificate_mode
       exit 0
       ;;
     exit)
