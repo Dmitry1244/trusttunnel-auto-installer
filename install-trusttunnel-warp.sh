@@ -610,6 +610,7 @@ EOF
 }
 
 write_letsencrypt_cert() {
+  ensure_letsencrypt_packages
   local certbot_name added_ufw_rule live_dir
   mkdir -p "$TT_DIR/certs"
   if [ "${FORCE_CERT_RENEW:-0}" != "1" ] && [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
