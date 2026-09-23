@@ -28,6 +28,10 @@ FORCE_CERT_RENEW="${FORCE_CERT_RENEW:-0}"
 TT_VERSION="${TT_VERSION:-latest}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
 WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
+PANEL_PORT="${PANEL_PORT:-8088}"
+PANEL_USER="${PANEL_USER:-admin}"
+PANEL_PASSWORD="${PANEL_PASSWORD:-}"
+CASCADE_SOCKS_ADDR="${CASCADE_SOCKS_ADDR:-}"
 
 TT_DIR="/opt/trusttunnel"
 WARP_DIR="/opt/warp-proxy"
@@ -35,6 +39,7 @@ CLIENT_DIR="/root/trusttunnel-clients"
 SOCKS_ADDR="127.0.0.1:40000"
 WARP_HEALTH_ADDR="127.0.0.1:40001"
 IDENTITY_BACKUP_DIR="/root/trusttunnel-identity-backup"
+PANEL_SCRIPT_URL="https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/trusttunnel-panel.py"
 
 need_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -45,10 +50,10 @@ need_root() {
 
 prompt_value() {
   local message="$1"
-  if [ -r /dev/tty ]; then
-    read -r -p "$message" REPLY_VALUE </dev/tty
+  if [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
+    read -r -p "$message" REPLY_VALUE </dev/tty || REPLY_VALUE=""
   else
-    read -r -p "$message" REPLY_VALUE
+    read -r -p "$message" REPLY_VALUE || REPLY_VALUE=""
   fi
 }
 
@@ -185,11 +190,19 @@ choose_action() {
     echo "10) Полностью перерегистрировать WARP-аккаунт"
     echo "11) Создать backup identity (сертификат и клиенты)"
     echo "12) Восстановить identity из backup"
+    echo "13) Обновить сертификат вручную"
+    echo "14) Сменить режим сертификата (Let's Encrypt / self-signed)"
+    echo "15) Тест скорости"
+    echo "16) Настроить каскадный upstream SOCKS5"
+    echo "17) Установить или обновить веб-панель"
+    echo "18) Удалить веб-панель"
+    echo "19) Правила маршрутизации/access rules"
+    echo "20) Смена портов"
+    echo "21) Управление fail2ban"
+    echo "22) Управление UFW"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
-    echo "13) Обновить сертификат вручную"
-    echo "14) Сменить режим сертификата (Let's Encrypt / self-signed)"
     case "${REPLY_VALUE:-1}" in
       1) ACTION="install"; return ;;
       2) ACTION="remove-all"; return ;;
@@ -205,8 +218,16 @@ choose_action() {
       12) ACTION="restore-identity"; return ;;
       13) ACTION="renew-certificate"; return ;;
       14) ACTION="switch-certificate-mode"; return ;;
+      15) ACTION="speedtest"; return ;;
+      16) ACTION="configure-cascade"; return ;;
+      17) ACTION="install-panel"; return ;;
+      18) ACTION="remove-panel"; return ;;
+      19) ACTION="configure-routing"; return ;;
+      20) ACTION="manage-ports"; return ;;
+      21) ACTION="manage-fail2ban"; return ;;
+      22) ACTION="manage-ufw"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0-12 из меню." ;;
+      *) echo "Нужно выбрать 0-22 из меню." ;;
     esac
   done
 }
@@ -513,6 +534,7 @@ EOF
 
 switch_trusttunnel_forwarder() {
   local mode="$1"
+  local socks_addr="${2:-$SOCKS_ADDR}"
   local config="$TT_DIR/vpn.toml"
   local tmp
   if [ ! -f "$config" ]; then
@@ -521,7 +543,7 @@ switch_trusttunnel_forwarder() {
 
   cp "$config" "$config.backup.$(date +%Y%m%d%H%M%S)"
   tmp="$(mktemp)"
-  awk -v mode="$mode" -v socks_addr="$SOCKS_ADDR" '
+  awk -v mode="$mode" -v socks_addr="$socks_addr" '
     BEGIN { inserted = 0; skip = 0 }
     /^\[forward_protocol\.socks5\]$/ { skip = 1; next }
     /^\[forward_protocol\.direct\]$/ { skip = 1; next }
@@ -1511,6 +1533,363 @@ remove_all() {
   echo "TrustTunnel и WARP удалены. SSH и fail2ban оставлены без изменений."
 }
 
+run_speedtest() {
+  echo "=== Speedtest ==="
+  echo "Direct public IP:"
+  curl -4 -sS --max-time 10 https://ifconfig.me || true
+  echo
+  echo
+  echo "WARP public IP:"
+  curl -x socks5h://127.0.0.1:40000 -sS --max-time 12 https://ifconfig.me || echo "WARP SOCKS недоступен."
+  echo
+  echo
+  if command -v speedtest-cli >/dev/null 2>&1; then
+    speedtest-cli --secure --simple || true
+  else
+    echo "speedtest-cli не найден. Использую fallback download test через Cloudflare 100 MB."
+    curl -L -o /dev/null -sS --max-time 60 -w 'download=%{speed_download} bytes/sec\n' 'https://speed.cloudflare.com/__down?bytes=104857600' || true
+  fi
+}
+
+configure_cascade() {
+  local addr
+  ask_required CASCADE_SOCKS_ADDR "Адрес upstream SOCKS5 для каскада, например 127.0.0.1:1080 или proxy.example.com:1080: "
+  addr="$CASCADE_SOCKS_ADDR"
+  if ! printf '%s' "$addr" | grep -Eq '^[A-Za-z0-9_.:-]+:[0-9]{1,5}$'; then
+    echo "Неверный формат SOCKS5 address: ${addr}" >&2
+    exit 1
+  fi
+  switch_trusttunnel_forwarder socks5 "$addr"
+  echo "TrustTunnel переключен на каскадный SOCKS5 upstream: ${addr}"
+}
+
+configure_routing() {
+  local choice cidr
+  while true; do
+    echo
+    echo "=== Routing / access rules ==="
+    echo "Это серверные access rules TrustTunnel: allow/deny по CIDR и client_random_prefix."
+    echo "1) Показать rules.toml"
+    echo "2) Добавить deny CIDR"
+    echo "3) Сбросить rules.toml"
+    echo "0) Назад"
+    prompt_value "Выбери действие [1]: "
+    choice="${REPLY_VALUE:-1}"
+    case "$choice" in
+      1)
+        cat "$TT_DIR/rules.toml" 2>/dev/null || echo "rules.toml не найден."
+        ;;
+      2)
+        ask_required cidr "CIDR для блокировки, например 1.2.3.4/32: "
+        if ! printf '%s' "$cidr" | grep -Eq '^[0-9A-Fa-f:.]+/[0-9]{1,3}$'; then
+          echo "Неверный CIDR: ${cidr}" >&2
+          exit 1
+        fi
+        cat >> "$TT_DIR/rules.toml" <<EOF
+
+[[rule]]
+cidr = "${cidr}"
+action = "deny"
+EOF
+        systemctl restart trusttunnel 2>/dev/null || true
+        echo "Deny rule добавлен: ${cidr}"
+        ;;
+      3)
+        confirm_action "rules.toml будет сброшен: все authenticated clients будут разрешены."
+        cat > "$TT_DIR/rules.toml" <<'EOF'
+# Empty rules file: all authenticated clients are allowed.
+EOF
+        systemctl restart trusttunnel 2>/dev/null || true
+        echo "rules.toml сброшен."
+        ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-3." ;;
+    esac
+  done
+}
+
+current_configured_ssh_port() {
+  if [ -f /etc/ssh/sshd_config.d/99-trusttunnel-port.conf ]; then
+    sed -nE 's/^[[:space:]]*Port[[:space:]]+([0-9]+).*/\1/p' /etc/ssh/sshd_config.d/99-trusttunnel-port.conf | tail -1
+    return
+  fi
+  sed -nE 's/^[[:space:]]*Port[[:space:]]+([0-9]+).*/\1/p' /etc/ssh/sshd_config 2>/dev/null | tail -1 || true
+}
+
+change_endpoint_port() {
+  local old_port new_port
+  load_current_trusttunnel_context
+  old_port="$ENDPOINT_PORT"
+  ask_default new_port "Новый порт TrustTunnel" "$old_port"
+  validate_port "Порт TrustTunnel" "$new_port"
+  if [ "$new_port" = "$old_port" ]; then
+    echo "Порт TrustTunnel уже ${old_port}."
+    return
+  fi
+  cp "$TT_DIR/vpn.toml" "$TT_DIR/vpn.toml.backup.$(date +%Y%m%d%H%M%S)"
+  sed -i -E "s/listen_address[[:space:]]*=[[:space:]]*\"[^:]+:[0-9]+\"/listen_address = \"0.0.0.0:${new_port}\"/" "$TT_DIR/vpn.toml"
+  ufw allow "${new_port}/tcp" comment "TrustTunnel TCP" >/dev/null 2>&1 || true
+  if [ "$ENABLE_QUIC" = "1" ]; then
+    ufw allow "${new_port}/udp" comment "TrustTunnel QUIC" >/dev/null 2>&1 || true
+    ufw delete allow "${old_port}/udp" >/dev/null 2>&1 || true
+  fi
+  ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
+  ENDPOINT_PORT="$new_port"
+  PRESERVE_CLIENT_CONFIGS=1
+  write_clients
+  systemctl restart trusttunnel
+  echo "TrustTunnel порт изменен: ${old_port} -> ${new_port}. Клиентские TOML пересобраны в ${CLIENT_DIR}."
+}
+
+change_ssh_port_menu() {
+  local old_port new_port
+  old_port="$(current_configured_ssh_port)"
+  old_port="${old_port:-$(detect_current_ssh_port)}"
+  ask_default new_port "Новый SSH-порт" "${old_port:-49222}"
+  validate_port "SSH-порт" "$new_port"
+  if [ "$new_port" = "$old_port" ]; then
+    echo "SSH-порт уже ${old_port}."
+    return
+  fi
+  confirm_action "SSH будет переведен на порт ${new_port}. Новый порт будет открыт в UFW до перезапуска sshd. Старый порт ${old_port} останется открытым для безопасности."
+  SSH_PORT="$new_port"
+  CHANGE_SSH_PORT=1
+  ufw allow "${new_port}/tcp" comment "SSH" >/dev/null 2>&1 || true
+  configure_ssh_port
+  if command -v fail2ban-client >/dev/null 2>&1; then
+    ENABLE_FAIL2BAN=1
+    configure_fail2ban || true
+  fi
+  echo "SSH-порт изменен на ${new_port}. Проверь новый вход перед закрытием старого порта ${old_port}."
+}
+
+manage_ports() {
+  local choice
+  while true; do
+    echo
+    echo "=== Смена портов ==="
+    echo "1) Сменить порт TrustTunnel"
+    echo "2) Сменить SSH-порт"
+    echo "0) Назад"
+    prompt_value "Выбери действие [1]: "
+    choice="${REPLY_VALUE:-1}"
+    case "$choice" in
+      1) change_endpoint_port ;;
+      2) change_ssh_port_menu ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-2." ;;
+    esac
+  done
+}
+
+manage_fail2ban() {
+  local choice ip
+  while true; do
+    echo
+    echo "=== fail2ban ==="
+    echo "1) Статус sshd jail"
+    echo "2) Включить/переустановить fail2ban для SSH"
+    echo "3) Отключить fail2ban"
+    echo "4) Разбанить IP"
+    echo "0) Назад"
+    prompt_value "Выбери действие [1]: "
+    choice="${REPLY_VALUE:-1}"
+    case "$choice" in
+      1) fail2ban-client status sshd 2>/dev/null || systemctl --no-pager status fail2ban || true ;;
+      2)
+        ENABLE_FAIL2BAN=1
+        SSH_PORT="$(current_configured_ssh_port)"
+        SSH_PORT="${SSH_PORT:-$(detect_current_ssh_port)}"
+        apt_update_retry || true
+        apt_install_retry -y --no-install-recommends --no-upgrade fail2ban || true
+        configure_fail2ban
+        echo "fail2ban включен для SSH-порта ${SSH_PORT}."
+        ;;
+      3)
+        confirm_action "fail2ban будет остановлен и отключен."
+        systemctl disable --now fail2ban 2>/dev/null || true
+        echo "fail2ban отключен."
+        ;;
+      4)
+        ask_required ip "IP для разбана: "
+        fail2ban-client set sshd unbanip "$ip" || true
+        ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-4." ;;
+    esac
+  done
+}
+
+manage_ufw() {
+  local choice port proto ssh_port endpoint_port quic
+  while true; do
+    echo
+    echo "=== UFW firewall ==="
+    echo "1) Статус"
+    echo "2) Открыть порт"
+    echo "3) Закрыть порт"
+    echo "4) Пересобрать базовые правила SSH + TrustTunnel"
+    echo "0) Назад"
+    prompt_value "Выбери действие [1]: "
+    choice="${REPLY_VALUE:-1}"
+    case "$choice" in
+      1) ufw status verbose ;;
+      2)
+        ask_required port "Порт: "
+        validate_port "Порт" "$port"
+        ask_default proto "Протокол tcp/udp" "tcp"
+        ufw allow "${port}/${proto}" || true
+        ;;
+      3)
+        ask_required port "Порт: "
+        validate_port "Порт" "$port"
+        ask_default proto "Протокол tcp/udp" "tcp"
+        ufw delete allow "${port}/${proto}" || true
+        ;;
+      4)
+        endpoint_port="$(current_endpoint_port)"
+        quic="$(current_quic_enabled)"
+        ssh_port="$(current_configured_ssh_port)"
+        ssh_port="${ssh_port:-$(detect_current_ssh_port)}"
+        confirm_action "UFW будет сброшен. Будут открыты SSH ${ssh_port}/tcp, TrustTunnel ${endpoint_port}/tcp и UDP при включенном QUIC."
+        ufw --force reset
+        ufw default deny incoming
+        ufw default allow outgoing
+        ufw allow "${ssh_port}/tcp" comment "SSH"
+        ufw allow "${endpoint_port}/tcp" comment "TrustTunnel TCP"
+        if [ "$quic" = "1" ]; then
+          ufw allow "${endpoint_port}/udp" comment "TrustTunnel QUIC"
+        fi
+        ufw --force enable
+        ufw status verbose
+        ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-4." ;;
+    esac
+  done
+}
+
+install_panel() {
+  local panel_path env_file panel_mode ssh_port default_port default_mode old_port requested_panel_port requested_panel_mode
+  requested_panel_port="${PANEL_PORT:-}"
+  requested_panel_mode="${PANEL_ACCESS_MODE:-}"
+  panel_path="/usr/local/sbin/trusttunnel-panel.py"
+  env_file="/etc/trusttunnel-panel.env"
+  default_port="$PANEL_PORT"
+  default_mode="localhost"
+  if [ -f "$env_file" ]; then
+    . "$env_file" || true
+    default_port="${PANEL_PORT:-$default_port}"
+    if [ "${PANEL_TLS:-0}" = "1" ]; then
+      default_mode="https"
+    fi
+  fi
+  [ -n "$requested_panel_port" ] && PANEL_PORT="$requested_panel_port"
+  [ -n "$requested_panel_mode" ] && PANEL_ACCESS_MODE="$requested_panel_mode"
+  if [ -r /dev/tty ]; then
+    prompt_value "Порт веб-панели [${default_port}]: "
+    PANEL_PORT="${REPLY_VALUE:-$default_port}"
+  else
+    PANEL_PORT="${PANEL_PORT:-$default_port}"
+  fi
+  validate_port "Порт веб-панели" "$PANEL_PORT"
+  if [ -n "${PANEL_ACCESS_MODE:-}" ]; then
+    panel_mode="$PANEL_ACCESS_MODE"
+  elif [ -r /dev/tty ]; then
+    echo
+    echo "Режим доступа к веб-панели:"
+    echo "1) localhost - только через SSH-туннель, порт наружу не открывается"
+    echo "2) HTTPS - публично на выбранном порту, порт откроется в UFW"
+    prompt_value "Выбери режим [${default_mode}]: "
+    case "${REPLY_VALUE:-$default_mode}" in
+      2|https|HTTPS) panel_mode="https" ;;
+      *) panel_mode="localhost" ;;
+    esac
+  else
+    panel_mode="$default_mode"
+  fi
+  apt_update_retry || true
+  apt_install_retry -y --no-install-recommends --no-upgrade python3 curl qrencode || true
+  if [ -f /tmp/trusttunnel-panel.py ]; then
+    cp /tmp/trusttunnel-panel.py "$panel_path"
+  elif [ -f ./trusttunnel-panel.py ]; then
+    cp ./trusttunnel-panel.py "$panel_path"
+  else
+    curl -fsSL -o "$panel_path" "$PANEL_SCRIPT_URL"
+  fi
+  chmod 0755 "$panel_path"
+  old_port="$default_port"
+  if [ -z "${PANEL_PASSWORD:-}" ]; then
+    PANEL_PASSWORD="$(openssl rand -base64 18 | tr -d '=+/')"
+  fi
+  if [ "$panel_mode" = "https" ]; then
+    if [ ! -f "$TT_DIR/certs/cert.pem" ] || [ ! -f "$TT_DIR/certs/key.pem" ]; then
+      echo "Для HTTPS-панели не найден сертификат TrustTunnel в ${TT_DIR}/certs." >&2
+      exit 1
+    fi
+    cat > "$env_file" <<EOF
+PANEL_BIND=0.0.0.0
+PANEL_PORT=${PANEL_PORT}
+PANEL_USER=${PANEL_USER}
+PANEL_PASSWORD=${PANEL_PASSWORD}
+PANEL_TLS=1
+PANEL_CERT=${TT_DIR}/certs/cert.pem
+PANEL_KEY=${TT_DIR}/certs/key.pem
+EOF
+    ufw allow "${PANEL_PORT}/tcp" comment "TrustTunnel Panel HTTPS" >/dev/null 2>&1 || true
+  else
+    cat > "$env_file" <<EOF
+PANEL_BIND=127.0.0.1
+PANEL_PORT=${PANEL_PORT}
+PANEL_USER=${PANEL_USER}
+PANEL_PASSWORD=${PANEL_PASSWORD}
+PANEL_TLS=0
+PANEL_CERT=${TT_DIR}/certs/cert.pem
+PANEL_KEY=${TT_DIR}/certs/key.pem
+EOF
+    ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
+  fi
+  chmod 0600 "$env_file"
+  cat > /etc/systemd/system/trusttunnel-panel.service <<EOF
+[Unit]
+Description=TrustTunnel web panel
+After=network-online.target trusttunnel.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=${env_file}
+ExecStart=/usr/bin/python3 ${panel_path}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now trusttunnel-panel
+  systemctl restart trusttunnel-panel
+  ssh_port="$(current_configured_ssh_port)"
+  ssh_port="${ssh_port:-$(detect_current_ssh_port)}"
+  echo "Веб-панель установлена."
+  echo "Логин: ${PANEL_USER}"
+  echo "Пароль: ${PANEL_PASSWORD}"
+  if [ "$panel_mode" = "https" ]; then
+    echo "URL: https://$(current_domain):${PANEL_PORT}"
+  else
+    echo "URL: http://127.0.0.1:${PANEL_PORT}"
+    echo "SSH-туннель: ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} -p ${ssh_port} root@SERVER_IP"
+  fi
+}
+remove_panel() {
+  confirm_action "Веб-панель TrustTunnel будет остановлена и удалена."
+  systemctl disable --now trusttunnel-panel 2>/dev/null || true
+  rm -f /etc/systemd/system/trusttunnel-panel.service
+  rm -f /usr/local/sbin/trusttunnel-panel.py
+  rm -f /etc/trusttunnel-panel.env
+  systemctl daemon-reload
+  echo "Веб-панель удалена."
+}
 show_status() {
   if command -v trusttunnel-status >/dev/null 2>&1; then
     trusttunnel-status
@@ -1719,6 +2098,38 @@ main() {
       ;;
     switch-certificate-mode)
       switch_certificate_mode
+      exit 0
+      ;;
+    speedtest)
+      run_speedtest
+      exit 0
+      ;;
+    configure-cascade)
+      configure_cascade
+      exit 0
+      ;;
+    install-panel)
+      install_panel
+      exit 0
+      ;;
+    remove-panel)
+      remove_panel
+      exit 0
+      ;;
+    configure-routing)
+      configure_routing
+      exit 0
+      ;;
+    manage-ports)
+      manage_ports
+      exit 0
+      ;;
+    manage-fail2ban)
+      manage_fail2ban
+      exit 0
+      ;;
+    manage-ufw)
+      manage_ufw
       exit 0
       ;;
     exit)
