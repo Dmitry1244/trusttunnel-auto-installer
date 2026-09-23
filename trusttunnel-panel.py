@@ -23,9 +23,9 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 
 
-def run(cmd, timeout=40, input_text=None):
+def run(cmd, timeout=40, input_text=None, env=None, cwd=None):
     try:
-        p = subprocess.run(cmd, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        p = subprocess.run(cmd, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, env=env, cwd=cwd)
         return p.returncode, p.stdout.strip()
     except Exception as exc:
         return 1, str(exc)
@@ -115,6 +115,43 @@ def random_password():
     return 'TT-' + secrets.token_hex(12)
 
 
+PANEL_SETTINGS = Path('/etc/trusttunnel-panel-settings.env')
+
+
+def panel_settings():
+    values = {'DNS_UPSTREAMS': '94.140.14.14,94.140.15.15', 'CLIENT_ANTI_DPI': '0', 'TLS_PROFILE': 'chrome', 'POST_QUANTUM': '0'}
+    for line in read_text(PANEL_SETTINGS).splitlines():
+        if '=' in line and not line.lstrip().startswith('#'):
+            key, value = line.split('=', 1)
+            if key in values:
+                values[key] = value.strip()
+    return values
+
+
+def dns_upstreams():
+    return [item.strip() for item in panel_settings()['DNS_UPSTREAMS'].split(',') if re.fullmatch(r'[A-Za-z0-9_.:/?-]{1,253}', item.strip())][:4]
+
+
+def client_anti_dpi_enabled():
+    return panel_settings()['CLIENT_ANTI_DPI'] == '1'
+
+
+def client_tls_profile():
+    profile = panel_settings()['TLS_PROFILE']
+    return profile if profile in ('chrome', 'safari', 'firefox', 'okhttp', 'openssl', 'default') else 'chrome'
+
+
+def save_client_network_settings(dns_value, anti_dpi, tls_profile, post_quantum):
+    values = [item.strip() for item in dns_value.replace('\n', ',').split(',') if item.strip()]
+    if not values or len(values) > 4 or any(not re.fullmatch(r'[A-Za-z0-9_.:/?-]{1,253}', item) for item in values):
+        return 'Введите от 1 до 4 корректных DNS upstream.'
+    if tls_profile not in ('chrome', 'safari', 'firefox', 'okhttp', 'openssl', 'default'):
+        return 'Некорректный TLS-профиль.'
+    write_text(PANEL_SETTINGS, 'DNS_UPSTREAMS=' + ','.join(values) + '\nCLIENT_ANTI_DPI=' + ('1' if anti_dpi else '0') + '\nTLS_PROFILE=' + tls_profile + '\nPOST_QUANTUM=' + ('1' if post_quantum else '0') + '\n', 0o600)
+    rebuild_client_files(load_clients())
+    audit_log('client_network_settings_changed', ','.join(values))
+    return 'DNS, AntiDPI и TLS-профиль сохранены. Все TOML клиентов пересобраны.'
+
 def client_profile(username, password, protocol):
     cert = read_text(TT_DIR / 'certs' / 'cert.pem')
     body = f'''# Endpoint host name, used for TLS session establishment
@@ -147,11 +184,22 @@ certificate = """
 {cert}
 """
 '''
-    body += f'''\n# Protocol to be used to communicate with the endpoint [http2, http3]
+    dns_values = ', '.join(f'"{q(item)}"' for item in dns_upstreams())
+    post_quantum = panel_settings().get('POST_QUANTUM') == '1'
+    body += f'''\n# DNS resolvers for requests sent through the tunnel
+dns_upstreams = [{dns_values}]
+
+# Protocol to be used to communicate with the endpoint [http2, http3]
 upstream_protocol = "{protocol}"
 
-# Is anti-DPI measures should be enabled
-anti_dpi = false
+# TLS ClientHello profile used by the client
+tls_profile = "{client_tls_profile()}"
+
+# Enable client AntiDPI measures
+anti_dpi = {str(client_anti_dpi_enabled()).lower()}
+
+# Hybrid post-quantum TLS key exchange (requires a current TrustTunnel client)
+post_quantum_group_enabled = {str(post_quantum).lower()}
 '''
     return body
 
@@ -206,9 +254,11 @@ def switch_forwarder(mode, address=''):
 
 
 def deeplink(username):
-    cmd = [str(TT_DIR / 'trusttunnel_endpoint'), 'vpn.toml', 'hosts.toml', '-c', username, '-a', f'{domain()}:{endpoint_port()}', '--format', 'deeplink']
-    rc, out = run(cmd, timeout=10)
-    return out if rc == 0 and out.startswith('tt://') else ''
+    cmd = [str(TT_DIR / 'trusttunnel_endpoint'), 'vpn.toml', 'hosts.toml', '-c', username, '-a', f'{domain()}:{endpoint_port()}', '--format', 'deeplink', '--name', username]
+    for upstream in dns_upstreams():
+        cmd += ['--dns-upstream', upstream]
+    rc, out = run(cmd, timeout=15, cwd=str(TT_DIR))
+    return out.strip() if rc == 0 and out.strip().startswith('tt://') else ''
 
 
 def service_status(name):
@@ -526,6 +576,59 @@ def update_panel_credentials(username, password):
     subprocess.Popen(['sh', '-c', 'sleep 1; systemctl restart trusttunnel-panel >/dev/null 2>&1'])
     return 'Panel credentials updated. Sign in again with the new credentials.'
 
+def installer_defaults():
+    cfg = read_text(TT_DIR / 'vpn.toml')
+    cert = cert_mode()
+    return {
+        'domain': domain(),
+        'clients': str(max(1, len(load_clients()))),
+        'endpoint_port': endpoint_port(),
+        'ssh_port': current_ssh_port(),
+        'warp': '1' if uses_warp() else '0',
+        'quic': '1' if quic_enabled() else '0',
+        'cert_mode': cert if cert in ('self-signed', 'letsencrypt') else 'self-signed',
+    }
+
+
+def installer_operation(action, values):
+    allowed = {'install', 'update-trusttunnel', 'install-warp', 'remove-warp', 'reregister-warp', 'enable-warp', 'disable-warp', 'check-warp', 'backup-identity'}
+    if action not in allowed:
+        return 'Unsupported installer action.'
+    dangerous = {'install', 'remove-warp', 'reregister-warp'}
+    if action in dangerous and values.get('confirm', '') != 'REINSTALL':
+        return 'For this operation type REINSTALL in the confirmation field.'
+    env = os.environ.copy()
+    env['ACTION'] = action
+    env['AUTO_CONFIRM'] = '1'
+    if action == 'install':
+        defaults = installer_defaults()
+        domain_value = values.get('domain', '').strip()
+        if not re.fullmatch(r'[A-Za-z0-9.-]{3,253}', domain_value):
+            return 'Invalid domain.'
+        clients = values.get('clients', defaults['clients']).strip()
+        port = values.get('endpoint_port', defaults['endpoint_port']).strip()
+        if not clients.isdigit() or not 1 <= int(clients) <= 500:
+            return 'Clients must be between 1 and 500.'
+        if not validate_port(port):
+            return 'Invalid TrustTunnel port.'
+        cert = values.get('cert_mode', defaults['cert_mode'])
+        if cert not in ('self-signed', 'letsencrypt'):
+            return 'Invalid certificate mode.'
+        email = values.get('email', '').strip()
+        if cert == 'letsencrypt' and not re.fullmatch(r'[^@\\s]+@[^@\\s]+\\.[^@\\s]+', email):
+            return 'A valid email is required for Let\'s Encrypt.'
+        env.update({
+            'DOMAIN': domain_value, 'CLIENTS': clients, 'ENDPOINT_PORT': port,
+            'SSH_PORT': defaults['ssh_port'], 'CHANGE_SSH_PORT': '0',
+            'ENABLE_SYSTEM_UPGRADE': '0', 'ENABLE_WARP': values.get('warp', defaults['warp']),
+            'ENABLE_QUIC': values.get('quic', defaults['quic']), 'ENABLE_FAIL2BAN': '1',
+            'PRESERVE_CLIENT_CONFIGS': '1', 'CONFIRM_FIREWALL_RESET': '1',
+            'CERT_MODE': cert, 'EMAIL': email or 'admin@example.invalid',
+        })
+    rc, out = run(['/bin/bash', '/usr/local/sbin/trusttunnel-menu'], timeout=900, input_text='', env=env)
+    audit_log('installer_operation', action)
+    return out or ('Operation finished.' if rc == 0 else f'Operation failed with exit code {rc}.')
+
 def fail2ban_output(action, ip=''):
     if action == 'status':
         return run(['fail2ban-client', 'status', 'sshd'], timeout=15)[1]
@@ -570,6 +673,8 @@ def ufw_output(action, port='', proto='tcp'):
     return 'Unknown UFW action.'
 def html_page(message='', log=''):
     env = current_panel_env()
+    setup = installer_defaults()
+    net = panel_settings()
     clients = load_clients()
     protocols = ['http2', 'http3'] if quic_enabled() else ['http2']
     monitor_block = monitoring_html()
@@ -584,7 +689,7 @@ def html_page(message='', log=''):
         rows.append(f'''<tr><td>{html.escape(c['username'])}</td><td><code>{html.escape(c['password'])}</code></td><td>{' | '.join(links)}</td><td><form method="post" action="/client/password"><input type="hidden" name="username" value="{html.escape(c['username'])}"><button>Новый пароль</button></form><form method="post" action="/client/delete"><input type="hidden" name="username" value="{html.escape(c['username'])}"><button class="danger">Удалить</button></form></td></tr>''')
     msg = f'<div class="message">{html.escape(message)}</div>' if message else ''
     log_block = f'<section><pre>{html.escape(log)}</pre></section>' if log else ''
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TrustTunnel Panel</title><style>body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f6f7f9;color:#17202a}}header{{background:#17202a;color:white;padding:16px 24px}}main{{max-width:1180px;margin:0 auto;padding:24px}}section{{background:white;border:1px solid #d8dee6;border-radius:8px;margin-bottom:18px;padding:18px}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}.metric{{border:1px solid #e1e6ee;border-radius:6px;padding:12px;background:#fbfcfe}}.metric b{{display:block;font-size:13px;color:#536171;margin-bottom:6px}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;border-bottom:1px solid #e8edf3;padding:10px;vertical-align:top}}form{{display:inline-block;margin:3px}}input{{padding:8px;border:1px solid #ccd3dc;border-radius:6px}}button{{padding:8px 11px;border:1px solid #b7c0cc;border-radius:6px;background:#f7f9fb;cursor:pointer}}button.primary{{background:#1463ff;color:white;border-color:#1463ff}}button.danger{{background:#fff4f4;color:#a21616;border-color:#edb5b5}}pre{{white-space:pre-wrap;background:#111827;color:#d1e7dd;border-radius:6px;padding:14px;overflow:auto}}.message{{padding:10px 12px;background:#eef6ff;border:1px solid #b8d9ff;border-radius:6px;margin-bottom:14px}}a{{color:#145bd7;text-decoration:none}}.hint{{color:#536171;font-size:14px;line-height:1.45}}</style></head><body><header><h1>TrustTunnel Panel</h1></header><main>{msg}<section><div class="grid"><div class="metric"><b>Domain</b>{html.escape(domain())}:{endpoint_port()}</div><div class="metric"><b>TrustTunnel</b>{html.escape(service_status('trusttunnel'))}</div><div class="metric"><b>WARP</b>{html.escape(service_status('warp-wireproxy'))}</div><div class="metric"><b>Forward</b>{html.escape(forwarder_label())}</div><div class="metric"><b>QUIC/HTTP3</b>{'enabled' if quic_enabled() else 'disabled'}</div><div class="metric"><b>Certificate</b>{html.escape(cert_mode())}</div></div></section>{monitor_block}<section><form method="post" action="/action"><button name="action" value="restart" class="primary">Перезапустить TrustTunnel</button></form><form method="post" action="/action"><button name="action" value="warp">WARP</button></form><form method="post" action="/action"><button name="action" value="direct">Direct</button></form><form method="post" action="/action"><button name="action" value="speedtest">Speedtest</button></form><form method="post" action="/action"><button name="action" value="backup">Backup identity</button></form><a href="/backup/latest.zip">Скачать backup</a><form method="post" action="/action"><button name="action" value="diagnostics">Диагностика</button></form><form method="post" action="/action"><button name="action" value="logs">Логи TrustTunnel</button></form><form method="post" action="/action"><button name="action" value="certificate">Сертификат</button></form><form method="post" action="/action"><button name="action" value="renew-cert">Обновить Let's Encrypt</button></form><form method="post" action="/action"><button name="action" value="restart-warp">Перезапустить WARP</button></form><form method="post" action="/action"><button name="action" value="audit">История действий</button></form></section><section><h2>Обслуживание и уведомления</h2><div class="grid"><div><b>TrustTunnel endpoint</b><br><code>{html.escape(endpoint_version())}</code><form method="post" action="/maintenance"><button name="action" value="packages">Обновить пакеты VPS</button></form></div><div><b>Планировщик</b><form method="post" action="/maintenance"><button name="action" value="status">Статус</button><button name="action" value="enable">Включить daily check</button><button name="action" value="disable" class="danger">Отключить</button></form></div></div><form method="post" action="/telegram"><input name="token" placeholder="Telegram bot token" required><input name="chat_id" placeholder="Chat ID" required><button class="primary">Сохранить и проверить Telegram</button></form><p class="hint">Уведомления Telegram отправляются при тесте настройки. Автоматические сообщения можно безопасно включать после проверки таймера на тестовом VPS.</p></section><section><h2>Каскадный upstream</h2><form method="post" action="/cascade"><input name="address" placeholder="127.0.0.1:1080 или proxy.example:1080" required><button class="primary">Включить SOCKS5 cascade</button></form></section><section><h2>Порты</h2><form method="post" action="/ports/endpoint"><input name="port" value="{endpoint_port()}" required><button class="primary">Сменить порт TrustTunnel</button></form></section><section><h2>Доступ к панели</h2><form method="post" action="/panel/access"><input name="port" value="{html.escape(env.get('PANEL_PORT', '8088'))}" required><button name="mode" value="localhost">Localhost</button><button name="mode" value="https" class="primary">HTTPS</button></form><form method="post" action="/panel/credentials"><input name="username" value="{html.escape(env.get('PANEL_USER', 'admin'))}" required><input name="password" type="password" placeholder="Новый пароль, минимум 12 символов" required><button class="primary">Сменить логин и пароль</button></form></section><section><h2>fail2ban</h2><form method="post" action="/fail2ban"><button name="action" value="status">Статус</button><button name="action" value="enable">Включить</button><button name="action" value="disable" class="danger">Отключить</button><input name="ip" placeholder="IP для разбана"><button name="action" value="unban">Разбанить IP</button></form></section><section><h2>UFW</h2><form method="post" action="/ufw"><button name="action" value="status">Статус</button><button name="action" value="rebuild">Пересобрать базовые правила</button><input name="port" placeholder="порт"><input name="proto" value="tcp"><button name="action" value="allow">Открыть</button><button name="action" value="delete" class="danger">Закрыть</button></form></section><section><h2>Клиенты</h2><form method="post" action="/client/add"><input name="username" placeholder="client22" required><input name="password" placeholder="пароль, можно пусто"><button class="primary">Добавить клиента</button></form><table><thead><tr><th>Логин</th><th>Пароль</th><th>Ссылки/QR</th><th>Действия</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section><section><h2>Rules</h2><form method="post" action="/rules/add-deny"><input name="cidr" placeholder="1.2.3.4/32" required><button>Добавить deny CIDR</button></form><form method="post" action="/rules/reset"><button class="danger">Сбросить rules.toml</button></form><pre>{html.escape(rules_text())}</pre></section>{log_block}</main></body></html>'''
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TrustTunnel Panel</title><style>body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#f4f6f8;color:#17202a}}header{{position:sticky;top:0;z-index:5;background:#17202a;color:white;padding:14px 24px}}header h1{{font-size:20px;margin:0}}.shell{{display:grid;grid-template-columns:220px minmax(0,1fr);max-width:1440px;margin:0 auto}}aside{{padding:20px 14px;border-right:1px solid #d8dee6;background:#fff;min-height:calc(100vh - 52px);position:sticky;top:52px;height:fit-content}}aside a{{display:block;padding:9px 10px;border-radius:6px;color:#405166;font-size:14px;margin-bottom:2px}}aside a:hover{{background:#edf3ff;color:#145bd7}}main{{min-width:0;padding:24px;max-width:1180px}}section{{scroll-margin-top:72px;background:white;border:1px solid #d8dee6;border-radius:8px;margin-bottom:18px;padding:18px}}section h2{{font-size:18px;margin:0 0 14px}}@media(max-width:820px){{.shell{{display:block}}aside{{position:static;min-height:auto;border-right:0;border-bottom:1px solid #d8dee6;display:flex;overflow-x:auto;gap:3px;padding:9px}}aside a{{white-space:nowrap;margin:0}}main{{padding:14px}}}}.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px}}.metric{{border:1px solid #e1e6ee;border-radius:6px;padding:12px;background:#fbfcfe}}.metric b{{display:block;font-size:13px;color:#536171;margin-bottom:6px}}table{{width:100%;border-collapse:collapse}}th,td{{text-align:left;border-bottom:1px solid #e8edf3;padding:10px;vertical-align:top}}form{{display:inline-block;margin:3px}}input{{padding:8px;border:1px solid #ccd3dc;border-radius:6px}}button{{padding:8px 11px;border:1px solid #b7c0cc;border-radius:6px;background:#f7f9fb;cursor:pointer}}button.primary{{background:#1463ff;color:white;border-color:#1463ff}}button.danger{{background:#fff4f4;color:#a21616;border-color:#edb5b5}}pre{{white-space:pre-wrap;background:#111827;color:#d1e7dd;border-radius:6px;padding:14px;overflow:auto}}.message{{padding:10px 12px;background:#eef6ff;border:1px solid #b8d9ff;border-radius:6px;margin-bottom:14px}}a{{color:#145bd7;text-decoration:none}}.hint{{color:#536171;font-size:14px;line-height:1.45}}</style></head><body><header><h1>TrustTunnel Panel</h1></header><div class="shell"><aside><a href="#overview">Обзор</a><a href="#monitoring">Мониторинг</a><a href="#install">TrustTunnel</a><a href="#warp">WARP</a><a href="#client-network">DNS и AntiDPI</a><a href="#clients">Клиенты</a><a href="#routing">Маршрутизация</a><a href="#security">Безопасность</a><a href="#panel-access">Панель</a><a href="#maintenance">Обслуживание</a></aside><main>{msg}<section id="overview"><div class="grid"><div class="metric"><b>Domain</b>{html.escape(domain())}:{endpoint_port()}</div><div class="metric"><b>TrustTunnel</b>{html.escape(service_status('trusttunnel'))}</div><div class="metric"><b>WARP</b>{html.escape(service_status('warp-wireproxy'))}</div><div class="metric"><b>Forward</b>{html.escape(forwarder_label())}</div><div class="metric"><b>QUIC/HTTP3</b>{'enabled' if quic_enabled() else 'disabled'}</div><div class="metric"><b>Certificate</b>{html.escape(cert_mode())}</div></div></section><div id="monitoring">{monitor_block}</div><section id="install"><h2>Установка и обновление</h2><p class="hint">Переустановка использует тот же установщик, что и <code>ttmenu</code>. По умолчанию сохраняются текущий сертификат, пользователи и их TOML. Firewall будет пересобран: останутся SSH и выбранные порты TrustTunnel.</p><form method="post" action="/installer"><input type="hidden" name="action" value="install"><div class="grid"><label>Домен<br><input name="domain" value="{html.escape(setup['domain'])}" required></label><label>Клиентов<br><input name="clients" value="{setup['clients']}" required></label><label>Порт TrustTunnel<br><input name="endpoint_port" value="{setup['endpoint_port']}" required></label><label>Email для Let's Encrypt<br><input name="email" placeholder="нужен только для LE"></label></div><p><label><input type="checkbox" name="warp" value="1" {'checked' if setup['warp'] == '1' else ''}> WARP</label> <label><input type="checkbox" name="quic" value="1" {'checked' if setup['quic'] == '1' else ''}> QUIC/HTTP3</label> <label>Сертификат <select name="cert_mode"><option value="self-signed" {'selected' if setup['cert_mode'] == 'self-signed' else ''}>self-signed</option><option value="letsencrypt" {'selected' if setup['cert_mode'] == 'letsencrypt' else ''}>Let's Encrypt</option></select></label></p><input name="confirm" placeholder="Для переустановки введи REINSTALL" required><button class="danger">Установить / переустановить</button></form><form method="post" action="/installer"><input type="hidden" name="action" value="update-trusttunnel"><button class="primary">Обновить только TrustTunnel endpoint</button></form></section><section id="warp"><h2>WARP</h2><form method="post" action="/installer"><input type="hidden" name="action" value="check-warp"><button>Проверить WARP</button></form><form method="post" action="/installer"><input type="hidden" name="action" value="install-warp"><button>Установить / переустановить WARP</button></form><form method="post" action="/installer"><input type="hidden" name="action" value="reregister-warp"><input name="confirm" placeholder="REINSTALL"><button class="danger">Перерегистрировать WARP</button></form><form method="post" action="/installer"><input type="hidden" name="action" value="remove-warp"><input name="confirm" placeholder="REINSTALL"><button class="danger">Удалить WARP и перейти на direct</button></form></section><section id="client-network"><h2>DNS, AntiDPI и TLS</h2><p class="hint">Настройки применяются к экспортируемым TOML. AntiDPI и TLS profile поддерживаются актуальным клиентом TrustTunnel. Post-quantum TLS включай только после обновления клиентского приложения.</p><form method="post" action="/client/network"><div class="grid"><label>DNS upstream, до 4 через запятую<br><input name="dns" value="{html.escape(net['DNS_UPSTREAMS'])}" required></label><label>TLS profile<br><select name="tls_profile"><option value="chrome" {'selected' if net['TLS_PROFILE'] == 'chrome' else ''}>chrome</option><option value="safari" {'selected' if net['TLS_PROFILE'] == 'safari' else ''}>safari</option><option value="firefox" {'selected' if net['TLS_PROFILE'] == 'firefox' else ''}>firefox</option><option value="okhttp" {'selected' if net['TLS_PROFILE'] == 'okhttp' else ''}>okhttp</option><option value="openssl" {'selected' if net['TLS_PROFILE'] == 'openssl' else ''}>openssl</option><option value="default" {'selected' if net['TLS_PROFILE'] == 'default' else ''}>default</option></select></label></div><p><label><input type="checkbox" name="anti_dpi" value="1" {'checked' if net['CLIENT_ANTI_DPI'] == '1' else ''}> Включить AntiDPI в новых TOML</label> <label><input type="checkbox" name="post_quantum" value="1" {'checked' if net.get('POST_QUANTUM') == '1' else ''}> Hybrid post-quantum TLS</label></p><button class="primary">Сохранить и пересобрать профили</button></form></section><section><form method="post" action="/action"><button name="action" value="restart" class="primary">Перезапустить TrustTunnel</button></form><form method="post" action="/action"><button name="action" value="warp">WARP</button></form><form method="post" action="/action"><button name="action" value="direct">Direct</button></form><form method="post" action="/action"><button name="action" value="speedtest">Speedtest</button></form><form method="post" action="/action"><button name="action" value="backup">Backup identity</button></form><a href="/backup/latest.zip">Скачать backup</a><form method="post" action="/action"><button name="action" value="diagnostics">Диагностика</button></form><form method="post" action="/action"><button name="action" value="logs">Логи TrustTunnel</button></form><form method="post" action="/action"><button name="action" value="certificate">Сертификат</button></form><form method="post" action="/action"><button name="action" value="renew-cert">Обновить Let's Encrypt</button></form><form method="post" action="/action"><button name="action" value="restart-warp">Перезапустить WARP</button></form><form method="post" action="/action"><button name="action" value="audit">История действий</button></form></section><section id="maintenance"><h2>Обслуживание и уведомления</h2><div class="grid"><div><b>TrustTunnel endpoint</b><br><code>{html.escape(endpoint_version())}</code><form method="post" action="/maintenance"><button name="action" value="packages">Обновить пакеты VPS</button></form></div><div><b>Планировщик</b><form method="post" action="/maintenance"><button name="action" value="status">Статус</button><button name="action" value="enable">Включить daily check</button><button name="action" value="disable" class="danger">Отключить</button></form></div></div><form method="post" action="/telegram"><input name="token" placeholder="Telegram bot token" required><input name="chat_id" placeholder="Chat ID" required><button class="primary">Сохранить и проверить Telegram</button></form><p class="hint">Уведомления Telegram отправляются при тесте настройки. Автоматические сообщения можно безопасно включать после проверки таймера на тестовом VPS.</p></section><section id="routing"><h2>Каскадный upstream</h2><form method="post" action="/cascade"><input name="address" placeholder="127.0.0.1:1080 или proxy.example:1080" required><button class="primary">Включить SOCKS5 cascade</button></form></section><section><h2>Порты</h2><form method="post" action="/ports/endpoint"><input name="port" value="{endpoint_port()}" required><button class="primary">Сменить порт TrustTunnel</button></form></section><section id="panel-access"><h2>Доступ к панели</h2><form method="post" action="/panel/access"><input name="port" value="{html.escape(env.get('PANEL_PORT', '8088'))}" required><button name="mode" value="localhost">Localhost</button><button name="mode" value="https" class="primary">HTTPS</button></form><form method="post" action="/panel/credentials"><input name="username" value="{html.escape(env.get('PANEL_USER', 'admin'))}" required><input name="password" type="password" placeholder="Новый пароль, минимум 12 символов" required><button class="primary">Сменить логин и пароль</button></form></section><section id="security"><h2>fail2ban</h2><form method="post" action="/fail2ban"><button name="action" value="status">Статус</button><button name="action" value="enable">Включить</button><button name="action" value="disable" class="danger">Отключить</button><input name="ip" placeholder="IP для разбана"><button name="action" value="unban">Разбанить IP</button></form></section><section><h2>UFW</h2><form method="post" action="/ufw"><button name="action" value="status">Статус</button><button name="action" value="rebuild">Пересобрать базовые правила</button><input name="port" placeholder="порт"><input name="proto" value="tcp"><button name="action" value="allow">Открыть</button><button name="action" value="delete" class="danger">Закрыть</button></form></section><section id="clients"><h2>Клиенты</h2><form method="post" action="/client/add"><input name="username" placeholder="client22" required><input name="password" placeholder="пароль, можно пусто"><button class="primary">Добавить клиента</button></form><table><thead><tr><th>Логин</th><th>Пароль</th><th>Ссылки/QR</th><th>Действия</th></tr></thead><tbody>{''.join(rows)}</tbody></table></section><section><h2>Rules</h2><form method="post" action="/rules/add-deny"><input name="cidr" placeholder="1.2.3.4/32" required><button>Добавить deny CIDR</button></form><form method="post" action="/rules/reset"><button class="danger">Сбросить rules.toml</button></form><pre>{html.escape(rules_text())}</pre></section>{log_block}</main></div></body></html>'''
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -685,6 +790,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html('WARP restart finished.', restart_service('warp-wireproxy')); return
             if action == 'audit':
                 self.send_html('Panel action history.', audit_output()); return
+        if self.path == '/installer':
+            action = f.get('action', '')
+            self.send_html('Операция установщика завершена.', installer_operation(action, f))
+            return
         if self.path == '/maintenance':
             action = f.get('action', '')
             if action == 'packages':
@@ -695,6 +804,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_html('Maintenance scheduler updated.', maintenance_setup(action == 'enable')); return
         if self.path == '/telegram':
             self.send_html('Telegram settings.', save_telegram(f.get('token', '').strip(), f.get('chat_id', '').strip()))
+            return
+        if self.path == '/client/network':
+            self.send_html('Настройки клиентов обновлены.', save_client_network_settings(f.get('dns', ''), f.get('anti_dpi') == '1', f.get('tls_profile', 'chrome'), f.get('post_quantum') == '1'))
             return
         if self.path == '/cascade':
             address = f.get('address', '').strip()
