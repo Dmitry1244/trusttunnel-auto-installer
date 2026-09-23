@@ -308,6 +308,10 @@ collect_config() {
 confirm_action() {
   local message="$1"
   local answer=""
+  if [ "${AUTO_CONFIRM:-0}" = "1" ]; then
+    echo "Подтверждено неинтерактивным режимом: ${message}"
+    return
+  fi
   prompt_value "$message Напиши YES/yes/да для подтверждения: "
   answer="$REPLY_VALUE"
   case "$answer" in
