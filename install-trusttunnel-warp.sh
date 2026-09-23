@@ -39,6 +39,10 @@ CLIENT_DIR="/root/trusttunnel-clients"
 SOCKS_ADDR="127.0.0.1:40000"
 WARP_HEALTH_ADDR="127.0.0.1:40001"
 IDENTITY_BACKUP_DIR="/root/trusttunnel-identity-backup"
+CLIENT_SETTINGS_FILE="/etc/trusttunnel-panel-settings.env"
+PANEL_TELEGRAM_ENV="/etc/trusttunnel-panel-telegram.env"
+PANEL_MAINTENANCE_SERVICE="/etc/systemd/system/trusttunnel-maintenance.service"
+PANEL_MAINTENANCE_TIMER="/etc/systemd/system/trusttunnel-maintenance.timer"
 PANEL_SCRIPT_URL="https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/trusttunnel-panel.py"
 
 need_root() {
@@ -201,7 +205,10 @@ choose_action() {
     echo "21) Управление fail2ban"
     echo "22) Управление UFW"
     echo "23) Настроить доступ к веб-панели (localhost / HTTPS)"
-    echo "24) Включить / выключить веб-панель"
+    echo "24) Включить / выключить веб-панель и сменить вход"
+    echo "25) Управление клиентами и tt:// ссылками"
+    echo "26) DNS, TLS profile, AntiDPI и post-quantum для TOML"
+    echo "27) Система, диагностика и журнал"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -230,8 +237,11 @@ choose_action() {
       22) ACTION="manage-ufw"; return ;;
       23) ACTION="configure-panel-access"; return ;;
       24) ACTION="manage-panel-service"; return ;;
+      25) ACTION="manage-clients"; return ;;
+      26) ACTION="manage-client-network"; return ;;
+      27) ACTION="manage-system-tools"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0-24 из меню." ;;
+      *) echo "Нужно выбрать 0-27 из меню." ;;
     esac
   done
 }
@@ -938,6 +948,7 @@ write_client_profiles() {
   local user="$2"
   local pass="$3"
   local profile protocol protocols
+  load_client_network_settings
   protocols="http2"
   if [ "$ENABLE_QUIC" = "1" ]; then
     protocols="http2 http3"
@@ -982,11 +993,20 @@ EOF
     fi
     cat >> "$profile" <<EOF
 
+# DNS resolvers for requests sent through the tunnel
+dns_upstreams = ${CLIENT_DNS_TOML}
+
 # Protocol to be used to communicate with the endpoint [http2, http3]
 upstream_protocol = "${protocol}"
 
-# Is anti-DPI measures should be enabled
-anti_dpi = false
+# TLS ClientHello profile used by the client
+tls_profile = "${CLIENT_TLS_PROFILE}"
+
+# Enable client AntiDPI measures
+anti_dpi = ${CLIENT_ANTI_DPI}
+
+# Hybrid post-quantum TLS key exchange (requires a current TrustTunnel client)
+post_quantum_group_enabled = ${CLIENT_POST_QUANTUM}
 EOF
   done
 }
@@ -2003,6 +2023,322 @@ show_status() {
   ufw status 2>/dev/null || true
 }
 
+load_client_network_settings() {
+  local key value item first
+  CLIENT_DNS_UPSTREAMS="94.140.14.14,94.140.15.15"
+  CLIENT_TLS_PROFILE="chrome"
+  CLIENT_ANTI_DPI_VALUE="0"
+  CLIENT_POST_QUANTUM_VALUE="0"
+  if [ -f "$CLIENT_SETTINGS_FILE" ]; then
+    while IFS='=' read -r key value; do
+      case "$key" in
+        DNS_UPSTREAMS) CLIENT_DNS_UPSTREAMS="$value" ;;
+        TLS_PROFILE) CLIENT_TLS_PROFILE="$value" ;;
+        CLIENT_ANTI_DPI) CLIENT_ANTI_DPI_VALUE="$value" ;;
+        POST_QUANTUM) CLIENT_POST_QUANTUM_VALUE="$value" ;;
+      esac
+    done < "$CLIENT_SETTINGS_FILE"
+  fi
+  validate_client_dns_upstreams "$CLIENT_DNS_UPSTREAMS" || CLIENT_DNS_UPSTREAMS="94.140.14.14,94.140.15.15"
+  case "$CLIENT_TLS_PROFILE" in chrome|safari|firefox|okhttp|openssl|default) ;; *) CLIENT_TLS_PROFILE="chrome" ;; esac
+  case "$CLIENT_ANTI_DPI_VALUE" in 1) CLIENT_ANTI_DPI=true ;; *) CLIENT_ANTI_DPI=false; CLIENT_ANTI_DPI_VALUE=0 ;; esac
+  case "$CLIENT_POST_QUANTUM_VALUE" in 1) CLIENT_POST_QUANTUM=true ;; *) CLIENT_POST_QUANTUM=false; CLIENT_POST_QUANTUM_VALUE=0 ;; esac
+  CLIENT_DNS_TOML="["
+  first=1
+  IFS=',' read -r -a _client_dns_items <<< "$CLIENT_DNS_UPSTREAMS"
+  for item in "${_client_dns_items[@]}"; do
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [ -z "$item" ] && continue
+    [ "$first" = 1 ] || CLIENT_DNS_TOML+=", "
+    CLIENT_DNS_TOML+="\"${item}\""
+    first=0
+  done
+  CLIENT_DNS_TOML+="]"
+}
+
+validate_client_dns_upstreams() {
+  local value="$1" item count=0
+  IFS=',' read -r -a _dns_values <<< "$value"
+  for item in "${_dns_values[@]}"; do
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [ -z "$item" ] && continue
+    count=$((count + 1))
+    [[ "$item" =~ ^[A-Za-z0-9_.:/?-]{1,253}$ ]] || return 1
+  done
+  [ "$count" -ge 1 ] && [ "$count" -le 4 ]
+}
+
+save_client_network_settings() {
+  validate_client_dns_upstreams "$CLIENT_DNS_UPSTREAMS" || { echo "DNS: от 1 до 4 адресов DNS/DoH/DoT/DoQ через запятую." >&2; return 1; }
+  cat > "$CLIENT_SETTINGS_FILE" <<EOF
+DNS_UPSTREAMS=${CLIENT_DNS_UPSTREAMS}
+CLIENT_ANTI_DPI=${CLIENT_ANTI_DPI_VALUE}
+TLS_PROFILE=${CLIENT_TLS_PROFILE}
+POST_QUANTUM=${CLIENT_POST_QUANTUM_VALUE}
+EOF
+  chmod 0600 "$CLIENT_SETTINGS_FILE"
+}
+
+write_current_credentials_from_pairs() {
+  local pairs="$1" user pass
+  cat > "$TT_DIR/credentials.toml" <<'EOF'
+# Managed TrustTunnel users. One user/password per client.
+EOF
+  while read -r user pass; do
+    [ -z "$user" ] && continue
+    if ! [[ "$user" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || ! [[ "$pass" =~ ^[A-Za-z0-9._-]{12,128}$ ]]; then
+      echo "Некорректные данные клиента: ${user}" >&2
+      return 1
+    fi
+    cat >> "$TT_DIR/credentials.toml" <<EOF
+
+[[client]]
+username = "${user}"
+password = "${pass}"
+EOF
+  done < "$pairs"
+  chmod 0600 "$TT_DIR/credentials.toml"
+}
+
+rebuild_current_client_exports() {
+  load_current_trusttunnel_context
+  write_clients
+  systemctl restart trusttunnel
+  echo "Клиентские TOML и ZIP пересобраны: /root/trusttunnel-clients-$(current_domain).zip"
+}
+
+manage_clients() {
+  local choice user pass pairs updated link
+  if [ ! -f "$TT_DIR/credentials.toml" ]; then
+    echo "TrustTunnel ещё не установлен."
+    return
+  fi
+  while true; do
+    echo
+    echo "=== Клиенты TrustTunnel ==="
+    echo "1) Показать клиентов и пароли"
+    echo "2) Добавить клиента"
+    echo "3) Сменить пароль клиента"
+    echo "4) Удалить клиента"
+    echo "5) Пересобрать TOML и ZIP из текущих данных"
+    echo "6) Показать tt:// ссылку клиента"
+    echo "0) Назад"
+    prompt_value "Выбери действие [1]: "
+    choice="${REPLY_VALUE:-1}"
+    case "$choice" in
+      1) list_existing_clients "$TT_DIR/credentials.toml" | nl -ba ;;
+      2)
+        prompt_value "Логин нового клиента: "
+        user="$REPLY_VALUE"
+        if ! [[ "$user" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then echo "Логин: буквы, цифры, точка, _ и -; до 64 символов."; continue; fi
+        pairs="$(mktemp)"; list_existing_clients "$TT_DIR/credentials.toml" > "$pairs"
+        if awk -v target="$user" '$1 == target { found=1 } END { exit(found ? 0 : 1) }' "$pairs"; then echo "Такой клиент уже существует."; rm -f "$pairs"; continue; fi
+        prompt_value "Пароль (пусто = сгенерировать): "
+        pass="${REPLY_VALUE:-$(random_password)}"
+        if ! [[ "$pass" =~ ^[A-Za-z0-9._-]{12,128}$ ]]; then echo "Пароль: 12-128 символов, только буквы, цифры, точка, _ и -."; rm -f "$pairs"; continue; fi
+        printf '%s %s\n' "$user" "$pass" >> "$pairs"
+        write_current_credentials_from_pairs "$pairs" && rebuild_current_client_exports
+        rm -f "$pairs"
+        ;;
+      3)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        pairs="$(mktemp)"; list_existing_clients "$TT_DIR/credentials.toml" > "$pairs"
+        if ! awk -v target="$user" '$1 == target { found=1 } END { exit(found ? 0 : 1) }' "$pairs"; then echo "Клиент не найден."; rm -f "$pairs"; continue; fi
+        prompt_value "Новый пароль (пусто = сгенерировать): "; pass="${REPLY_VALUE:-$(random_password)}"
+        if ! [[ "$pass" =~ ^[A-Za-z0-9._-]{12,128}$ ]]; then echo "Некорректный пароль."; rm -f "$pairs"; continue; fi
+        updated="$(mktemp)"; awk -v target="$user" -v replacement="$pass" '{ if ($1 == target) print $1, replacement; else print $0 }' "$pairs" > "$updated"
+        write_current_credentials_from_pairs "$updated" && rebuild_current_client_exports
+        rm -f "$pairs" "$updated"
+        ;;
+      4)
+        prompt_value "Логин клиента для удаления: "; user="$REPLY_VALUE"
+        pairs="$(mktemp)"; list_existing_clients "$TT_DIR/credentials.toml" > "$pairs"
+        if ! awk -v target="$user" '$1 == target { found=1 } END { exit(found ? 0 : 1) }' "$pairs"; then echo "Клиент не найден."; rm -f "$pairs"; continue; fi
+        if [ "$(wc -l < "$pairs" | tr -d '[:space:]')" -le 1 ]; then echo "Нельзя удалить последнего клиента."; rm -f "$pairs"; continue; fi
+        confirm_action "Будет удалён клиент ${user} и его профили."
+        updated="$(mktemp)"; awk -v target="$user" '$1 != target' "$pairs" > "$updated"
+        write_current_credentials_from_pairs "$updated" && rebuild_current_client_exports
+        rm -f "$pairs" "$updated"
+        ;;
+      5) rebuild_current_client_exports ;;
+      6)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        if ! existing_password_for_user "$user" "$TT_DIR/credentials.toml" >/dev/null; then echo "Клиент не найден."; continue; fi
+        load_current_trusttunnel_context
+        link="$(cd "$TT_DIR" && ./trusttunnel_endpoint vpn.toml hosts.toml -c "$user" -a "${DOMAIN}:${ENDPOINT_PORT}" --format deeplink --name "$user" 2>/dev/null || true)"
+        if [[ "$link" == tt://* ]]; then printf '%s\n' "$link"; else echo "Не удалось создать tt:// ссылку. TOML-профиль остаётся рабочим вариантом."; fi
+        ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-6." ;;
+    esac
+  done
+}
+
+manage_client_network_settings() {
+  local choice value
+  if [ ! -f "$TT_DIR/credentials.toml" ]; then echo "TrustTunnel ещё не установлен."; return; fi
+  while true; do
+    load_client_network_settings
+    echo
+    echo "=== Настройки экспортируемых TOML ==="
+    echo "DNS upstream: ${CLIENT_DNS_UPSTREAMS}"
+    echo "TLS profile: ${CLIENT_TLS_PROFILE}"
+    echo "AntiDPI: ${CLIENT_ANTI_DPI}"
+    echo "Post-quantum TLS: ${CLIENT_POST_QUANTUM}"
+    echo "1) Изменить DNS upstream"
+    echo "2) Изменить TLS profile"
+    echo "3) Включить / отключить AntiDPI"
+    echo "4) Включить / отключить post-quantum TLS"
+    echo "5) Применить к TOML всех клиентов"
+    echo "0) Назад"
+    prompt_value "Выбери действие [0]: "
+    choice="${REPLY_VALUE:-0}"
+    case "$choice" in
+      1)
+        prompt_value "DNS через запятую (1-4 адреса): "; value="$REPLY_VALUE"
+        if ! validate_client_dns_upstreams "$value"; then echo "Некорректные DNS upstream."; continue; fi
+        CLIENT_DNS_UPSTREAMS="$value"; save_client_network_settings && echo "Сохранено. Для пересборки TOML выбери пункт 5." ;;
+      2)
+        echo "Допустимо: chrome, safari, firefox, okhttp, openssl, default"
+        prompt_value "TLS profile: "; value="$REPLY_VALUE"
+        case "$value" in chrome|safari|firefox|okhttp|openssl|default) CLIENT_TLS_PROFILE="$value"; save_client_network_settings && echo "Сохранено. Для пересборки TOML выбери пункт 5." ;; *) echo "Некорректный TLS profile." ;; esac
+        ;;
+      3)
+        [ "$CLIENT_ANTI_DPI_VALUE" = 1 ] && CLIENT_ANTI_DPI_VALUE=0 || CLIENT_ANTI_DPI_VALUE=1
+        save_client_network_settings && echo "AntiDPI сохранён. Для пересборки TOML выбери пункт 5."
+        ;;
+      4)
+        [ "$CLIENT_POST_QUANTUM_VALUE" = 1 ] && CLIENT_POST_QUANTUM_VALUE=0 || CLIENT_POST_QUANTUM_VALUE=1
+        save_client_network_settings && echo "Post-quantum TLS сохранён. Для пересборки TOML выбери пункт 5."
+        ;;
+      5)
+        echo "Будут пересобраны TOML и ZIP, но сертификат, пользователи и пароли не изменятся."
+        confirm_action "Применить настройки к экспортируемым TOML всех клиентов."
+        rebuild_current_client_exports
+        ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-5." ;;
+    esac
+  done
+}
+
+show_system_monitoring() {
+  echo "=== Мониторинг системы ==="
+  uptime || true
+  echo
+  free -h || true
+  echo
+  df -h / || true
+  echo
+  echo "Трафик сетевых интерфейсов:"
+  awk -F'[: ]+' 'NR > 2 && $1 != "lo" { printf "%s: RX %s bytes, TX %s bytes\\n", $1, $3, $11 }' /proc/net/dev 2>/dev/null || true
+}
+
+run_diagnostics() {
+  local domain endpoint_port
+  domain="$(current_domain)"; endpoint_port="$(current_endpoint_port)"
+  echo "=== Диагностика ==="
+  echo "Домен: ${domain}"
+  echo "Порт endpoint: ${endpoint_port}"
+  echo "TrustTunnel: $(systemctl is-active trusttunnel 2>/dev/null || true)"
+  echo "WARP: $(systemctl is-active warp-wireproxy 2>/dev/null || true)"
+  echo
+  echo "DNS домена:"; getent ahosts "$domain" 2>/dev/null || true
+  echo
+  echo "Слушающие порты:"; ss -lntup | grep -E ":(${endpoint_port}|40000|40001)\\b|trusttunnel|wireproxy" || true
+  echo
+  echo "Сертификат:"; openssl x509 -in "$TT_DIR/certs/cert.pem" -noout -dates -issuer 2>/dev/null || true
+  echo
+  check_warp
+}
+
+configure_maintenance_timer() {
+  local choice
+  while true; do
+    echo
+    echo "=== Ежедневная проверка сервисов ==="
+    echo "1) Включить"
+    echo "2) Отключить"
+    echo "3) Показать статус"
+    echo "0) Назад"
+    prompt_value "Выбери действие [3]: "; choice="${REPLY_VALUE:-3}"
+    case "$choice" in
+      1)
+        cat > "$PANEL_MAINTENANCE_SERVICE" <<'EOF'
+[Unit]
+Description=TrustTunnel daily maintenance
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'systemctl is-active --quiet trusttunnel || systemctl restart trusttunnel; systemctl is-active --quiet warp-wireproxy || true'
+EOF
+        cat > "$PANEL_MAINTENANCE_TIMER" <<'EOF'
+[Unit]
+Description=TrustTunnel daily maintenance timer
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload
+        systemctl enable --now trusttunnel-maintenance.timer
+        echo "Ежедневная проверка включена."
+        ;;
+      2) systemctl disable --now trusttunnel-maintenance.timer 2>/dev/null || true; echo "Ежедневная проверка отключена." ;;
+      3) systemctl list-timers --all trusttunnel-maintenance.timer || true ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-3." ;;
+    esac
+  done
+}
+
+configure_telegram_notifications() {
+  local token chat_id response
+  echo "Telegram используется только для тестового сообщения. Автоматические уведомления не включаются без отдельной настройки."
+  prompt_value "Bot token: "; token="$REPLY_VALUE"
+  prompt_value "Chat ID: "; chat_id="$REPLY_VALUE"
+  if [ -z "$token" ] || [ -z "$chat_id" ] || [[ "$token" == *$'\n'* ]] || [[ "$chat_id" == *$'\n'* ]]; then echo "Нужны Bot token и Chat ID."; return; fi
+  cat > "$PANEL_TELEGRAM_ENV" <<EOF
+TELEGRAM_BOT_TOKEN=${token}
+TELEGRAM_CHAT_ID=${chat_id}
+EOF
+  chmod 0600 "$PANEL_TELEGRAM_ENV"
+  response="$(curl -fsS --max-time 15 -X POST "https://api.telegram.org/bot${token}/sendMessage" -d "chat_id=${chat_id}" --data-urlencode "text=TrustTunnel: Telegram notifications are connected." 2>&1 || true)"
+  if printf '%s' "$response" | grep -q '"ok":true'; then echo "Тестовое сообщение отправлено."; else echo "Данные сохранены, но тестовое сообщение не подтверждено Telegram."; fi
+}
+
+manage_system_tools() {
+  local choice service
+  while true; do
+    echo
+    echo "=== Система, диагностика и журнал ==="
+    echo "1) Мониторинг CPU/RAM/диска/трафика"
+    echo "2) Диагностика TrustTunnel и WARP"
+    echo "3) Последние логи сервисов"
+    echo "4) Обновить пакеты VPS"
+    echo "5) Ежедневная проверка сервисов"
+    echo "6) Настроить Telegram для тестового сообщения"
+    echo "0) Назад"
+    prompt_value "Выбери действие [1]: "; choice="${REPLY_VALUE:-1}"
+    case "$choice" in
+      1) show_system_monitoring ;;
+      2) run_diagnostics ;;
+      3)
+        prompt_value "Сервис: trusttunnel, warp, fail2ban, panel [trusttunnel]: "; service="${REPLY_VALUE:-trusttunnel}"
+        case "$service" in trusttunnel) service=trusttunnel ;; warp) service=warp-wireproxy ;; fail2ban) service=fail2ban ;; panel) service=trusttunnel-panel ;; *) echo "Неизвестный сервис."; continue ;; esac
+        journalctl -u "$service" -n 120 --no-pager || true
+        ;;
+      4) confirm_action "Будут обновлены пакеты VPS через apt-get."; apt_update_retry && apt-get -o Acquire::Retries=3 upgrade -y || true ;;
+      5) configure_maintenance_timer ;;
+      6) configure_telegram_notifications ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-6." ;;
+    esac
+  done
+}
 write_tools() {
   cat > /usr/local/sbin/ttmenu <<'EOF'
 #!/usr/bin/env bash
@@ -2218,6 +2554,18 @@ main() {
       ;;
     manage-panel-service)
       manage_panel_service
+      exit 0
+      ;;
+    manage-clients)
+      manage_clients
+      exit 0
+      ;;
+    manage-client-network)
+      manage_client_network_settings
+      exit 0
+      ;;
+    manage-system-tools)
+      manage_system_tools
       exit 0
       ;;
     configure-routing)
