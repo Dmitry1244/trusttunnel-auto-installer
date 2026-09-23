@@ -2,22 +2,29 @@
 
 Интерактивный установщик TrustTunnel endpoint для Ubuntu/Debian VPS.
 
-Что настраивает:
+Скрипт можно запускать на чистом сервере и повторно на уже настроенном сервере. Для аккуратной переустановки есть backup/restore identity: сертификат, ключи и клиенты можно сохранить, чтобы на телефоне или ПК потом ничего не менять.
+
+## Что настраивает
 
 - TrustTunnel на выбранном TCP-порту, по умолчанию `443`;
 - актуальную версию TrustTunnel из latest GitHub release;
 - обновление системы перед установкой;
-- WARP через `wireproxy`, чтобы сайты видели WARP/Cloudflare IP, а не IP VPS;
+- self-signed сертификат или Let's Encrypt на выбор;
+- автообновление Let's Encrypt сертификата через systemd timer;
 - HTTP/2 и опционально QUIC/HTTP3;
-- выбор порта TrustTunnel, по умолчанию `443`;
+- WARP через `wireproxy`/SOCKS5, чтобы сайты видели WARP/Cloudflare IP, а не IP VPS;
+- direct-режим без WARP;
+- cascade SOCKS5 upstream;
 - клиентов `client01`, `client02` и т.д.;
-- TOML-файлы клиентов;
+- TOML-файлы клиентов, ссылки и QR через веб-панель;
 - ZIP-архив с клиентскими конфигами;
 - UFW firewall;
 - fail2ban для защиты SSH;
-- BBR congestion control для TCP.
+- BBR congestion control для TCP;
+- systemd автоперезапуск сервисов при падении;
+- короткую команду меню `ttmenu`.
 
-При смене SSH-порта скрипт сначала проверяет конфигурацию `sshd`, затем меняет firewall. Это снижает риск потерять доступ к серверу.
+При смене SSH-порта скрипт сначала проверяет конфигурацию `sshd`, затем меняет firewall. Старый SSH-порт сразу не закрывается, чтобы снизить риск потерять доступ к серверу.
 
 ## Быстрый запуск на VPS
 
@@ -44,6 +51,14 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 12) Восстановить identity из backup
 13) Обновить сертификат вручную
 14) Сменить режим сертификата (Let's Encrypt / self-signed)
+15) Speedtest
+16) Настроить cascade SOCKS5 upstream
+17) Установить или обновить веб-панель
+18) Удалить веб-панель
+19) Routing / access rules
+20) Смена портов
+21) Управление fail2ban
+22) Управление UFW
 0) Выход
 ```
 
@@ -51,6 +66,7 @@ curl -fsSL -o /tmp/install-trusttunnel-warp.sh https://raw.githubusercontent.com
 Для обновления TrustTunnel без пересоздания клиентов выбирай `6`.
 Для ручного обновления сертификата выбирай `13`.
 Для переключения между `Let's Encrypt` и `self-signed` выбирай `14`.
+Для веб-панели выбирай `17`.
 
 После установки главное меню можно открыть командой:
 
@@ -63,6 +79,55 @@ ttmenu
 ```bash
 trusttunnel-menu
 ```
+
+## Веб-панель
+
+Веб-панель ставится через пункт `17` меню. Скрипт спросит порт панели и режим доступа:
+
+- `localhost` - панель доступна только на `127.0.0.1` сервера, наружу порт не открывается. Это самый безопасный режим.
+- `HTTPS` - панель доступна публично на выбранном порту, порт открывается в UFW. Используется текущий сертификат TrustTunnel.
+
+Для режима `localhost` подключайся через SSH-туннель:
+
+```bash
+ssh -L 8088:127.0.0.1:8088 -p 49222 root@SERVER_IP
+```
+
+Потом открой в браузере:
+
+```text
+http://127.0.0.1:8088
+```
+
+В панели доступны только функции, которые реально применимы к этой установке:
+
+- статус TrustTunnel/WARP/fail2ban/UFW;
+- перезапуск TrustTunnel;
+- переключение `direct` / `WARP via SOCKS` / `cascade SOCKS5`;
+- speedtest;
+- добавление, удаление клиентов и смена пароля конкретному клиенту;
+- скачивание TOML, генерация QR и ссылок;
+- смена порта TrustTunnel;
+- управление доступом к самой панели: localhost/HTTPS и порт;
+- простые routing/access rules через `rules.toml`;
+- управление fail2ban;
+- управление UFW.
+
+Пароль панели создается автоматически при установке и выводится в конце. Его можно поменять в `/etc/trusttunnel-panel.env`, затем выполнить:
+
+```bash
+systemctl restart trusttunnel-panel
+```
+
+## Сертификаты
+
+Скрипт умеет два режима:
+
+- `self-signed` - проще и надежнее для ручного TOML/импорта. Клиенту нужен `server-cert.pem`. Автообновление не требуется.
+- `Let's Encrypt` - публичный доверенный сертификат для домена. Нужен корректный DNS A/AAAA на VPS. Скрипт ставит systemd timer для обновления. На время обновления порт `80/tcp` открывается, после обновления закрывается.
+
+Ручное обновление сертификата: пункт `13`.
+Смена режима сертификата: пункт `14`.
 
 ## Запуск с Windows PowerShell
 
@@ -79,6 +144,7 @@ ssh -t -p 49222 root@SERVER_IP "curl -fsSL -o /tmp/install-trusttunnel-warp.sh h
 ## Что спросит скрипт
 
 - домен TrustTunnel;
+- email для Let's Encrypt, если выбран этот режим;
 - количество клиентов;
 - порт TrustTunnel для клиентов, по умолчанию `443`;
 - менять ли SSH-порт;
@@ -132,25 +198,25 @@ trusttunnel-status
 Нормально, если:
 
 - `trusttunnel` active;
-- `warp-wireproxy` active;
-- `fail2ban` active;
+- `warp-wireproxy` active, если WARP включен;
+- `fail2ban` active, если fail2ban включен;
 - выбранный TCP-порт TrustTunnel слушается;
 - выбранный UDP-порт слушается, если включен QUIC/HTTP3;
-- WARP public IP отличается от IP VPS.
-- `net.ipv4.tcp_congestion_control = bbr`.
+- WARP public IP отличается от IP VPS;
+- `net.ipv4.tcp_congestion_control = bbr`;
 - systemd service использует `Restart=always`.
 
 ## Важно
 
-- Скрипт рассчитан на чистый Ubuntu/Debian VPS.
-- Скрипт сбрасывает UFW firewall.
+- Скрипт может запускаться повторно, но перед рискованными действиями лучше создать backup identity пунктом `11`.
+- Скрипт может сбрасывать UFW firewall при установке или пересборке правил.
 - Открываются только SSH-порт и выбранный TCP-порт TrustTunnel.
 - Если включен QUIC/HTTP3, дополнительно открывается UDP на выбранном порту TrustTunnel.
 - Самый стабильный режим клиента: HTTP/2.
 - Если нужен WARP IP на сайтах, используй HTTP/2.
 - QUIC/HTTP3 сейчас следует считать экспериментальным режимом.
 - В связке `TrustTunnel -> WARP via SOCKS (wireproxy)` полноценный UDP outbound не гарантируется, поэтому QUIC/HTTP3 может подключаться, но не давать нормальный интернет.
-- Сертификат self-signed, но он встроен в TOML-файлы клиентов.
+- При self-signed сертификате клиентам нужен общий `server-cert.pem`.
 
 ## Identity backup
 
@@ -158,15 +224,16 @@ trusttunnel-status
 
 Что сохраняется:
 
-- `cert.pem`
-- `key.pem`
-- `credentials.toml`
-- клиентские TOML и `clients-credentials.txt`
+- `cert.pem`;
+- `key.pem`;
+- `credentials.toml`;
+- `hosts.toml`;
+- клиентские TOML и `clients-credentials.txt`.
 
 Меню:
 
-- `11` — создать backup identity
-- `12` — восстановить identity из backup
+- `11` - создать backup identity;
+- `12` - восстановить identity из backup.
 
 После backup на сервере появятся:
 
@@ -174,3 +241,8 @@ trusttunnel-status
 /root/trusttunnel-identity-backup
 /root/YOUR_DOMAIN-identity-backup.tar.gz
 ```
+## Мониторинг и обслуживание
+
+Веб-панель показывает состояние TrustTunnel, WARP, CPU/RAM, диск, uptime и суммарный трафик сетевых интерфейсов VPS. Также доступны диагностика DNS/портов/сертификата, журналы TrustTunnel, создание и скачивание ZIP-backup identity, перезапуск WARP, ручное продление Let's Encrypt, планировщик ежедневной проверки и настройка Telegram для тестового уведомления.
+
+Статистика трафика по отдельному пользователю и список онлайн-пользователей не показываются, пока TrustTunnel endpoint не предоставляет достоверные события сессий.
