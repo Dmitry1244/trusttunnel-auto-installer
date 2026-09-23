@@ -200,6 +200,8 @@ choose_action() {
     echo "20) Смена портов"
     echo "21) Управление fail2ban"
     echo "22) Управление UFW"
+    echo "23) Настроить доступ к веб-панели (localhost / HTTPS)"
+    echo "24) Включить / выключить веб-панель"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -226,8 +228,10 @@ choose_action() {
       20) ACTION="manage-ports"; return ;;
       21) ACTION="manage-fail2ban"; return ;;
       22) ACTION="manage-ufw"; return ;;
+      23) ACTION="configure-panel-access"; return ;;
+      24) ACTION="manage-panel-service"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0-22 из меню." ;;
+      *) echo "Нужно выбрать 0-24 из меню." ;;
     esac
   done
 }
@@ -575,6 +579,14 @@ cert_matches_domain() {
   openssl x509 -in "$cert_path" -noout -subject 2>/dev/null | grep -Fq "CN = ${DOMAIN}"
 }
 
+cert_is_letsencrypt() {
+  local cert_path="$1"
+  if [ ! -f "$cert_path" ]; then
+    return 1
+  fi
+  openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null | grep -qiE "Let's Encrypt|ISRG"
+}
+
 write_self_signed_cert() {
   mkdir -p "$TT_DIR/certs"
   if [ "${FORCE_CERT_RENEW:-0}" != "1" ] && [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
@@ -614,8 +626,8 @@ write_letsencrypt_cert() {
   local certbot_name added_ufw_rule live_dir
   mkdir -p "$TT_DIR/certs"
   if [ "${FORCE_CERT_RENEW:-0}" != "1" ] && [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
-    if cert_matches_domain "$TT_DIR/certs/cert.pem"; then
-      echo "Using existing certificate for ${DOMAIN}."
+    if cert_matches_domain "$TT_DIR/certs/cert.pem" && cert_is_letsencrypt "$TT_DIR/certs/cert.pem"; then
+      echo "Using existing Let's Encrypt certificate for ${DOMAIN}."
       return
     fi
   fi
@@ -1882,6 +1894,85 @@ EOF
     echo "SSH-туннель: ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} -p ${ssh_port} root@SERVER_IP"
   fi
 }
+configure_panel_access() {
+  if [ ! -f /etc/systemd/system/trusttunnel-panel.service ]; then
+    echo "Веб-панель ещё не установлена. Сначала выбери пункт 17."
+    return
+  fi
+  echo "Настройка доступа к веб-панели. VPN, пользователи и сертификат TrustTunnel не изменяются."
+  install_panel
+}
+show_panel_credentials() {
+  local panel_bind panel_port panel_user panel_password panel_tls panel_domain
+  if [ ! -f /etc/trusttunnel-panel.env ]; then
+    echo "Настройки веб-панели не найдены."
+    return
+  fi
+  . /etc/trusttunnel-panel.env
+  panel_bind="${PANEL_BIND:-127.0.0.1}"
+  panel_port="${PANEL_PORT:-8088}"
+  panel_user="${PANEL_USER:-admin}"
+  panel_password="${PANEL_PASSWORD:-}"
+  panel_tls="${PANEL_TLS:-0}"
+  echo "Логин: ${panel_user}"
+  echo "Пароль: ${panel_password}"
+  if [ "$panel_tls" = "1" ]; then
+    panel_domain="$(current_domain)"
+    echo "URL: https://${panel_domain}:${panel_port}"
+  else
+    echo "URL: http://127.0.0.1:${panel_port}"
+    echo "Доступ только через SSH-туннель."
+  fi
+}
+
+change_panel_credentials() {
+  local panel_user panel_password
+  prompt_value "Новый логин панели: "
+  panel_user="$REPLY_VALUE"
+  if ! [[ "$panel_user" =~ ^[A-Za-z0-9_.-]{1,64}$ ]]; then
+    echo "Логин: только буквы, цифры, точка, _ и -; до 64 символов."
+    return
+  fi
+  prompt_value "Новый пароль панели (минимум 12 символов): "
+  panel_password="$REPLY_VALUE"
+  if [ "${#panel_password}" -lt 12 ] || [[ "$panel_password" == *$'\n'* ]] || [[ "$panel_password" == *"="* ]]; then
+    echo "Пароль должен быть не короче 12 символов и не содержать перевод строки или =."
+    return
+  fi
+  sed -i -E "s|^PANEL_USER=.*|PANEL_USER=${panel_user}|; s|^PANEL_PASSWORD=.*|PANEL_PASSWORD=${panel_password}|" /etc/trusttunnel-panel.env
+  chmod 0600 /etc/trusttunnel-panel.env
+  systemctl restart trusttunnel-panel
+  echo "Данные входа веб-панели обновлены."
+}
+
+manage_panel_service() {
+  local choice
+  if [ ! -f /etc/systemd/system/trusttunnel-panel.service ]; then
+    echo "Веб-панель ещё не установлена. Сначала выбери пункт 17."
+    return
+  fi
+  while true; do
+    echo
+    echo "Веб-панель: $(systemctl is-active trusttunnel-panel 2>/dev/null || true)"
+    echo "1) Включить и запустить"
+    echo "2) Отключить и остановить"
+    echo "3) Показать статус и последние логи"
+    echo "4) Показать данные для входа"
+    echo "5) Сменить логин и пароль"
+    echo "0) Назад"
+    prompt_value "Выбери действие [3]: "
+    choice="${REPLY_VALUE:-3}"
+    case "$choice" in
+      1) systemctl enable --now trusttunnel-panel; echo "Веб-панель включена." ;;
+      2) systemctl disable --now trusttunnel-panel; echo "Веб-панель отключена. Настройки сохранены." ;;
+      3) systemctl --no-pager --full status trusttunnel-panel || true; journalctl -u trusttunnel-panel -n 30 --no-pager || true ;;
+      4) show_panel_credentials ;;
+      5) change_panel_credentials ;;
+      0) return ;;
+      *) echo "Нужно выбрать 0-5." ;;
+    esac
+  done
+}
 remove_panel() {
   confirm_action "Веб-панель TrustTunnel будет остановлена и удалена."
   systemctl disable --now trusttunnel-panel 2>/dev/null || true
@@ -2115,6 +2206,14 @@ main() {
       ;;
     remove-panel)
       remove_panel
+      exit 0
+      ;;
+    configure-panel-access)
+      configure_panel_access
+      exit 0
+      ;;
+    manage-panel-service)
+      manage_panel_service
       exit 0
       ;;
     configure-routing)
