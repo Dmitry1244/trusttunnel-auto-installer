@@ -11,6 +11,17 @@ import time
 import subprocess
 import urllib.parse
 import zipfile
+import json
+import sys
+import threading
+import tempfile
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+import ipaddress
+import socket
+from contextlib import contextmanager
 from pathlib import Path
 
 TT_DIR = Path('/opt/trusttunnel')
@@ -23,6 +34,9 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 DEEPLINK_CACHE = {}
 DEEPLINK_CACHE_TTL = 300
+ADMIN_VERSION = '2026.09.26'
+ADMIN_LOCK = threading.RLock()
+CSRF_TOKEN = secrets.token_urlsafe(32)
 
 
 def run(cmd, timeout=40, input_text=None, env=None, cwd=None):
@@ -99,14 +113,369 @@ def cert_mode():
 
 
 def load_clients():
-    text = read_text(TT_DIR / 'credentials.toml')
-    clients = []
-    for block in re.split(r'(?m)^\s*\[\[client\]\]\s*$', text):
-        user = re.search(r'^\s*username\s*=\s*"([^"]*)"', block, re.M)
-        password = re.search(r'^\s*password\s*=\s*"([^"]*)"', block, re.M)
-        if user and password:
-            clients.append({'username': user.group(1), 'password': password.group(1)})
-    return clients
+    return tomllib.loads(read_text(TT_DIR / 'credentials.toml')).get('client', [])
+
+
+@contextmanager
+def admin_lock():
+    # Shared by web workers and the terminal CLI, including separate processes.
+    import fcntl
+    TT_DIR.mkdir(parents=True, exist_ok=True)
+    with ADMIN_LOCK, (TT_DIR / '.admin.lock').open('a') as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def atomic_write(path, text):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.admin-')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def client_state():
+    text = read_text(TT_DIR / 'clients-state.json')
+    return json.loads(text) if text else {'disabled': {}, 'notes': {}}
+
+
+def client_inventory():
+    state = client_state()
+    active = {c['username']: dict(c, enabled=True) for c in load_clients()}
+    for name, record in state.get('disabled', {}).items():
+        active.setdefault(name, dict(record, enabled=False))
+    return [dict(c, note=state.get('notes', {}).get(name, '')) for name, c in sorted(active.items())]
+
+
+def client_operation(action, values):
+    with admin_lock():
+        clients = load_clients()
+        state = client_state()
+        state.setdefault('disabled', {})
+        state.setdefault('notes', {})
+        user = values.get('username', '').strip()
+        records = {c['username']: c for c in clients}
+        all_names = set(records) | set(state['disabled'])
+        if action not in ('list', 'batch', 'rebuild') and not client_name_valid(user):
+            raise ValueError('Некорректный логин клиента.')
+        if action == 'list':
+            return '\n'.join(f"{c['username']}\t{'включён' if c['enabled'] else 'отключён'}\t{c['note']}" for c in client_inventory())
+        if action == 'link':
+            if user not in records:
+                raise ValueError('Клиент не найден или отключён.')
+            return deeplink(user) or 'Endpoint не смог сформировать ссылку.'
+        if action == 'rebuild':
+            rebuild_client_files(clients)
+            return 'TOML и ZIP пересобраны.'
+        if action in ('add', 'batch'):
+            count = int(values.get('count', '1')) if action == 'batch' else 1
+            prefix = values.get('prefix', 'client').strip()
+            if not 1 <= count <= 100 or not client_name_valid(prefix) or len(prefix) > 54:
+                raise ValueError('Укажите префикс до 54 символов и количество от 1 до 100.')
+            names = [user] if action == 'add' else []
+            index = 1
+            while len(names) < count:
+                candidate = f'{prefix}{index:02d}'
+                index += 1
+                if candidate not in all_names:
+                    names.append(candidate)
+            if any(name in all_names for name in names):
+                raise ValueError('Такой клиент уже существует, в том числе среди отключённых.')
+            password = values.get('password', '').strip()
+            if password and not re.fullmatch(r'[A-Za-z0-9._-]{12,128}', password):
+                raise ValueError('Пароль: 12–128 букв, цифр или символов ._-')
+            clients.extend({'username': name, 'password': password or random_password()} for name in names)
+        elif user not in all_names:
+            raise ValueError('Клиент не найден.')
+        elif action == 'note':
+            note = values.get('note', '').strip()
+            if len(note) > 300 or '\n' in note or '\r' in note:
+                raise ValueError('Заметка: одна строка, до 300 символов.')
+            state['notes'][user] = note
+            atomic_write(TT_DIR / 'clients-state.json', json.dumps(state, ensure_ascii=False))
+            audit_log('client-note', user)
+            return 'Заметка сохранена.'
+        elif action == 'disable':
+            if user not in records:
+                return 'Клиент уже отключён.'
+            if len(clients) <= 1:
+                raise ValueError('Нельзя отключить последнего активного клиента.')
+            state['disabled'][user] = records[user]
+            clients = [c for c in clients if c['username'] != user]
+        elif action == 'enable':
+            if user in records:
+                return 'Клиент уже включён.'
+            clients.append(state['disabled'].pop(user))
+        elif action == 'delete':
+            if user in records and len(clients) <= 1:
+                raise ValueError('Нельзя удалить последнего активного клиента.')
+            clients = [c for c in clients if c['username'] != user]
+            state['disabled'].pop(user, None)
+            state['notes'].pop(user, None)
+        elif action == 'password':
+            password = values.get('password', '').strip() or random_password()
+            if not re.fullmatch(r'[A-Za-z0-9._-]{12,128}', password):
+                raise ValueError('Пароль: 12–128 букв, цифр или символов ._-')
+            (records.get(user) or state['disabled'][user])['password'] = password
+        else:
+            raise ValueError('Неизвестное действие клиента.')
+        cred = TT_DIR / 'credentials.toml'
+        state_path = TT_DIR / 'clients-state.json'
+        old_credentials, old_state = read_text(cred), read_text(state_path)
+        config = tomllib.loads(old_credentials)
+        if set(config) - {'client'} or any(set(c) - {'username', 'password'} for c in config.get('client', [])):
+            raise ValueError('Обнаружены дополнительные поля credentials.toml. Автоматическая перезапись отменена.')
+        lines = []
+        for c in clients:
+            lines += ['[[client]]', 'username = ' + json.dumps(c['username']), 'password = ' + json.dumps(c['password']), '']
+        candidate = '\n'.join(lines)
+        tomllib.loads(candidate)
+        backup = TT_DIR / 'backups' / ('clients-' + time.strftime('%Y%m%d-%H%M%S') + '-' + secrets.token_hex(3))
+        backup.mkdir(parents=True, mode=0o700)
+        atomic_write(backup / 'credentials.toml', old_credentials)
+        atomic_write(backup / 'clients-state.json', old_state or '{}')
+        try:
+            atomic_write(state_path, json.dumps(state, ensure_ascii=False))
+            atomic_write(cred, candidate)
+            rc, out = run(['systemctl', 'restart', 'trusttunnel'], timeout=30)
+            if rc or service_status('trusttunnel') != 'active':
+                raise RuntimeError('TrustTunnel не запустился: ' + out)
+        except Exception:
+            atomic_write(cred, old_credentials)
+            if old_state:
+                atomic_write(state_path, old_state)
+            else:
+                state_path.unlink(missing_ok=True)
+            run(['systemctl', 'restart', 'trusttunnel'], timeout=30)
+            raise
+        DEEPLINK_CACHE.clear()
+        # Preserve existing profiles; only update new/changed identities.
+        before = {c['username']: c['password'] for c in tomllib.loads(old_credentials).get('client', [])}
+        for c in clients:
+            if before.get(c['username']) != c['password']:
+                for protocol in (['http2', 'http3'] if quic_enabled() else ['http2']):
+                    write_text(CLIENT_DIR / f"{c['username']}-{protocol}.toml", client_profile(c['username'], c['password'], protocol))
+        remaining = {c['username'] for c in clients}
+        for name in set(before) - remaining:
+            for protocol in ('http2', 'http3'):
+                (CLIENT_DIR / f'{name}-{protocol}.toml').unlink(missing_ok=True)
+        write_text(CLIENT_DIR / 'clients-credentials.txt', ''.join(f"{c['username']} {c['password']}\n" for c in clients))
+        audit_log('client-' + action, user or str(count))
+        return 'Изменения сохранены. TrustTunnel работает.'
+
+
+def admin_operation(action, values):
+    if action.startswith('client-'):
+        return client_operation(action[7:], values)
+    if action == 'monitor':
+        return json.dumps(monitor_snapshot(), ensure_ascii=False, indent=2)
+    if action == 'logs':
+        unit = values.get('unit', 'trusttunnel')
+        if unit not in ('trusttunnel', 'warp-wireproxy', 'trusttunnel-panel', 'fail2ban'):
+            raise ValueError('Неизвестный сервис.')
+        return recent_logs(unit, min(500, max(20, int(values.get('lines', '100')))))
+    if action == 'audit':
+        return audit_output()
+    if action.startswith(('security-', 'routing-', 'dns-')):
+        with admin_lock():
+            return network_operation(action, values)
+    raise ValueError('Неизвестная операция.')
+
+
+def checked_run(args, timeout=30):
+    rc, out = run(args, timeout=timeout)
+    if rc:
+        raise RuntimeError(out or 'Команда завершилась с ошибкой.')
+    return out
+
+
+def apply_endpoint_file(path, text):
+    tomllib.loads(text)
+    old = read_text(path)
+    atomic_write(Path(str(path) + '.admin-backup'), old)
+    atomic_write(path, text)
+    try:
+        checked_run(['systemctl', 'restart', 'trusttunnel'])
+        if service_status('trusttunnel') != 'active':
+            raise RuntimeError('TrustTunnel не запустился.')
+    except Exception:
+        atomic_write(path, old)
+        run(['systemctl', 'restart', 'trusttunnel'])
+        raise
+
+
+def validated_dns(value):
+    items = [v.strip() for v in value.replace('\n', ',').split(',') if v.strip()]
+    if not 1 <= len(items) <= 4:
+        raise ValueError('Укажите от 1 до 4 DNS-серверов.')
+    for item in items:
+        try:
+            ipaddress.ip_address(item)
+            continue
+        except ValueError:
+            pass
+        parsed = urllib.parse.urlsplit(item)
+        if parsed.scheme not in ('https', 'tls', 'quic') or not parsed.hostname or parsed.username or parsed.password or parsed.fragment:
+            raise ValueError('DNS: IP-адрес либо URL https://, tls:// или quic://.')
+        if any(ch.isspace() or ch in '\"\'\\' for ch in item):
+            raise ValueError('Недопустимые символы в DNS.')
+        if parsed.port is not None and not 1 <= parsed.port <= 65535:
+            raise ValueError('Некорректный порт DNS.')
+    return items
+
+
+def network_operation(action, values):
+    if action == 'security-status':
+        return '\n'.join(run(cmd)[1] for cmd in (['ufw', 'status', 'numbered'], ['fail2ban-client', 'status', 'sshd'], ['sshd', '-T']))
+    if action in ('security-ban', 'security-unban'):
+        address = str(ipaddress.ip_address(values.get('ip', '')))
+        if action == 'security-ban':
+            caller = values.get('_peer') or os.environ.get('SSH_CONNECTION', '').split(' ')[0]
+            if ipaddress.ip_address(address).is_loopback or address == caller:
+                raise ValueError('Нельзя заблокировать loopback или IP текущего администратора.')
+        return checked_run(['fail2ban-client', 'set', 'sshd', 'banip' if action == 'security-ban' else 'unbanip', address])
+    if action == 'security-fail2ban':
+        retry, findtime, bantime = (int(values.get(k, default)) for k, default in [('retry', '5'), ('findtime', '600'), ('bantime', '3600')])
+        if not 1 <= retry <= 100 or not 60 <= findtime <= 86400 or not 60 <= bantime <= 604800:
+            raise ValueError('Попытки: 1–100; окно: 60–86400 с; бан: 60–604800 с.')
+        path = Path('/etc/fail2ban/jail.d/sshd.local')
+        old = read_text(path)
+        import configparser
+        config = configparser.ConfigParser(interpolation=None)
+        config.read_string(old or '[sshd]\n')
+        if not config.has_section('sshd'):
+            config.add_section('sshd')
+        config['sshd'].update({'enabled': 'true', 'port': current_ssh_port(), 'backend': 'systemd', 'maxretry': str(retry), 'findtime': str(findtime), 'bantime': str(bantime)})
+        import io
+        output = io.StringIO(); config.write(output)
+        atomic_write(path, output.getvalue())
+        try:
+            checked_run(['fail2ban-client', '-t'])
+            checked_run(['systemctl', 'restart', 'fail2ban'])
+        except Exception:
+            if old: atomic_write(path, old)
+            else: path.unlink(missing_ok=True)
+            run(['systemctl', 'restart', 'fail2ban'])
+            raise
+        return 'Параметры SSH jail сохранены.'
+    if action in ('security-open', 'security-close'):
+        port, proto = values.get('port', ''), values.get('proto', 'tcp')
+        if not validate_port(port) or proto not in ('tcp', 'udp'):
+            raise ValueError('Некорректный порт или протокол.')
+        protected = {int(current_ssh_port()), int(endpoint_port()), int(current_panel_env().get('PANEL_PORT', '8088'))}
+        if action == 'security-close' and int(port) in protected:
+            raise ValueError('Этот порт используется SSH, TrustTunnel или панелью. Сначала смените порт сервиса.')
+        command = ['ufw', 'allow', f'{int(port)}/{proto}'] if action == 'security-open' else ['ufw', '--force', 'delete', 'allow', f'{int(port)}/{proto}']
+        return checked_run(command)
+    if action == 'routing-check':
+        return diagnostics_output()
+    if action == 'routing-switch':
+        mode = values.get('mode', '')
+        address = SOCKS_ADDR if mode == 'warp' else values.get('address', '').strip()
+        if mode not in ('direct', 'warp', 'socks5'):
+            raise ValueError('Некорректный маршрут.')
+        if mode != 'direct':
+            target = urllib.parse.urlsplit('socks5://' + address)
+            if not target.hostname or not target.port or target.username or target.password or target.path or target.query or target.fragment:
+                raise ValueError('Укажите SOCKS5 как host:port, без логина и пароля.')
+            if mode == 'warp':
+                checked_run(['systemctl', 'enable', '--now', 'warp-wireproxy'])
+            check = checked_run(['curl', '-fsS', '--max-time', '15', '--proxy', 'socks5h://' + address, 'https://www.cloudflare.com/cdn-cgi/trace'], timeout=20)
+            if mode == 'warp' and 'warp=on' not in check and 'warp=plus' not in check:
+                raise RuntimeError('WARP не подтвердил работоспособность. Маршрут не изменён.')
+        path = TT_DIR / 'vpn.toml'
+        cfg = read_text(path)
+        parsed = tomllib.loads(cfg)
+        if set(parsed.get('forward_protocol', {})) - {'direct', 'socks5'}:
+            raise ValueError('Неподдерживаемый существующий маршрут, изменение отменено.')
+        cfg = re.sub(r'(?ms)^\[forward_protocol(?:\.[^\]]+)?\][^\[]*', '', cfg)
+        cfg += '\n[forward_protocol]\n' + ('direct = {}\n' if mode == 'direct' else '[forward_protocol.socks5]\naddress = ' + json.dumps(address) + '\nextended_auth = false\n')
+        apply_endpoint_file(path, cfg)
+        audit_log(action, mode)
+        return 'Исходящий маршрут: ' + forwarder_label()
+    if action in ('routing-rule-add', 'routing-rule-delete'):
+        path = TT_DIR / 'rules.toml'
+        parsed = tomllib.loads(read_text(path))
+        rules = parsed.get('rule', [])
+        if set(parsed) - {'rule'} or any(set(rule) - {'cidr', 'action', 'client_random_prefix'} for rule in rules):
+            raise ValueError('Файл содержит дополнительные поля. Автоматическая перезапись отменена.')
+        if action.endswith('add'):
+            cidr = str(ipaddress.ip_network(values.get('cidr', ''), strict=False))
+            decision = values.get('decision', 'deny')
+            if decision not in ('allow', 'deny'):
+                raise ValueError('Действие: allow или deny.')
+            rule = {'cidr': cidr, 'action': decision}
+            if rule in rules: raise ValueError('Такое правило уже есть.')
+            rules.append(rule)
+        else:
+            index = int(values.get('index', '0')) - 1
+            if not 0 <= index < len(rules): raise ValueError('Правило не найдено.')
+            # Reject stale page actions instead of deleting a different rule.
+            expected = values.get('fingerprint', '')
+            import hashlib
+            actual = hashlib.sha256(json.dumps(rules[index], sort_keys=True).encode()).hexdigest()
+            if expected and expected != actual: raise ValueError('Правила изменились. Обновите страницу.')
+            rules.pop(index)
+        text = '\n'.join('[[rule]]\n' + '\n'.join(f'{k} = {json.dumps(v)}' for k, v in rule.items()) + '\n' for rule in rules)
+        apply_endpoint_file(path, text)
+        audit_log(action)
+        return 'Правила доступа сохранены. Первое совпавшее правило имеет приоритет.'
+    if action in ('dns-save', 'dns-check', 'dns-apply'):
+        if action == 'dns-apply':
+            rebuild_client_files(load_clients())
+            return 'Профили пересобраны. Импортируйте новый TOML на устройстве.'
+        items = validated_dns(values.get('dns', panel_settings()['DNS_UPSTREAMS']))
+        if action == 'dns-save':
+            net = panel_settings(); net['DNS_UPSTREAMS'] = ','.join(items)
+            atomic_write(PANEL_SETTINGS, ''.join(f'{k}={v}\n' for k, v in net.items()))
+            audit_log(action, ','.join(items))
+            return 'DNS сохранён. Применение к TOML выполняется отдельной командой.'
+        lines = []
+        for item in items:
+            try:
+                ipaddress.ip_address(item)
+                rc, output = run(['dig', '+time=3', '+tries=1', '@' + item, 'example.com', 'A'], timeout=6)
+                status = 'OK' if rc == 0 and 'status: NOERROR' in output else 'Нет успешного DNS-ответа'
+                lines.append(item + ': ' + status + '\n' + output)
+            except ValueError:
+                host = urllib.parse.urlsplit(item).hostname
+                try:
+                    lines.append(item + ': имя разрешается в ' + ', '.join(sorted({x[4][0] for x in socket.getaddrinfo(host, None)})) + '; DNS-запрос по DoH/DoT/DoQ этим тестом не проверяется.')
+                except OSError as exc:
+                    lines.append(item + ': ошибка разрешения имени: ' + str(exc))
+        return '\n\n'.join(lines)
+    raise ValueError('Неизвестная операция сети.')
+
+
+def monitor_snapshot():
+    result = system_metrics()
+    result['services'] = {name: service_status(name) for name in ('trusttunnel', 'warp-wireproxy', 'fail2ban')}
+    result['route'] = forwarder_label()
+    result['interfaces'] = {}
+    for line in read_text('/proc/net/dev').splitlines()[2:]:
+        if ':' in line:
+            name, raw = line.split(':', 1)
+            fields = raw.split()
+            if name.strip() != 'lo' and len(fields) > 8:
+                result['interfaces'][name.strip()] = {'rx': int(fields[0]), 'tx': int(fields[8])}
+    memory = {p[0].rstrip(':'): int(p[1]) for p in (line.split() for line in read_text('/proc/meminfo').splitlines()) if len(p) > 1}
+    result['memory_percent'] = round(100 * (1 - memory.get('MemAvailable', 0) / max(memory.get('MemTotal', 1), 1)), 1)
+    disk = shutil.disk_usage('/')
+    result['disk_percent'] = round(100 * disk.used / max(disk.total, 1), 1)
+    result['time'] = time.time()
+    return result
 
 
 def client_name_valid(name):
@@ -376,6 +745,9 @@ def backup_archive():
     for src, dst in [(TT_DIR/'certs'/'cert.pem', backup_dir/'cert.pem'), (TT_DIR/'certs'/'key.pem', backup_dir/'key.pem'), (TT_DIR/'credentials.toml', backup_dir/'credentials.toml'), (TT_DIR/'hosts.toml', backup_dir/'hosts.toml'), (TT_DIR/'vpn.toml', backup_dir/'vpn.toml')]:
         if src.exists():
             shutil.copy2(src, dst)
+    state = TT_DIR / 'clients-state.json'
+    if state.exists():
+        shutil.copy2(state, backup_dir / state.name)
     archive = Path('/root/trusttunnel-identity-backup.zip')
     with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
         for item in backup_dir.iterdir():
@@ -629,7 +1001,7 @@ def installer_operation(action, values):
         if cert not in ('self-signed', 'letsencrypt'):
             return 'Invalid certificate mode.'
         email = values.get('email', '').strip()
-        if cert == 'letsencrypt' and not re.fullmatch(r'[^@\\s]+@[^@\\s]+\\.[^@\\s]+', email):
+        if cert == 'letsencrypt' and not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', email):
             return 'A valid email is required for Let\'s Encrypt.'
         env.update({
             'DOMAIN': domain_value, 'CLIENTS': clients, 'ENDPOINT_PORT': port,
@@ -697,6 +1069,7 @@ NAV_ITEMS = (
     ('warp', 'WARP'), ('routing', 'Маршрутизация'), ('dns', 'DNS и AntiDPI'),
     ('certificates', 'Сертификаты'), ('security', 'Безопасность'),
     ('system', 'Система'), ('panel', 'Панель'),
+    ('logs', 'Журналы'),
 )
 
 
@@ -704,7 +1077,7 @@ def nav_html(view):
     groups = (
         ('Сервер', ('dashboard', 'endpoint', 'clients')),
         ('Сеть', ('warp', 'routing', 'dns')),
-        ('Управление', ('certificates', 'security', 'system', 'panel')),
+        ('Управление', ('certificates', 'security', 'system', 'logs', 'panel')),
     )
     labels = dict(NAV_ITEMS)
     parts = []
@@ -782,8 +1155,117 @@ def panel_view():
     return f'''<div class="page-head"><div><h2>Панель</h2><p>Доступ, HTTPS и данные администратора.</p></div></div><section class="surface"><h3>Режим доступа</h3><form method="post" action="/panel/access"><label>Порт панели<input name="port" value="{html.escape(env.get('PANEL_PORT', '8088'))}" required></label><button name="mode" value="localhost">Только localhost</button><button class="primary" name="mode" value="https">Публичный HTTPS</button></form></section><section class="surface"><h3>Учётные данные</h3><form method="post" action="/panel/credentials"><label>Логин<input name="username" value="{html.escape(env.get('PANEL_USER', 'admin'))}" required></label><label>Новый пароль<input type="password" name="password" minlength="12" required></label><button class="primary">Сменить данные входа</button></form></section>'''
 
 
-def html_page(message='', log='', view='dashboard'):
-    views = {'dashboard': dashboard_view, 'endpoint': endpoint_view, 'clients': clients_view, 'warp': warp_view, 'routing': routing_view, 'dns': dns_view, 'certificates': certificates_view, 'security': security_view, 'system': system_view, 'panel': panel_view}
+def admin_form(action, body, username='', view='clients', confirm=''):
+    confirmation = f' data-confirm="{html.escape(confirm, quote=True)}"' if confirm else ''
+    identity = f'<input type="hidden" name="username" value="{html.escape(username, quote=True)}">' if username else ''
+    return f'<form method="post" action="/manage"{confirmation}><input type="hidden" name="action" value="{action}"><input type="hidden" name="view" value="{view}">{identity}{body}</form>'
+
+
+def clients_console():
+    clients = client_inventory()
+    rows, drawers = [], []
+    for index, client in enumerate(clients):
+        name = client['username']
+        safe = html.escape(name, quote=True)
+        enabled = client['enabled']
+        state = 'active' if enabled else 'inactive'
+        label = 'Включён' if enabled else 'Отключён'
+        drawer_id = f'identity-{index}'
+        profiles = ''
+        if enabled:
+            for proto, title in [('http2', 'HTTP/2')] + ([('http3', 'QUIC')] if quic_enabled() else []):
+                profiles += f'<a class="button" href="/client/{urllib.parse.quote(name)}/{proto}.toml">{title} TOML</a> '
+        link = deeplink(name) if enabled else ''
+        share = f'<label>Ссылка подключения<textarea id="share-{index}" readonly>{html.escape(link)}</textarea></label><button type="button" data-copy="share-{index}">Копировать ссылку</button><img class="share-qr" loading="lazy" alt="QR подключения {safe}" src="/qr-link/{urllib.parse.quote(name)}.png">' if link else '<p class="muted">Ссылка доступна для включённого клиента, если endpoint поддерживает экспорт.</p>'
+        toggle = admin_form('client-disable' if enabled else 'client-enable', f'<button role="switch" aria-checked="{str(enabled).lower()}" class="toggle {state}" title="{label}"><span></span></button>', name, confirm='Изменить доступ клиента? Активные подключения TrustTunnel переподключатся.')
+        rows.append(f'<tr data-client-row data-client="{safe.lower()} {html.escape(client["note"].lower(), quote=True)}" data-protocols="http2 http3" data-state="{state}"><td>{toggle}</td><td><strong>{safe}</strong><span class="muted">{html.escape(client["note"])}</span></td><td><span class="badge {state}">{label}</span></td><td><span class="protocol">HTTP/2</span> {"<span class=protocol>QUIC</span>" if quic_enabled() else ""}</td><td class="table-actions"><button type="button" data-drawer="{drawer_id}">Управлять</button></td></tr>')
+        note = admin_form('client-note', f'<label>Заметка<input name="note" maxlength="300" value="{html.escape(client["note"], quote=True)}"></label><button>Сохранить</button>', name)
+        password = admin_form('client-password', '<label>Новый пароль<input name="password" type="password" placeholder="Пусто: случайный" autocomplete="new-password"></label><button>Сменить пароль</button>', name, confirm='Старый пароль перестанет работать. Потребуется обновить профиль клиента.')
+        delete = admin_form('client-delete', '<button class="danger">Удалить клиента</button>', name, confirm='Удалить клиента и отозвать доступ?')
+        drawers.append(f'<aside class="drawer" id="{drawer_id}" role="dialog" aria-modal="true" aria-label="Клиент {safe}"><div class="drawer-card"><div class="drawer-head"><h2>{safe}</h2><button type="button" data-drawer-close aria-label="Закрыть">×</button></div><section class="drawer-section">{note}</section><section class="drawer-section"><label>Текущий пароль<input type="password" value="{html.escape(client["password"], quote=True)}" id="secret-{index}" readonly></label><button type="button" data-reveal="secret-{index}">Показать / скрыть</button><button type="button" data-copy="secret-{index}">Копировать</button></section><section class="drawer-section"><h3>Подключение</h3>{profiles}{share}</section><section class="drawer-section">{password}{delete}</section></div></aside>')
+    create = admin_form('client-add', '<label>Логин<input name="username" pattern="[A-Za-z0-9_.-]{1,64}" required></label><label>Пароль<input name="password" type="password" placeholder="Пусто: случайный"></label><button class="primary">Добавить клиента</button>')
+    batch = admin_form('client-batch', '<label>Префикс<input name="prefix" value="client" maxlength="54" required></label><label>Количество<input name="count" type="number" min="1" max="100" value="5" required></label><button>Создать группу</button>', confirm='Создать новых клиентов? TrustTunnel кратковременно перезапустится.')
+    active = sum(c['enabled'] for c in clients)
+    return f'<div class="page-head"><div><h2>Клиенты</h2><p>{len(clients)} всего · {active} включено · {len(clients)-active} отключено</p></div><button class="primary" data-drawer="add-client">Добавить клиентов</button></div><div class="table-toolbar"><input id="client-search" class="search" aria-label="Поиск клиентов" placeholder="Поиск по логину или заметке"><select id="client-state" aria-label="Состояние клиента"><option value="all">Все состояния</option><option value="active">Включённые</option><option value="inactive">Отключённые</option></select><span id="client-count"></span></div><div class="table-wrap"><table><thead><tr><th>Доступ</th><th>Клиент / заметка</th><th>Состояние</th><th>Транспорт</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div><div class="pagination"><button id="page-prev" aria-label="Предыдущая страница">←</button><span id="page-label"></span><button id="page-next" aria-label="Следующая страница">→</button><select id="page-size" aria-label="Строк на странице"><option>10</option><option>25</option><option>50</option></select></div>{"".join(drawers)}<aside class="drawer" id="add-client" role="dialog" aria-modal="true" aria-label="Добавление клиентов"><div class="drawer-card"><div class="drawer-head"><h2>Добавление клиентов</h2><button data-drawer-close aria-label="Закрыть">×</button></div><section class="drawer-section"><h3>Один клиент</h3>{create}</section><section class="drawer-section"><h3>Группа клиентов</h3>{batch}</section></div></aside>'
+
+
+def overview_console():
+    stats = monitor_snapshot()
+    cards = ''.join(f'<div class="metric"><small>{label}</small><strong id="stat-{key}">{html.escape(stats[key])}</strong></div>' for key, label in [('cpu', 'Нагрузка CPU'), ('memory', 'Оперативная память'), ('disk', 'Диск'), ('uptime', 'Время работы')])
+    services = ''.join(f'<tr><td>{name}</td><td id="service-{name}"><span class="badge {status}">{status}</span></td></tr>' for name, status in stats['services'].items())
+    return f'<div class="page-head"><div><h2>Обзор</h2><p>{html.escape(domain())}:{endpoint_port()} · {html.escape(endpoint_version())}</p></div><span id="monitor-status" class="badge active">Подключено</span></div><div class="metrics overview-metrics">{cards}</div><div class="resource-bars"><label>RAM <meter id="ram-meter" min="0" max="100" value="{stats["memory_percent"]}"></meter></label><label>Диск <meter id="disk-meter" min="0" max="100" value="{stats["disk_percent"]}"></meter></label></div><section class="surface"><div class="page-head"><h3>Сетевой трафик VPS</h3><span id="network-rate">Ожидание второго измерения</span></div><canvas id="traffic-chart" height="150" aria-label="Скорость входящего и исходящего трафика"></canvas><div class="chart-legend"><span class="rx">● Приём</span><span class="tx">● Отправка</span><span>Последние 60 измерений · байт/с</span></div><div id="interface-totals"></div></section><div class="overview-columns"><section class="surface"><h3>Сервисы</h3><table><tbody>{services}</tbody></table></section><section class="surface"><h3>Подключение</h3><dl><dt>Исходящий маршрут</dt><dd id="stat-route">{html.escape(stats["route"])}</dd><dt>Транспорты</dt><dd>HTTP/2 {"· QUIC / HTTP3" if quic_enabled() else ""}</dd><dt>Сертификат</dt><dd>{cert_mode()}</dd></dl><a class="button" href="/?view=endpoint">Настройки подключения</a></section></div>'
+
+
+def logs_console():
+    controls = admin_form('logs', '<label>Сервис<select name="unit"><option>trusttunnel</option><option>warp-wireproxy</option><option>trusttunnel-panel</option><option>fail2ban</option></select></label><label>Строк<input name="lines" type="number" min="20" max="500" value="100"></label><button class="primary">Показать журнал</button>', view='logs')
+    audit = admin_form('audit', '<button>Журнал действий администратора</button>', view='logs')
+    return f'<div class="page-head"><h2>Журналы</h2></div><section class="surface">{controls}{audit}</section>'
+
+
+def security_console():
+    status = admin_form('security-status', '<button class="primary">Проверить безопасность</button>', view='security')
+    jail = admin_form('security-fail2ban', '<label>Попыток<input name="retry" type="number" min="1" max="100" value="5"></label><label>Окно, с<input name="findtime" type="number" min="60" max="86400" value="600"></label><label>Бан, с<input name="bantime" type="number" min="60" max="604800" value="3600"></label><button>Применить</button>', view='security', confirm='Изменить параметры защиты SSH?')
+    bans = ''.join(admin_form('security-' + action, '<label>IP-адрес<input name="ip" required></label><button>' + title + '</button>', view='security', confirm='Изменить блокировку IP в SSH jail?') for action, title in [('ban', 'Забанить'), ('unban', 'Разбанить')])
+    ports = ''.join(admin_form('security-' + action, '<label>Порт<input type="number" name="port" min="1" max="65535" required></label><label>Протокол<select name="proto"><option>tcp</option><option>udp</option></select></label><button>' + title + '</button>', view='security', confirm='Изменить правило UFW?') for action, title in [('open', 'Разрешить'), ('close', 'Удалить разрешение')])
+    return f'<div class="page-head"><h2>Безопасность сервера</h2>{status}</div><section class="surface"><h3>Защита SSH · fail2ban</h3>{jail}<div>{bans}</div></section><section class="surface"><h3>Сетевой экран · UFW</h3><p class="warning">Порты SSH, TrustTunnel и панели защищены от удаления разрешения. Удаление разрешения не блокирует порт, если его разрешает другое правило.</p>{ports}</section>'
+
+
+def routing_console():
+    switch = admin_form('routing-switch', '<label>Маршрут<select name="mode"><option value="direct">Direct · IP сервера</option><option value="warp">WARP · IP Cloudflare</option><option value="socks5">Каскад SOCKS5</option></select></label><label>SOCKS5 host:port<input name="address" placeholder="proxy.example:1080"></label><button class="primary">Применить маршрут</button>', view='routing', confirm='Переключить маршрут? TrustTunnel кратковременно перезапустится.')
+    add = admin_form('routing-rule-add', '<label>IP / подсеть CIDR<input name="cidr" placeholder="203.0.113.0/24" required></label><label>Действие<select name="decision"><option value="deny">Запретить</option><option value="allow">Разрешить</option></select></label><button>Добавить правило</button>', view='routing', confirm='Применить правило доступа и перезапустить TrustTunnel?')
+    rules = tomllib.loads(rules_text()).get('rule', [])
+    rows = []
+    import hashlib
+    for index, rule in enumerate(rules, 1):
+        fingerprint = hashlib.sha256(json.dumps(rule, sort_keys=True).encode()).hexdigest()
+        delete = admin_form('routing-rule-delete', f'<input type="hidden" name="index" value="{index}"><input type="hidden" name="fingerprint" value="{fingerprint}"><button class="danger">Удалить</button>', view='routing', confirm='Удалить это правило доступа?')
+        rows.append(f'<tr><td>{index}</td><td>{html.escape(rule.get("cidr", ""))}</td><td>{html.escape(rule.get("client_random_prefix", ""))}</td><td>{html.escape(rule.get("action", ""))}</td><td>{delete}</td></tr>')
+    return f'<div class="page-head"><h2>Маршрутизация</h2>{admin_form("routing-check", "<button>Диагностика</button>", view="routing")}</div><section class="surface"><h3>Выход в интернет: {html.escape(forwarder_label())}</h3>{switch}</section><section class="surface"><h3>Правила доступа к TrustTunnel</h3><p class="warning">Правила относятся к входящему IP клиента. Выполняется первое совпадение; без совпадения доступ разрешён. Это не фильтр посещаемых сайтов.</p>{add}<div class="table-wrap"><table><thead><tr><th>№</th><th>CIDR</th><th>Client random</th><th>Действие</th><th></th></tr></thead><tbody>{"".join(rows) or "<tr><td colspan=5>Правил нет</td></tr>"}</tbody></table></div></section>'
+
+
+def dns_console():
+    values = panel_settings()
+    saved = html.escape(values['DNS_UPSTREAMS'], quote=True)
+    save = admin_form('dns-save', f'<label>DNS: IP, DoH, DoT или DoQ<input name="dns" size="56" value="{saved}" required></label><button class="primary">Сохранить DNS</button>', view='dns')
+    check = admin_form('dns-check', '<button>Проверить DNS с VPS</button>', view='dns')
+    apply = admin_form('dns-apply', '<button>Пересобрать TOML</button>', view='dns', confirm='Пересобрать профили с сохранённым DNS? На устройствах потребуется импортировать новые TOML.')
+    advanced = dns_view()
+    advanced = re.sub(r'<div class="page-head">.*?</div></div>', '', advanced, count=1)
+    return f'<div class="page-head"><h2>DNS и настройки клиента</h2></div><section class="surface"><h3>DNS-серверы клиентов</h3>{save}<div>{check}{apply}</div><p class="muted">Сохранение не меняет текущие профили. IP DNS проверяется запросом с VPS; для DoH/DoT/DoQ проверяется разрешение имени сервера.</p></section><details class="surface"><summary>TLS и AntiDPI</summary>{advanced}</details>'
+
+
+PANEL_STYLE += r'''
+*{letter-spacing:0} :root{--nav:#fff;--nav-hover:#f1f5f9;--nav-active:#e8f3ff;--ink:#20252b;--accent:#1677ff;--canvas:#f5f5f5;--line:#e8e8e8}
+.sidebar{border-right:1px solid var(--line);color:var(--ink)}.brand{color:var(--ink);border-color:var(--line);display:block}.brand:before{display:none}.brand small{color:var(--muted)}.nav-item{color:#4b5563}.nav-item:hover{color:var(--accent)}.nav-item.active{color:var(--accent);box-shadow:none}.nav-label{color:#8b929c}.topbar{position:static}.endpoint-context:before{display:none}.content{max-width:1600px}.surface{border:0;border-radius:0;background:transparent;padding:20px 0;border-top:1px solid var(--line)}.surface .surface{border:0}.table-wrap{background:var(--surface);border:1px solid var(--line);border-radius:6px}th{font-size:12px;text-transform:none;background:#fafafa}table{min-width:0}td,th{padding:12px}th:first-child{width:74px}.table-toolbar,.pagination{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}.pagination{justify-content:flex-end}.table-actions{display:table-cell;text-align:right}.toggle{padding:2px;width:36px;min-height:20px;height:20px;border:0;border-radius:10px;background:#c7cbd1;display:flex;justify-content:flex-start}.toggle span{width:16px;height:16px;background:white;border-radius:50%}.toggle.active{background:var(--accent);justify-content:flex-end}.share-qr{display:block;width:180px;height:180px;margin:16px 0}.copy-row input{min-width:0;width:100%}.drawer-card input,.drawer-card textarea{max-width:100%;width:100%}.drawer-card form{display:flex;align-items:end}.drawer-card label{min-width:0;flex:1}.drawer-card{overscroll-behavior:contain}.drawer-section{display:flow-root}.drawer-head button{font-size:24px;line-height:1;width:36px;padding:0}.overview-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.overview-columns{display:grid;grid-template-columns:1fr 1fr;gap:28px}.metric{box-shadow:0 1px 2px #00000005}.metric strong{font-size:17px}.resource-bars{display:flex;gap:24px}.resource-bars label{flex:1}meter{width:100%;height:8px}.chart-legend{display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:var(--muted)}.rx{color:#1677ff}.tx{color:#21a366}#traffic-chart{width:100%;height:150px;display:block}dl{display:grid;grid-template-columns:1fr 1fr;gap:10px}dd{margin:0;overflow-wrap:anywhere}.notice{overflow-wrap:anywhere}.text-link{color:var(--accent)}input,select{max-width:100%;min-width:0}input[type=checkbox]{min-height:0}button:disabled{opacity:.55;cursor:wait}.endpoint-context{flex-wrap:wrap}h2{font-size:24px}.theme-toggle{width:36px;padding:0;font-size:20px}.header-actions{display:flex;gap:8px;align-items:center}
+html[data-theme=dark]{--ink:#e4e7ec;--muted:#a0a7b2;--canvas:#141414;--surface:#1f1f1f;--line:#343434;--nav:#1f1f1f;--nav-hover:#292929;--nav-active:#112c48}html[data-theme=dark] input,html[data-theme=dark] select,html[data-theme=dark] textarea,html[data-theme=dark] button,html[data-theme=dark] .button,html[data-theme=dark] .metric{background:var(--surface);color:var(--ink);border-color:#414141}html[data-theme=dark] .drawer-card,html[data-theme=dark] .command-box{background:var(--surface)}html[data-theme=dark] th{background:#252525}html[data-theme=dark] .nav-item{color:#b6bdc7}html[data-theme=dark] .primary{background:#1668dc}html[data-theme=dark] .nav-item.active{color:#69b1ff}html[data-theme=dark] tr:hover td{background:#242424}html[data-theme=dark] .toggle.active{background:#1668dc}html[data-theme=dark] .command-item:hover{background:#292929}
+@media(max-width:900px){.overview-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.sidebar{border-bottom:1px solid var(--line)}.overview-columns{grid-template-columns:1fr}.endpoint-context span{display:none}}@media(max-width:560px){.content{padding:16px 12px}.overview-metrics{grid-template-columns:1fr 1fr}.metric strong{font-size:14px}.metric{padding:10px}.table-wrap{overflow-x:auto}.table-wrap table{min-width:600px}.page-head h2{font-size:22px}.topbar{padding:0 12px}.page-head>button{margin-top:12px}.resource-bars{gap:12px}}
+'''
+
+CONSOLE_SCRIPT = r'''
+(() => {
+  let theme = 'light'; try { theme = localStorage.getItem('tt-theme') || theme; } catch (_) {}
+  document.documentElement.dataset.theme = theme;
+  document.getElementById('theme-toggle').onclick = () => { const value = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = value; try { localStorage.setItem('tt-theme', value); } catch (_) {} };
+  document.querySelectorAll('[data-reveal]').forEach(b => b.onclick = () => { const input = document.getElementById(b.dataset.reveal); input.type = input.type === 'password' ? 'text' : 'password'; });
+  document.querySelectorAll('[data-drawer]').forEach(b => b.addEventListener('click', () => { document.getElementById(b.dataset.drawer).querySelector('button,input')?.focus(); }));
+  document.addEventListener('keydown', e => { if(e.key !== 'Tab') return; const d = document.querySelector('.drawer.open'); if(!d) return; const items = [...d.querySelectorAll('button,input:not([type=hidden]),textarea,a[href],select')]; const first = items[0], last = items.at(-1); if(e.shiftKey && document.activeElement === first) {e.preventDefault();last.focus();} else if(!e.shiftKey && document.activeElement === last) {e.preventDefault();first.focus();} });
+  document.querySelectorAll('form').forEach(f => f.addEventListener('submit', e => {if(e.defaultPrevented) return; setTimeout(() => f.querySelectorAll('button').forEach(b => b.disabled = true), 0);}));
+  const rows = [...document.querySelectorAll('[data-client-row]')]; let page = 0;
+  const search = document.getElementById('client-search'), state = document.getElementById('client-state'), size = document.getElementById('page-size');
+  function filter() { if(!state) return; const matches = rows.filter(r => r.dataset.client.includes(search.value.toLowerCase()) && (state.value === 'all' || r.dataset.state === state.value)); const pages = Math.max(1, Math.ceil(matches.length / +size.value)); page = Math.min(page,pages-1); rows.forEach(r => r.hidden = true); matches.slice(page*+size.value,(page+1)*+size.value).forEach(r => r.hidden=false); document.getElementById('page-label').textContent = `${page+1} / ${pages}`; document.getElementById('client-count').textContent = `Найдено: ${matches.length}`; document.getElementById('page-prev').disabled = page===0; document.getElementById('page-next').disabled = page===pages-1; }
+  if(state) { [search,state,size].forEach(x => x.addEventListener('input', () => {page=0;filter();})); document.getElementById('page-prev').onclick=()=>{page--;filter();};document.getElementById('page-next').onclick=()=>{page++;filter();}; filter(); }
+  const canvas = document.getElementById('traffic-chart'); if(!canvas) return;
+  let previous=null, history=[];
+  const bytes = value => {const units=['B','KiB','MiB','GiB','TiB'];let n=0;while(value>=1024 && n<4){value/=1024;n++;}return value.toFixed(1)+' '+units[n];};
+  function draw() { const w=canvas.clientWidth, h=150, ratio=devicePixelRatio||1;canvas.width=w*ratio;canvas.height=h*ratio;const c=canvas.getContext('2d');c.scale(ratio,ratio);c.clearRect(0,0,w,h);c.strokeStyle='#88888830';for(let y=0;y<h;y+=30){c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();}const max=Math.max(1024,...history.flat()); ['#1677ff','#21a366'].forEach((color,k)=>{c.strokeStyle=color;c.lineWidth=2;c.beginPath();history.forEach((v,i)=>{let x=i/59*w,y=h-8-v[k]/max*(h-16);i?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();}); }
+  async function poll() { try { const response=await fetch('/api/monitor',{cache:'no-store'}); if(!response.ok) throw Error(response.status); const data=await response.json(); for(const key of ['cpu','memory','disk','uptime','route']) document.getElementById('stat-'+key).textContent=data[key];document.getElementById('ram-meter').value=data.memory_percent;document.getElementById('disk-meter').value=data.disk_percent;for(const [name,value] of Object.entries(data.services)){const cell=document.getElementById('service-'+name);cell.textContent=value;}const status=document.getElementById('monitor-status');status.textContent='Обновлено '+new Date().toLocaleTimeString();status.className='badge active';document.getElementById('interface-totals').textContent=Object.entries(data.interfaces).map(([name,v])=>`${name}: принято ${bytes(v.rx)}, отправлено ${bytes(v.tx)}`).join(' · ');if(previous){const dt=data.time-previous.time;if(dt>0){let rx=0,tx=0;for(const [name,v] of Object.entries(data.interfaces)){const old=previous.interfaces[name];if(old){rx+=Math.max(0,v.rx-old.rx)/dt;tx+=Math.max(0,v.tx-old.tx)/dt;}}history.push([rx,tx]);history=history.slice(-60);document.getElementById('network-rate').textContent=`↓ ${bytes(rx)}/с   ↑ ${bytes(tx)}/с`;draw();}}previous=data;} catch(e) {const s=document.getElementById('monitor-status');s.textContent='Нет связи с панелью';s.className='badge failed';} finally {setTimeout(poll,5000);} }
+  window.addEventListener('resize',draw);poll();
+})();
+'''
+
+
+def page_shell(message='', log='', view='dashboard'):
+    views = {'dashboard': overview_console, 'endpoint': endpoint_view, 'clients': clients_console, 'warp': warp_view, 'routing': routing_console, 'dns': dns_console, 'certificates': certificates_view, 'security': security_console, 'system': system_view, 'panel': panel_view, 'logs': logs_console}
     view = view if view in views else 'dashboard'
     content = views[view]()
     notice = f'<div class="notice">{html.escape(message)}</div>' if message else ''
@@ -792,13 +1274,32 @@ def html_page(message='', log='', view='dashboard'):
     commands = ''.join(f'<a class="command-item" href="/?view={key}">{label}<small>Открыть раздел</small></a>' for key, label in NAV_ITEMS)
     return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TrustTunnel Panel</title><style>{PANEL_STYLE}</style></head><body data-view="{view}"><div class="layout"><aside class="sidebar"><div class="brand">TrustTunnel<small>Панель управления сервером</small></div>{nav_html(view)}</aside><div class="workspace"><header class="topbar"><div class="endpoint-context"><strong>{html.escape(domain())}:{endpoint_port()}</strong><span>{html.escape(labels[view])}</span></div><button type="button" class="command-trigger" data-command-open>Команды <kbd>Ctrl K</kbd></button></header><main class="content">{notice}{content}{output}</main></div></div><div class="command-layer" id="command-layer"><div class="command-box"><input id="command-search" placeholder="Перейти к разделу" autocomplete="off"><div class="command-list">{commands}</div></div></div><script>{PANEL_SCRIPT}</script></body></html>'''
 
+def html_page(message='', log='', view='dashboard'):
+    page = page_shell(message, log, view)
+    page = re.sub(r'(<form\b[^>]*>)', lambda m: m[1] + f'<input type="hidden" name="_csrf" value="{CSRF_TOKEN}">', page)
+    page = page.replace('</header>', '<button id="theme-toggle" class="theme-toggle" title="Светлая / тёмная тема" aria-label="Сменить тему">◐</button></header>')
+    page = page.replace("if(document.body.dataset.view==='dashboard')setTimeout(()=>location.reload(),30000)", '')
+    page = page.replace('</body>', '<script>' + CONSOLE_SCRIPT + '</script></body>')
+    # Restore the selected TLS option instead of silently resetting it to Chrome.
+    selected = html.escape(client_tls_profile(), quote=True)
+    page = page.replace(f'<option value="{selected}">{selected}</option>', f'<option value="{selected}" selected>{selected}</option>')
+    return page
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        super().end_headers()
+
     def authenticated(self):
         if not PANEL_PASSWORD:
-            return True
+            self.send_error(503, 'Panel password is not configured')
+            return False
         auth = self.headers.get('Authorization', '')
         expected = 'Basic ' + base64.b64encode(f'{PANEL_USER}:{PANEL_PASSWORD}'.encode()).decode()
-        if auth == expected:
+        if secrets.compare_digest(auth, expected):
             return True
         self.send_response(401)
         self.send_header('WWW-Authenticate', 'Basic realm="TrustTunnel Panel"')
@@ -810,11 +1311,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header('Content-Type', 'text/html; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store')
         self.end_headers()
         self.wfile.write(body)
 
     def form(self):
         length = int(self.headers.get('Content-Length', '0'))
+        if not 0 <= length <= 65536:
+            raise ValueError('Request body too large')
         return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode()).items()}
 
     def redirect(self, message):
@@ -832,23 +1336,41 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authenticated():
             return
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == '/api/monitor':
+            body = json.dumps(monitor_snapshot()).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Cache-Control', 'no-store')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if parsed.path == '/':
             query = urllib.parse.parse_qs(parsed.query)
             self.send_html(query.get('msg', [''])[0], view=query.get('view', ['dashboard'])[0]); return
         m = re.fullmatch(r'/client/([^/]+)/(http2|http3)\.toml', parsed.path)
         if m:
-            path = CLIENT_DIR / f'{urllib.parse.unquote(m.group(1))}-{m.group(2)}.toml'
+            username = urllib.parse.unquote(m.group(1))
+            if not client_name_valid(username) or username not in {c['username'] for c in load_clients()}:
+                self.send_error(404); return
+            path = CLIENT_DIR / f'{username}-{m.group(2)}.toml'
             if path.exists():
                 body = path.read_bytes(); self.send_response(200); self.send_header('Content-Type', 'application/toml; charset=utf-8'); self.send_header('Content-Disposition', f'attachment; filename="{path.name}"'); self.send_header('Content-Length', str(len(body))); self.end_headers(); self.wfile.write(body); return
         m = re.fullmatch(r'/qr/([^/]+)/(http2|http3)\.png', parsed.path)
         if m:
-            path = CLIENT_DIR / f'{urllib.parse.unquote(m.group(1))}-{m.group(2)}.toml'
+            username = urllib.parse.unquote(m.group(1))
+            if not client_name_valid(username) or username not in {c['username'] for c in load_clients()}:
+                self.send_error(404); return
+            path = CLIENT_DIR / f'{username}-{m.group(2)}.toml'
             if path.exists() and shutil.which('qrencode'):
                 p = subprocess.run(['qrencode', '-t', 'PNG', '-o', '-'], input=path.read_bytes(), stdout=subprocess.PIPE)
                 self.send_response(200); self.send_header('Content-Type', 'image/png'); self.end_headers(); self.wfile.write(p.stdout); return
         m = re.fullmatch(r'/qr-link/([^/]+)\.png', parsed.path)
         if m and shutil.which('qrencode'):
-            link = deeplink(urllib.parse.unquote(m.group(1)))
+            username = urllib.parse.unquote(m.group(1))
+            if not client_name_valid(username) or username not in {c['username'] for c in load_clients()}:
+                self.send_error(404); return
+            link = deeplink(username)
             if link:
                 p = subprocess.run(['qrencode', '-t', 'PNG', '-o', '-'], input=link.encode('utf-8'), stdout=subprocess.PIPE)
                 self.send_response(200); self.send_header('Content-Type', 'image/png'); self.end_headers(); self.wfile.write(p.stdout); return
@@ -867,15 +1389,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.authenticated():
             return
-        f = self.form()
+        try:
+            f = self.form()
+        except (ValueError, UnicodeError):
+            self.send_error(400, 'Invalid form'); return
+        if not secrets.compare_digest(f.get('_csrf', ''), CSRF_TOKEN):
+            self.send_error(403, 'Reload page and try again'); return
+        if self.path == '/manage':
+            try:
+                f['_peer'] = self.client_address[0]
+                result = admin_operation(f.get('action', ''), f)
+                self.send_html('Операция выполнена.', result, f.get('view', 'clients'))
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_html('Операция не выполнена.', str(exc), f.get('view', 'clients'))
+            return
         if self.path == '/action':
             action = f.get('action', '')
             if action == 'restart':
                 rc, out = run(['systemctl', 'restart', 'trusttunnel'], timeout=20); self.send_html('TrustTunnel restarted.', out); return
             if action == 'warp':
-                run(['systemctl', 'enable', '--now', 'warp-wireproxy'], timeout=20); switch_forwarder('socks5', SOCKS_ADDR); self.redirect('TrustTunnel switched to WARP.'); return
+                try: self.redirect(admin_operation('routing-switch', {'mode': 'warp'}))
+                except (ValueError, RuntimeError, OSError) as exc: self.send_html('Маршрут не изменён.', str(exc), 'warp')
+                return
             if action == 'direct':
-                switch_forwarder('direct'); self.redirect('TrustTunnel switched to direct.'); return
+                try: self.redirect(admin_operation('routing-switch', {'mode': 'direct'}))
+                except (ValueError, RuntimeError, OSError) as exc: self.send_html('Не удалось применить маршрут.', str(exc), 'routing')
+                return
             if action == 'speedtest':
                 self.send_html('Speedtest finished.', speedtest_output()); return
             if action == 'backup':
@@ -914,23 +1453,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_html('Настройки клиентов обновлены.', save_client_network_settings(f.get('dns', ''), f.get('anti_dpi') == '1', f.get('tls_profile', 'chrome'), f.get('post_quantum') == '1'))
             return
         if self.path == '/cascade':
-            address = f.get('address', '').strip()
-            if not re.fullmatch(r'[A-Za-z0-9_.:-]{3,255}', address):
-                self.redirect('Invalid SOCKS5 address.'); return
-            switch_forwarder('socks5', address); self.redirect('Cascade SOCKS5 enabled.'); return
+            try: self.redirect(admin_operation('routing-switch', {'mode': 'socks5', 'address': f.get('address', '')}))
+            except (ValueError, RuntimeError, OSError) as exc: self.send_html('Маршрут не изменён.', str(exc), 'routing')
+            return
         if self.path == '/client/add':
-            username = f.get('username', '').strip(); password = f.get('password', '').strip() or random_password()
-            if not client_name_valid(username): self.redirect('Invalid username.'); return
-            clients = load_clients()
-            if any(c['username'] == username for c in clients): self.redirect('Client already exists.'); return
-            clients.append({'username': username, 'password': password}); save_clients(clients); self.redirect(f'Client {username} added.'); return
-        if self.path == '/client/delete':
-            username = f.get('username', ''); save_clients([c for c in load_clients() if c['username'] != username]); self.redirect(f'Client {username} deleted.'); return
-        if self.path == '/client/password':
-            username = f.get('username', ''); clients = load_clients()
-            for c in clients:
-                if c['username'] == username: c['password'] = random_password()
-            save_clients(clients); self.redirect(f'Password changed for {username}.'); return
+            action = 'add'
+        elif self.path in ('/client/delete', '/client/password'):
+            action = self.path.rsplit('/', 1)[1]
+        else:
+            action = None
+        if action:
+            try:
+                self.redirect(client_operation(action, f))
+            except (ValueError, RuntimeError, OSError) as exc:
+                self.send_html('Операция не выполнена.', str(exc), 'clients')
+            return
         if self.path == '/ports/endpoint':
             self.redirect(change_endpoint_port(f.get('port', '').strip()))
             return
@@ -968,4 +1505,17 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == '--admin':
+        try:
+            action = sys.argv[2]
+            values = dict(arg.split('=', 1) for arg in sys.argv[3:])
+            if not sys.stdin.isatty():
+                payload = sys.stdin.read().strip()
+                if payload:
+                    values.update(json.loads(payload))
+            print(admin_operation(action, values))
+        except (ValueError, RuntimeError, OSError, IndexError) as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
+    else:
+        main()

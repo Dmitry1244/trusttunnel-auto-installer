@@ -209,6 +209,7 @@ choose_action() {
     echo "25) Управление клиентами и tt:// ссылками"
     echo "26) DNS, TLS profile, AntiDPI и post-quantum для TOML"
     echo "27) Система, диагностика и журнал"
+    echo "28) Расширенное управление: безопасность, маршруты, DNS, мониторинг"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -240,8 +241,9 @@ choose_action() {
       25) ACTION="manage-clients"; return ;;
       26) ACTION="manage-client-network"; return ;;
       27) ACTION="manage-system-tools"; return ;;
+      28) ACTION="manage-admin"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0-27 из меню." ;;
+      *) echo "Нужно выбрать 0-28 из меню." ;;
     esac
   done
 }
@@ -1475,6 +1477,12 @@ backup_identity() {
   cp "$TT_DIR/certs/cert.pem" "$IDENTITY_BACKUP_DIR/certs/cert.pem"
   cp "$TT_DIR/certs/key.pem" "$IDENTITY_BACKUP_DIR/certs/key.pem"
   cp "$TT_DIR/credentials.toml" "$IDENTITY_BACKUP_DIR/credentials.toml"
+  if [ -f "$TT_DIR/clients-state.json" ]; then
+    cp "$TT_DIR/clients-state.json" "$IDENTITY_BACKUP_DIR/clients-state.json"
+    chmod 0600 "$IDENTITY_BACKUP_DIR/clients-state.json"
+  else
+    rm -f "$IDENTITY_BACKUP_DIR/clients-state.json"
+  fi
   cp "$TT_DIR/hosts.toml" "$IDENTITY_BACKUP_DIR/hosts.toml"
   if [ -f "$CLIENT_DIR/clients-credentials.txt" ]; then
     cp "$CLIENT_DIR/clients-credentials.txt" "$IDENTITY_BACKUP_DIR/client-files/clients-credentials.txt"
@@ -1509,6 +1517,12 @@ restore_identity() {
   cp "$IDENTITY_BACKUP_DIR/certs/cert.pem" "$TT_DIR/certs/cert.pem"
   cp "$IDENTITY_BACKUP_DIR/certs/key.pem" "$TT_DIR/certs/key.pem"
   cp "$IDENTITY_BACKUP_DIR/credentials.toml" "$TT_DIR/credentials.toml"
+  if [ -f "$IDENTITY_BACKUP_DIR/clients-state.json" ]; then
+    cp "$IDENTITY_BACKUP_DIR/clients-state.json" "$TT_DIR/clients-state.json"
+    chmod 0600 "$TT_DIR/clients-state.json"
+  else
+    rm -f "$TT_DIR/clients-state.json"
+  fi
   if [ -f "$IDENTITY_BACKUP_DIR/hosts.toml" ]; then
     cp "$IDENTITY_BACKUP_DIR/hosts.toml" "$TT_DIR/hosts.toml"
   fi
@@ -1846,7 +1860,7 @@ install_panel() {
     panel_mode="$default_mode"
   fi
   apt_update_retry || true
-  apt_install_retry -y --no-install-recommends --no-upgrade python3 curl qrencode || true
+  apt_install_retry -y --no-install-recommends --no-upgrade python3 python3-tomli dnsutils curl qrencode
   if [ -f /tmp/trusttunnel-panel.py ]; then
     cp /tmp/trusttunnel-panel.py "$panel_path"
   elif [ -f ./trusttunnel-panel.py ]; then
@@ -2107,7 +2121,7 @@ rebuild_current_client_exports() {
   echo "Клиентские TOML и ZIP пересобраны: /root/trusttunnel-clients-$(current_domain).zip"
 }
 
-manage_clients() {
+manage_clients_legacy() {
   local choice user pass pairs updated link
   if [ ! -f "$TT_DIR/credentials.toml" ]; then
     echo "TrustTunnel ещё не установлен."
@@ -2170,6 +2184,128 @@ manage_clients() {
         ;;
       0) return ;;
       *) echo "Нужно выбрать 0-6." ;;
+    esac
+  done
+}
+
+ensure_admin_helper() {
+  if ! python3 -c 'import tomllib' 2>/dev/null && ! python3 -c 'import tomli' 2>/dev/null; then
+    apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
+  fi
+  ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q '^def admin_operation(' "$ADMIN_HELPER_PATH"; then return; fi
+  local candidate
+  candidate="$(mktemp)"
+  if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
+  if ! python3 -m py_compile "$candidate"; then rm -f "$candidate"; return 1; fi
+  mkdir -p /usr/local/lib/trusttunnel
+  ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
+  install -m 0700 "$candidate" "$ADMIN_HELPER_PATH"
+  rm -f "$candidate"
+}
+
+admin_call() {
+  python3 "$ADMIN_HELPER_PATH" --admin "$@" </dev/null || echo "Операция не выполнена. Причина указана выше."
+}
+
+manage_clients() {
+  ensure_admin_helper || return
+  local choice user prefix count note
+  while true; do
+    echo "=== Клиенты (общие операции с панелью) ==="
+    echo "1) Список и состояние"
+    echo "2) Добавить клиента со случайным паролем"
+    echo "3) Сменить пароль (случайный)"
+    echo "4) Удалить клиента"
+    echo "5) Пересобрать TOML и ZIP"
+    echo "6) Показать tt:// ссылку"
+    echo "7) Отключить клиента с сохранением пароля"
+    echo "8) Включить клиента с прежним паролем"
+    echo "9) Изменить заметку"
+    echo "10) Создать группу клиентов"
+    echo "0) Назад"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
+    case "$choice" in
+      0) return ;;
+      1) admin_call client-list ;;
+      5) confirm_action "Будут пересобраны клиентские профили."; admin_call client-rebuild ;;
+      10)
+        prompt_value "Префикс [client]: "; prefix="${REPLY_VALUE:-client}"
+        prompt_value "Количество [5]: "; count="${REPLY_VALUE:-5}"
+        admin_call client-batch "prefix=$prefix" "count=$count" ;;
+      2|3|4|6|7|8|9)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        case "$choice" in
+          2) admin_call client-add "username=$user" ;;
+          3) confirm_action "Будет изменён пароль клиента."; admin_call client-password "username=$user" ;;
+          4) confirm_action "Клиент будет удалён."; admin_call client-delete "username=$user" ;;
+          6) admin_call client-link "username=$user" ;;
+          7) confirm_action "Доступ клиента будет отключён. TrustTunnel переподключит клиентов."; admin_call client-disable "username=$user" ;;
+          8) admin_call client-enable "username=$user" ;;
+          9) prompt_value "Заметка: "; note="$REPLY_VALUE"; admin_call client-note "username=$user" "note=$note" ;;
+        esac ;;
+      *) echo "Выберите 0–10." ;;
+    esac
+  done
+}
+
+manage_admin() {
+  ensure_admin_helper || return
+  local choice value second third
+  while true; do
+    echo "=== Расширенное управление (как в веб-панели) ==="
+    echo "1) Мониторинг ресурсов и трафика"
+    echo "2) Журнал сервиса"
+    echo "3) Аудит действий"
+    echo "4) UFW, fail2ban и конфигурация SSH"
+    echo "5) Забанить IP в SSH jail"
+    echo "6) Разбанить IP"
+    echo "7) Настроить fail2ban: попытки, окно, время бана"
+    echo "8) Открыть порт UFW"
+    echo "9) Удалить разрешение порта UFW"
+    echo "10) Исходящий маршрут Direct / WARP / SOCKS5"
+    echo "11) Диагностика маршрута"
+    echo "12) Добавить правило доступа allow / deny по CIDR"
+    echo "13) Посмотреть и удалить правило доступа"
+    echo "14) Сохранить DNS для будущих профилей"
+    echo "15) Проверить DNS с сервера"
+    echo "16) Применить DNS к TOML"
+    echo "0) Назад"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
+    case "$choice" in
+      0) return ;;
+      1) admin_call monitor ;;
+      2) prompt_value "Сервис [trusttunnel]: "; admin_call logs "unit=${REPLY_VALUE:-trusttunnel}" ;;
+      3) admin_call audit ;;
+      4) admin_call security-status ;;
+      5|6) prompt_value "IP: "; value="$REPLY_VALUE"; if [ "$choice" = 5 ]; then admin_call security-ban "ip=$value"; else admin_call security-unban "ip=$value"; fi ;;
+      7)
+        prompt_value "Попытки [5]: "; value="${REPLY_VALUE:-5}"
+        prompt_value "Окно, секунд [600]: "; second="${REPLY_VALUE:-600}"
+        prompt_value "Бан, секунд [3600]: "; third="${REPLY_VALUE:-3600}"
+        admin_call security-fail2ban "retry=$value" "findtime=$second" "bantime=$third" ;;
+      8|9)
+        prompt_value "Порт: "; value="$REPLY_VALUE"
+        prompt_value "Протокол [tcp]: "; second="${REPLY_VALUE:-tcp}"
+        if [ "$choice" = 8 ]; then admin_call security-open "port=$value" "proto=$second"; else admin_call security-close "port=$value" "proto=$second"; fi ;;
+      10)
+        prompt_value "Режим (direct / warp / socks5): "; value="$REPLY_VALUE"; second=""
+        if [ "$value" = socks5 ]; then prompt_value "SOCKS5 host:port: "; second="$REPLY_VALUE"; fi
+        confirm_action "Будет изменён исходящий маршрут и перезапущен TrustTunnel."
+        admin_call routing-switch "mode=$value" "address=$second" ;;
+      11) admin_call routing-check ;;
+      12)
+        prompt_value "CIDR: "; value="$REPLY_VALUE"
+        prompt_value "Действие (allow / deny): "; second="$REPLY_VALUE"
+        admin_call routing-rule-add "cidr=$value" "decision=$second" ;;
+      13)
+        cat "$TT_DIR/rules.toml"
+        prompt_value "Номер правила для удаления (пусто = назад): "; value="$REPLY_VALUE"
+        if [ -n "$value" ]; then confirm_action "Правило будет удалено."; admin_call routing-rule-delete "index=$value"; fi ;;
+      14) prompt_value "DNS через запятую: "; admin_call dns-save "dns=$REPLY_VALUE" ;;
+      15) admin_call dns-check ;;
+      16) confirm_action "Клиентские TOML будут пересобраны."; admin_call dns-apply ;;
+      *) echo "Выберите 0–16." ;;
     esac
   done
 }
@@ -2566,6 +2702,10 @@ main() {
       ;;
     manage-system-tools)
       manage_system_tools
+      exit 0
+      ;;
+    manage-admin)
+      manage_admin
       exit 0
       ;;
     configure-routing)
