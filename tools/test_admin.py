@@ -103,5 +103,58 @@ class AdminTests(unittest.TestCase):
         with self.assertRaises(ValueError): panel.network_operation('routing-rule-delete', {'index': '1', 'fingerprint': 'stale'})
         self.assertIn('192.0.2.0', path.read_text())
 
+    def test_clients_page_does_not_generate_links(self):
+        with patch.object(panel, 'deeplink') as exporter:
+            result = panel.clients_console()
+            self.assertIn('data-load-link=', result)
+            exporter.assert_not_called()
+
+    def test_scoped_firewall_rule_validation(self):
+        with patch.object(panel, 'current_ssh_port', return_value='49222'), patch.object(panel, 'current_panel_env', return_value={'PANEL_PORT': '8088'}):
+            panel.network_operation('security-open', {'port': '59177', 'proto': 'tcp', 'source': '192.0.2.7/24'})
+            self.assertEqual(panel.run.call_args.args[0], ['ufw', 'allow', 'proto', 'tcp', 'from', '192.0.2.0/24', 'to', 'any', 'port', '59177'])
+            with self.assertRaises(ValueError):
+                panel.network_operation('security-open', {'port': '59177', 'source': 'any; reboot'})
+
+    def test_fail2ban_exclusion_preserves_existing_and_rolls_back(self):
+        target = self.root / 'ignore.local'
+        target.write_text('[sshd]\nignoreip=127.0.0.1/8\n')
+        old = target.read_text()
+        with patch.object(panel, 'IGNORE_FILE', target):
+            panel.run.side_effect = [(0, 'These IP addresses/networks are ignored:\n|- 127.0.0.1/8\n|- ::1\n`- 198.51.100.1'), (0, 'OK'), (0, 'OK')]
+            panel.update_ignore_list('security-ignore-add', {'ip': '192.0.2.17'})
+            self.assertIn('198.51.100.1/32', target.read_text())
+            self.assertIn('192.0.2.17/32', target.read_text())
+            saved = target.read_text()
+            panel.run.side_effect = [(0, '127.0.0.1/8'), (1, 'invalid config'), (0, 'restored')]
+            with self.assertRaises(RuntimeError): panel.update_ignore_list('security-ignore-add', {'ip': '192.0.2.18'})
+            self.assertEqual(saved, target.read_text())
+            with self.assertRaises(ValueError): panel.update_ignore_list('security-ignore-add', {'ip': '0.0.0.0/0'})
+
+    def test_reboot_requires_confirmation(self):
+        for value in ('', 'yes', 'reboot'):
+            with self.assertRaises(ValueError): panel.power_operation('system-reboot', {'confirm': value})
+        panel.run.assert_not_called()
+        panel.power_operation('system-reboot', {'confirm': 'REBOOT'})
+        self.assertIn('--on-active=60s', panel.run.call_args.args[0])
+        panel.power_operation('system-reboot-cancel', {})
+        self.assertEqual(panel.run.call_args.args[0], ['systemctl', 'stop', 'trusttunnel-panel-reboot.timer'])
+
+    def test_login_throttle_expires_and_is_per_peer(self):
+        panel.LOGIN_FAILURES.clear()
+        with patch.object(panel.time, 'monotonic', return_value=100):
+            for _ in range(4): self.assertEqual(panel.login_delay('a', failed=True), 0)
+            self.assertGreater(panel.login_delay('a', failed=True), 0)
+            self.assertEqual(panel.login_delay('b'), 0)
+        with patch.object(panel.time, 'monotonic', return_value=161):
+            self.assertEqual(panel.login_delay('a'), 0)
+
+    def test_monitor_cache_coalesces_multiple_visitors(self):
+        panel.SNAPSHOT_CACHE.clear()
+        with patch.object(panel, 'system_metrics', return_value={}) as metrics, patch.object(panel, 'service_snapshot', return_value={}):
+            panel.monitor_snapshot()
+            panel.monitor_snapshot()
+            metrics.assert_called_once()
+
 
 if __name__ == '__main__': unittest.main()

@@ -15,6 +15,8 @@ import json
 import sys
 import threading
 import tempfile
+import functools
+import hashlib
 try:
     import tomllib
 except ImportError:
@@ -34,9 +36,48 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 DEEPLINK_CACHE = {}
 DEEPLINK_CACHE_TTL = 300
-ADMIN_VERSION = '2026.09.26'
+ADMIN_VERSION = '2026.09.30'
 ADMIN_LOCK = threading.RLock()
 CSRF_TOKEN = secrets.token_urlsafe(32)
+CACHE_LOCK = threading.RLock()
+SNAPSHOT_CACHE = {}
+LOGIN_LOCK = threading.Lock()
+LOGIN_FAILURES = {}
+CPU_SAMPLE = None
+IGNORE_FILE = Path('/etc/fail2ban/jail.d/zz-trusttunnel-ignore.local')
+
+
+def cached_snapshot(seconds):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapped():
+            with CACHE_LOCK:
+                cached = SNAPSHOT_CACHE.get(fn.__name__)
+                if cached and time.monotonic() - cached[0] < seconds:
+                    return cached[1]
+                value = fn()
+                SNAPSHOT_CACHE[fn.__name__] = (time.monotonic(), value)
+                return value
+        return wrapped
+    return decorate
+
+
+def login_delay(peer, failed=False, success=False):
+    now = time.monotonic()
+    with LOGIN_LOCK:
+        for address, (_, until) in list(LOGIN_FAILURES.items()):
+            if until <= now:
+                LOGIN_FAILURES.pop(address, None)
+        if success:
+            LOGIN_FAILURES.pop(peer, None)
+            return 0
+        count, until = LOGIN_FAILURES.get(peer, (0, now + 60))
+        if failed:
+            if len(LOGIN_FAILURES) >= 2048 and peer not in LOGIN_FAILURES:
+                LOGIN_FAILURES.pop(next(iter(LOGIN_FAILURES)))
+            count += 1
+            LOGIN_FAILURES[peer] = (count, until)
+        return max(1, int(until - now)) if count >= 5 else 0
 
 
 def run(cmd, timeout=40, input_text=None, env=None, cwd=None):
@@ -91,6 +132,7 @@ def forwarder_label():
     return 'direct'
 
 
+@cached_snapshot(60)
 def cert_mode():
     cert = TT_DIR / 'certs' / 'cert.pem'
     if not cert.exists():
@@ -288,6 +330,9 @@ def admin_operation(action, values):
         return recent_logs(unit, min(500, max(20, int(values.get('lines', '100')))))
     if action == 'audit':
         return audit_output()
+    if action.startswith('system-'):
+        with admin_lock():
+            return power_operation(action, values)
     if action.startswith(('security-', 'routing-', 'dns-')):
         with admin_lock():
             return network_operation(action, values)
@@ -337,8 +382,20 @@ def validated_dns(value):
 
 
 def network_operation(action, values):
+    if action == 'security-audit':
+        data = security_snapshot()
+        return '\n\n'.join(item['title'] + ': ' + item['detail'] for item in data['checks'])
+    if action == 'security-listeners':
+        return checked_run(['ss', '-lntup'])
+    if action == 'security-logins':
+        return recent_logs('ssh', 100) + '\n' + recent_logs('sshd', 100)
+    if action == 'security-ignore-list':
+        return checked_run(['fail2ban-client', 'get', 'sshd', 'ignoreip'])
+    if action in ('security-ignore-add', 'security-ignore-remove'):
+        return update_ignore_list(action, values)
     if action == 'security-status':
-        return '\n'.join(run(cmd)[1] for cmd in (['ufw', 'status', 'numbered'], ['fail2ban-client', 'status', 'sshd'], ['sshd', '-T']))
+        report = '\n'.join(run(cmd)[1] for cmd in (['ufw', 'status', 'numbered'], ['fail2ban-client', 'status', 'sshd'], ['sshd', '-T']))
+        return report + '\n\nSSH jail: ' + json.dumps(jail_settings(), ensure_ascii=False)
     if action in ('security-ban', 'security-unban'):
         address = str(ipaddress.ip_address(values.get('ip', '')))
         if action == 'security-ban':
@@ -377,8 +434,15 @@ def network_operation(action, values):
         protected = {int(current_ssh_port()), int(endpoint_port()), int(current_panel_env().get('PANEL_PORT', '8088'))}
         if action == 'security-close' and int(port) in protected:
             raise ValueError('Этот порт используется SSH, TrustTunnel или панелью. Сначала смените порт сервиса.')
-        command = ['ufw', 'allow', f'{int(port)}/{proto}'] if action == 'security-open' else ['ufw', '--force', 'delete', 'allow', f'{int(port)}/{proto}']
-        return checked_run(command)
+        source = values.get('source', '').strip()
+        rule = ['allow', f'{int(port)}/{proto}']
+        if source:
+            source = str(ipaddress.ip_network(source, strict=False))
+            rule = ['allow', 'proto', proto, 'from', source, 'to', 'any', 'port', str(int(port))]
+        command = ['ufw'] + ([] if action == 'security-open' else ['--force', 'delete']) + rule
+        result = checked_run(command)
+        audit_log(action, f'{port}/{proto} from {source or "any"}')
+        return result
     if action == 'routing-check':
         return diagnostics_output()
     if action == 'routing-switch':
@@ -459,9 +523,10 @@ def network_operation(action, values):
     raise ValueError('Неизвестная операция сети.')
 
 
+@cached_snapshot(5)
 def monitor_snapshot():
     result = system_metrics()
-    result['services'] = {name: service_status(name) for name in ('trusttunnel', 'warp-wireproxy', 'fail2ban')}
+    result['services'] = service_snapshot()
     result['route'] = forwarder_label()
     result['interfaces'] = {}
     for line in read_text('/proc/net/dev').splitlines()[2:]:
@@ -475,7 +540,117 @@ def monitor_snapshot():
     disk = shutil.disk_usage('/')
     result['disk_percent'] = round(100 * disk.used / max(disk.total, 1), 1)
     result['time'] = time.time()
+    result['sample_interval'] = 10
     return result
+
+
+@cached_snapshot(15)
+def service_snapshot():
+    units = ('trusttunnel', 'warp-wireproxy', 'fail2ban', 'trusttunnel-panel')
+    rc, output = run(['systemctl', 'show', '--property=Id,ActiveState', *units], timeout=5)
+    result = {unit: 'unknown' for unit in units}
+    for block in output.split('\n\n'):
+        fields = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+        name = fields.get('Id', '').removesuffix('.service')
+        if name in result:
+            result[name] = fields.get('ActiveState', 'unknown')
+    return result
+
+
+def update_ignore_list(action, values):
+    network = ipaddress.ip_network(values.get('ip', ''), strict=False)
+    if network.prefixlen == 0:
+        raise ValueError('Нельзя исключить из защиты весь интернет.')
+    token = str(network)
+    current = checked_run(['fail2ban-client', 'get', 'sshd', 'ignoreip'])
+    # Preserve the effective exclusions, including hostnames from other config files.
+    tokens = []
+    for line in current.splitlines():
+        item = line.strip().lstrip('|`- ').strip()
+        if not item or any(ch.isspace() for ch in item) or not re.fullmatch(r'[A-Za-z0-9_.:/-]+', item):
+            continue
+        try: item = str(ipaddress.ip_network(item, strict=False))
+        except ValueError: pass
+        if item not in tokens: tokens.append(item)
+    if action.endswith('add'):
+        if token not in tokens: tokens.append(token)
+    else:
+        if token not in tokens: raise ValueError('Исключение не найдено.')
+        loopback = ipaddress.ip_network('127.0.0.0/8' if network.version == 4 else '::1/128')
+        if network.overlaps(loopback):
+            raise ValueError('Нельзя удалить исключение loopback.')
+        tokens.remove(token)
+    old = read_text(IGNORE_FILE)
+    atomic_write(IGNORE_FILE, '[sshd]\nignoreip = ' + ' '.join(tokens) + '\n')
+    try:
+        checked_run(['fail2ban-client', '-t'])
+        checked_run(['fail2ban-client', 'reload', 'sshd'])
+    except Exception:
+        if old: atomic_write(IGNORE_FILE, old)
+        else: IGNORE_FILE.unlink(missing_ok=True)
+        run(['fail2ban-client', 'reload', 'sshd'])
+        raise
+    audit_log(action, token)
+    return 'Исключения SSH jail: ' + ', '.join(tokens) + '. Блокировки других jail не менялись.'
+
+
+@cached_snapshot(30)
+def security_snapshot():
+    services = service_snapshot()
+    checks = []
+    def check(title, state, detail):
+        checks.append(dict(title=title, state=state, detail=detail))
+    rc, ufw = run(['ufw', 'status'], timeout=5)
+    check('Сетевой экран', 'ok' if rc == 0 and 'Status: active' in ufw else 'warn', ufw.splitlines()[0] if ufw else 'UFW недоступен')
+    rc, jail = run(['fail2ban-client', 'status', 'sshd'], timeout=5)
+    banned = re.search(r'Currently banned:\s*(\d+)', jail)
+    check('Защита SSH', 'ok' if rc == 0 else 'warn', ('SSH jail работает' + (' · заблокировано IP: ' + banned[1] if banned else '')) if rc == 0 else 'SSH jail недоступен')
+    rc, ssh = run(['sshd', '-T'], timeout=5)
+    ssh_cfg = dict(line.split(' ', 1) for line in ssh.splitlines() if ' ' in line) if rc == 0 else {}
+    password = ssh_cfg.get('passwordauthentication', 'неизвестно')
+    root = ssh_cfg.get('permitrootlogin', 'неизвестно')
+    check('Вход по SSH', 'warn' if password != 'no' else 'ok', f'Пароль: {password}; root: {root}. Базовые настройки без учёта Match-блоков.')
+    env = current_panel_env()
+    local = env.get('PANEL_BIND', '127.0.0.1') in ('127.0.0.1', '::1', 'localhost')
+    tls = env.get('PANEL_TLS') == '1'
+    check('Доступ к панели', 'ok' if local or tls else 'warn', 'Локальный доступ' if local else ('Публичный HTTPS' if tls else 'Публичный HTTP: учётные данные без TLS'))
+    protected = [TT_DIR / 'credentials.toml', TT_DIR / 'certs/key.pem', Path('/etc/trusttunnel-panel.env')]
+    exposed = [str(p) for p in protected if p.exists() and p.stat().st_mode & 0o077]
+    missing = [str(p) for p in protected if not p.exists()]
+    check('Приватные файлы', 'warn' if exposed or missing else 'ok', ('Лишние права: ' + ', '.join(exposed)) if exposed else ('Файлы отсутствуют: ' + ', '.join(missing) if missing else 'Файлы учётных данных и ключа доступны только владельцу'))
+    cert = TT_DIR / 'certs/cert.pem'
+    rc, expiry = run(['openssl', 'x509', '-in', str(cert), '-noout', '-enddate', '-checkend', '1209600'], timeout=5)
+    check('Сертификат VPN', 'ok' if rc == 0 else 'warn', expiry or 'Сертификат не прочитан')
+    check('Перезагрузка ОС', 'warn' if Path('/var/run/reboot-required').exists() else 'ok', 'Требуется после обновлений' if Path('/var/run/reboot-required').exists() else 'ОС не сообщает о необходимости перезагрузки')
+    return dict(checks=checks, services=services, checked_at=time.time())
+
+
+@cached_snapshot(30)
+def jail_settings():
+    result = {}
+    for field in ('maxretry', 'findtime', 'bantime'):
+        rc, value = run(['fail2ban-client', 'get', 'sshd', field], timeout=5)
+        result[field] = value if rc == 0 and re.fullmatch(r'\d+', value) else ''
+    return result
+
+
+def power_operation(action, values):
+    if action == 'system-restart':
+        checked_run(['systemctl', 'restart', 'trusttunnel'])
+        checked_run(['systemctl', 'is-active', '--quiet', 'trusttunnel'])
+        audit_log(action)
+        return 'TrustTunnel перезапущен.'
+    if action == 'system-reboot':
+        if values.get('confirm') != 'REBOOT':
+            raise ValueError('Для перезагрузки VPS введите REBOOT.')
+        checked_run(['systemd-run', '--unit=trusttunnel-panel-reboot', '--on-active=60s', '/usr/bin/systemctl', 'reboot'])
+        audit_log(action, 'Scheduled in 60 seconds')
+        return 'Перезагрузка VPS запланирована через 60 секунд. Её можно отменить до срабатывания таймера.'
+    if action == 'system-reboot-cancel':
+        checked_run(['systemctl', 'stop', 'trusttunnel-panel-reboot.timer'])
+        audit_log(action)
+        return 'Таймер перезагрузки остановлен. Если перезагрузка уже началась, отменить её нельзя.'
+    raise ValueError('Неизвестная операция сервера.')
 
 
 def client_name_valid(name):
@@ -674,6 +849,7 @@ def human_bytes(value):
 
 
 def system_metrics():
+    global CPU_SAMPLE
     memory = {}
     for line in read_text('/proc/meminfo').splitlines():
         parts = line.replace(':', '').split()
@@ -685,8 +861,18 @@ def system_metrics():
     uptime_seconds = int(float(read_text('/proc/uptime').split()[0] or 0))
     days, rest = divmod(uptime_seconds, 86400)
     hours, minutes = divmod(rest, 3600)
+    cpu = 'Первое измерение'
+    stat = read_text('/proc/stat').splitlines()
+    if stat and stat[0].startswith('cpu '):
+        ticks = [int(v) for v in stat[0].split()[1:9]]
+        total_ticks, idle = sum(ticks), ticks[3] + ticks[4]
+        if CPU_SAMPLE and total_ticks > CPU_SAMPLE[0]:
+            percent = max(0, min(100, 100 * (1 - (idle - CPU_SAMPLE[1]) / (total_ticks - CPU_SAMPLE[0]))))
+            cpu = f'{percent:.1f}%'
+        CPU_SAMPLE = total_ticks, idle
     return {
-        'cpu': f'load: ' + ' / '.join(f'{item:.2f}' for item in getattr(os, 'getloadavg', lambda: (0.0, 0.0, 0.0))()),
+        'cpu': cpu,
+        'load': ' / '.join(f'{item:.2f}' for item in getattr(os, 'getloadavg', lambda: (0.0, 0.0, 0.0))()),
         'memory': f'{human_bytes(max(0, total - available))} / {human_bytes(total)}',
         'disk': f'{human_bytes(disk.used)} / {human_bytes(disk.total)}',
         'uptime': f'{days}d {hours:02d}h {minutes // 60:02d}m',
@@ -797,6 +983,7 @@ def save_telegram(token, chat_id):
     return send_telegram('TrustTunnel: Telegram notifications are connected.')
 
 
+@cached_snapshot(60)
 def endpoint_version():
     binary = TT_DIR / 'trusttunnel_endpoint'
     if not binary.exists():
@@ -1058,12 +1245,21 @@ def ufw_output(action, port='', proto='tcp'):
         return '\n'.join(out)
     return 'Unknown UFW action.'
 PANEL_STYLE = r'''
-:root{--ink:#172033;--muted:#65728a;--line:#e1e7ef;--canvas:#f4f6f9;--surface:#fff;--nav:#141b2d;--nav-hover:#202c43;--nav-active:#2b4773;--accent:#246bdb;--success:#147c45;--success-bg:#e7f6ec;--danger:#b42318;--danger-bg:#fff0ef;--warn:#9b6200;--warn-bg:#fff7df}*{box-sizing:border-box}body{margin:0;background:var(--canvas);color:var(--ink);font-family:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;font-size:14px;line-height:1.45}button,input,select,textarea{font:inherit}.layout{display:grid;grid-template-columns:248px minmax(0,1fr);min-height:100vh}.sidebar{padding:20px 12px;background:var(--nav);color:#eaf0fb;position:sticky;top:0;height:100vh;overflow:auto}.brand{display:flex;align-items:center;gap:10px;padding:4px 10px 20px;margin-bottom:15px;border-bottom:1px solid #293750;font-size:17px;font-weight:700}.brand:before{content:"T";display:grid;place-items:center;width:29px;height:29px;border:1px solid #6d9ee8;border-radius:7px;background:#1b3156;color:#dce9ff;font-size:14px}.brand small{display:block;margin-top:1px;color:#93a6c7;font-size:11px;font-weight:500}.nav-group{margin:16px 0}.nav-label{display:block;padding:0 10px 7px;color:#8496b8;text-transform:uppercase;letter-spacing:.06em;font-weight:700;font-size:10px}.nav-item{display:block;border-radius:6px;padding:9px 10px;margin:2px 0;color:#bdc9dd;text-decoration:none}.nav-item:hover{background:var(--nav-hover);color:#fff}.nav-item.active{background:var(--nav-active);color:#fff;box-shadow:inset 3px 0 0 #78a9ff}.workspace{min-width:0}.topbar{min-height:62px;padding:0 30px;display:flex;align-items:center;justify-content:space-between;gap:14px;background:var(--surface);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}.endpoint-context{display:flex;align-items:center;gap:9px;color:var(--muted);min-width:0}.endpoint-context:before{content:"";width:8px;height:8px;border-radius:50%;background:#26a35e;flex:none}.endpoint-context strong{color:var(--ink);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.command-trigger{min-height:34px;border:1px solid var(--line);border-radius:6px;background:#fff;color:#536176;padding:6px 9px;cursor:pointer}.command-trigger kbd{margin-left:6px;padding:1px 4px;border:1px solid #d9e0e9;border-bottom-width:2px;border-radius:4px;background:#f8fafc;color:#748197;font-size:11px}.content{max-width:1480px;padding:28px 30px 42px;margin:0 auto}.page-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin:0 0 22px}.page-head h2{font-size:25px;line-height:1.2;margin:0;font-weight:720}.page-head p{margin:6px 0 0;color:var(--muted)}h3{font-size:15px;margin:0 0 13px}.surface{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px;margin:0 0 16px}.metrics,.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:16px}.metric{min-height:88px;padding:14px;border:1px solid var(--line);border-radius:7px;background:#fff}.metric small{display:block;margin-bottom:8px;color:var(--muted);font-size:11px}.metric strong{display:block;font-size:15px;overflow-wrap:anywhere}.metric b{display:block;margin-bottom:9px;color:var(--muted);font-size:11px;font-weight:600}.badge{display:inline-flex;align-items:center;gap:5px;margin-top:8px;padding:3px 7px;border-radius:999px;background:#eef2f7;color:#59677b;font-size:11px}.badge:before{content:"";width:6px;height:6px;border-radius:50%;background:currentColor}.badge.active{background:var(--success-bg);color:var(--success)}.badge.inactive,.badge.failed{background:var(--danger-bg);color:var(--danger)}.warning{padding:10px 12px;border-left:3px solid #e6b344;background:var(--warn-bg);color:var(--warn);margin:0 0 14px}.notice{padding:11px 13px;border:1px solid #b7d6fe;background:#edf6ff;color:#164e91;border-radius:7px;margin-bottom:16px}form{display:inline-flex;align-items:end;gap:8px;flex-wrap:wrap;margin:3px 4px 3px 0}label{display:grid;gap:5px;color:#536176;font-size:12px}label.check{display:flex;align-items:center;gap:7px;padding:8px 0;font-size:13px}input,select,textarea,button,.button{min-height:36px;border:1px solid #cbd5e1;border-radius:6px;background:#fff;color:var(--ink);padding:7px 10px}textarea{width:100%;min-height:74px;resize:vertical;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}input:focus,select:focus,textarea:focus{outline:0;border-color:#5d92e5;box-shadow:0 0 0 3px #e7f0ff}button,.button{cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}button:hover,.button:hover{border-color:#7da6e5}button.primary,.button.primary{background:var(--accent);border-color:var(--accent);color:#fff}button.danger{background:#fff8f7;border-color:#efb3ae;color:var(--danger)}.form-grid{display:grid;grid-template-columns:repeat(3,minmax(180px,1fr));align-items:end;gap:12px}.table-wrap{overflow-x:auto;padding:0}table{width:100%;min-width:700px;border-collapse:collapse}th,td{padding:13px 16px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}th{background:#fafbfd;color:#69778c;font-size:11px;text-transform:uppercase;letter-spacing:.04em}tr:last-child td{border-bottom:0}tr.client-row:hover td{background:#f9fbff}.client-cell{display:flex;align-items:center;gap:10px}.avatar{width:29px;height:29px;border-radius:6px;display:grid;place-items:center;background:#e8f1ff;color:#1e5dc8;font-weight:750}.client-cell small,.muted,.hint{display:block;color:var(--muted);margin-top:2px}.protocols{display:flex;gap:5px;flex-wrap:wrap}.protocol{padding:2px 5px;border:1px solid #d7e1f0;border-radius:4px;color:#50627b;font-size:11px}.table-actions{display:flex;justify-content:flex-end;gap:7px}.search{width:min(300px,100%)}.summary-filters{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 14px}.summary-filter{min-height:32px;padding:5px 8px;border:1px solid var(--line);border-radius:6px;background:#fff;color:#536176;cursor:pointer}.summary-filter.active{background:#eaf2ff;border-color:#9dc0f4;color:#1b5ec8}.drawer{display:none;position:fixed;inset:0;z-index:20;background:rgba(16,25,41,.46)}.drawer.open{display:block}.drawer-card{width:min(570px,100vw);height:100%;margin-left:auto;padding:22px;background:#fff;overflow:auto;box-shadow:-16px 0 32px rgba(15,23,42,.18)}.drawer-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px;padding-bottom:17px;border-bottom:1px solid var(--line)}.drawer-head h2{font-size:19px;margin:0}.drawer-section{padding:18px 0;border-bottom:1px solid var(--line)}.drawer-section:last-child{border-bottom:0}.copy-row{display:flex;align-items:flex-start;gap:7px}.qr-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.qr-grid img{display:block;max-width:190px;width:100%;margin-top:7px;border:1px solid var(--line);border-radius:6px;padding:6px}.command-layer{display:none;position:fixed;z-index:30;inset:0;padding:12vh 16px 16px;background:rgba(16,25,41,.38)}.command-layer.open{display:block}.command-box{width:min(620px,100%);margin:0 auto;overflow:hidden;background:#fff;border:1px solid #cfd9e8;border-radius:8px;box-shadow:0 18px 45px rgba(15,23,42,.22)}.command-box input{width:100%;min-height:48px;border:0;border-bottom:1px solid var(--line);border-radius:0}.command-list{max-height:360px;overflow:auto;padding:8px}.command-item{display:block;padding:10px 11px;border-radius:5px;color:var(--ink);text-decoration:none}.command-item:hover{background:#f0f5fc}.command-item small{display:block;color:var(--muted);margin-top:2px}pre{margin:0;max-height:560px;overflow:auto;white-space:pre-wrap;background:#111a2a;color:#dce8fb;padding:14px;border-radius:6px;font-size:12px}@media(max-width:1050px){.metrics,.grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:900px){.layout{display:block}.sidebar{position:static;height:auto;display:flex;align-items:center;overflow-x:auto;gap:8px;padding:12px}.brand{flex:none;margin:0;padding:0 8px;border:0}.brand small,.nav-label{display:none}.nav-group{display:flex;gap:2px;margin:0}.nav-item{white-space:nowrap;margin:0}.topbar{padding:0 16px}.content{padding:18px 16px 32px}.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:560px){.page-head{display:block}.page-head form{margin-top:12px}.metrics,.grid,.form-grid,.qr-grid{grid-template-columns:1fr}.command-trigger{font-size:0}.command-trigger kbd{margin:0;font-size:10px}}
+:root{color-scheme:light;--canvas:#f5f7f8;--surface:#fff;--ink:#20292f;--muted:#68757c;--line:#dfe6e9;--accent:#147d71;--accent-soft:#e5f4f0;--danger:#b9323e;--danger-soft:#fff0f1;--warn:#916620;--warn-bg:#fff8e8;--blue:#2586db;--nav-active:#e9f5f1;--nav-hover:#f2f6f6}
+html[data-theme=dark]{color-scheme:dark;--canvas:#131818;--surface:#1c2222;--ink:#e7eeec;--muted:#a0afaa;--line:#35403d;--accent:#6acdb5;--accent-soft:#233d35;--nav-active:#243f36;--nav-hover:#283330;--danger:#ff9ca4;--danger-soft:#402a2e;--warn:#e2bd74;--warn-bg:#342e23}
+*{box-sizing:border-box;letter-spacing:0}body{margin:0;background:var(--canvas);color:var(--ink);font:14px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif}button,input,select,textarea{font:inherit}a{color:inherit}button,a,input,select,textarea,summary{-webkit-tap-highlight-color:transparent}button{cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}button:focus-visible,a:focus-visible,summary:focus-visible,input:focus,select:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:3px}.icon{width:19px;height:19px;flex:none;vertical-align:middle}button,.button{display:inline-flex;gap:8px;align-items:center;justify-content:center;min-height:40px;padding:9px 13px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);text-decoration:none;font-weight:600;font-size:13px;line-height:1.35;transition:background .15s,border-color .15s;white-space:normal}button:hover,.button:hover{background:var(--nav-hover);border-color:var(--muted)}button.primary,.button.primary{background:var(--accent);color:var(--surface);border-color:var(--accent)}html[data-theme=dark] .primary{color:#122921}.danger{color:var(--danger);background:var(--danger-soft)}.icon-button,.theme-toggle{height:40px;width:40px;padding:0;flex:none}
+.layout{display:grid;grid-template-columns:230px minmax(0,1fr);min-height:100vh}.sidebar{position:sticky;top:0;height:100dvh;overflow:auto;background:var(--surface);border-right:1px solid var(--line);padding:26px 16px 16px;display:flex;flex-direction:column}.brand{display:flex;align-items:center;gap:10px;text-decoration:none;margin-bottom:28px;font-size:18px;font-weight:700}.brand-mark{height:34px;width:34px;background:var(--accent-soft);color:var(--accent);border-radius:8px;display:grid;place-items:center}.brand small{display:block;font-size:10px;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:1.3px}.nav-group{margin:0 0 24px}.nav-label{display:block;font-size:10px;font-weight:650;color:var(--muted);padding:0 12px 9px;text-transform:uppercase;letter-spacing:1px}.nav-item{display:flex;gap:11px;align-items:center;padding:10px 12px;min-height:42px;margin:3px 0;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px;font-weight:500}.nav-item:hover{background:var(--nav-hover);color:var(--ink)}.nav-item.active{color:var(--accent);background:var(--nav-active);font-weight:650}.sidebar-footer{border-top:1px solid var(--line);padding:18px 10px 0;margin-top:auto;font-size:11px;color:var(--muted)}.sidebar-footer strong{display:block;color:var(--ink);font-size:12px}.workspace{min-width:0}.topbar{height:70px;padding:0 34px;display:flex;align-items:center;justify-content:space-between;gap:16px;border-bottom:1px solid var(--line);background:var(--surface)}.endpoint-context{min-width:0;display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px}.endpoint-context strong{font-weight:600;color:var(--ink);white-space:nowrap;text-overflow:ellipsis;overflow:hidden}.endpoint-context .icon{width:15px}.header-actions{display:flex;gap:8px;flex:none}.content{max-width:1450px;margin:auto;padding:30px 34px 50px}.page-head{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:26px}.page-head h2{font-size:27px;font-weight:650;line-height:1.25;margin:0}.page-head p{color:var(--muted);margin:8px 0 0;font-size:13px}.eyebrow{display:block;font-size:10px;letter-spacing:1.2px;font-weight:650;color:var(--accent);margin-bottom:6px}.version-pill{font-size:11px;padding:3px 7px;border:1px solid var(--line);border-radius:4px;margin-left:8px;display:inline-block}.page-actions,.inline-actions,.monitor-controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.section-heading{display:flex;justify-content:space-between;align-items:center;gap:15px;margin-bottom:20px}.section-heading h3{margin:0}h3{font-size:15px;font-weight:650;margin:0 0 16px}.surface{padding:24px 0;border-top:1px solid var(--line);margin:0}.surface .surface{border:0;padding:16px 0}.muted,.hint{color:var(--muted);font-size:12px;overflow-wrap:anywhere}.muted{display:block}.text-link{color:var(--accent);font-size:12px;font-weight:600;text-decoration:none;display:inline-flex;gap:5px;align-items:center}.text-link .icon{width:15px}.metrics,.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px}.overview-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.metric{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px;min-width:0;box-shadow:0 2px 4px #162d2404}.metric small{color:var(--muted);font-size:12px;display:block}.metric strong{display:block;margin:14px 0 7px;font-size:20px;font-weight:650;line-height:1.3;overflow-wrap:anywhere;font-variant-numeric:tabular-nums}.metric-caption{display:block;color:var(--muted);font-size:11px}.resource-bars{display:flex;gap:26px;margin:22px 0}.resource-bars label{flex:1;display:grid;grid-template-columns:auto 1fr;align-items:center;gap:12px;font-size:11px}meter{width:100%;height:7px;border:0}meter::-webkit-meter-bar{background:var(--line);border:0}meter::-webkit-meter-optimum-value{background:var(--accent)}#traffic-chart{width:100%;height:190px;display:block}.network-rate{font-variant-numeric:tabular-nums;font-size:17px;font-weight:600;display:block;margin-top:8px;min-height:26px}.chart-footer{display:flex;justify-content:space-between;gap:12px;align-items:center;margin:12px 0}.chart-legend{display:flex;gap:20px;flex-wrap:wrap;font-size:11px;color:var(--muted)}.rx:before,.tx:before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;background:var(--blue)}.tx:before{background:#16937a}#interface-totals{margin-top:12px;font-size:11px}.overview-columns{display:grid;grid-template-columns:1fr 1fr;gap:36px}.service-row{display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--line);padding:12px 0}.service-row:last-child{border:0}.badge{display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:4px 8px;border-radius:4px;background:var(--nav-hover);color:var(--muted);white-space:nowrap}.badge:before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}.badge.active{color:var(--accent);background:var(--accent-soft)}.badge.failed{color:var(--danger);background:var(--danger-soft)}dl{display:grid;grid-template-columns:1fr 1fr;gap:16px;font-size:13px;margin:0}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow-wrap:anywhere}
+form{display:inline-flex;align-items:end;gap:10px;flex-wrap:wrap;margin:4px 12px 12px 0;max-width:100%}.page-head form,.page-actions form,.section-heading form{margin:0}label{display:grid;gap:7px;font-size:12px;color:var(--muted);min-width:0}label.check{display:flex;align-items:center;gap:8px;padding:10px 0}input,select,textarea{min-height:40px;padding:9px 11px;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--ink);min-width:0;max-width:100%;font-size:13px}input[type=checkbox]{min-height:0;width:17px;height:17px;accent-color:var(--accent)}textarea{width:100%;resize:vertical;min-height:90px;font-family:ui-monospace,Consolas,monospace;font-size:12px}.form-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px;width:100%}.warning,.notice{padding:12px 14px;border-left:3px solid var(--warn);background:var(--warn-bg);color:var(--warn);margin:10px 0 20px;font-size:13px;overflow-wrap:anywhere}.notice{background:var(--accent-soft);color:var(--accent);border-color:var(--accent)}details{padding:18px 0}summary{cursor:pointer;font-weight:600;font-size:13px;color:var(--ink);padding:3px 0;margin-bottom:12px}.error-text{color:var(--danger);font-size:12px}
+.table-toolbar{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:0 0 18px}.search{width:min(330px,100%)}#client-count{margin-left:auto;color:var(--muted);font-size:12px}.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px;background:var(--surface)}table{width:100%;border-collapse:collapse;font-size:13px}th,td{padding:15px 16px;text-align:left;border-bottom:1px solid var(--line);vertical-align:middle}th{background:var(--nav-hover);font-size:11px;color:var(--muted);font-weight:600;white-space:nowrap}tr:last-child td{border-bottom:0}td strong{font-weight:600}.table-actions{text-align:right}.table-actions button{font-size:12px}.protocol{display:inline-block;font-size:10px;border:1px solid var(--line);border-radius:4px;padding:3px 6px;color:var(--muted);margin:2px}.toggle{padding:3px;width:38px;height:22px;min-height:22px;border:0;border-radius:20px;background:#abb5b5;display:flex;justify-content:flex-start}.toggle span{width:16px;height:16px;background:white;border-radius:50%;box-shadow:0 1px 3px #0002}.toggle.active{background:#168e79;justify-content:flex-end}.toggle:hover{border:0}.pagination{display:flex;gap:12px;justify-content:flex-end;align-items:center;margin-top:18px;font-size:12px}.pagination button{padding:0;width:36px}.pagination select{width:65px}.security-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-bottom:20px}.security-check{display:flex;gap:12px;padding:18px;background:var(--surface);border:1px solid var(--line);border-radius:7px;min-width:0}.security-check h3{margin:0 0 7px;font-size:13px}.security-check p{color:var(--muted);font-size:12px;margin:0;overflow-wrap:anywhere}.check-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none;margin-top:6px}.security-check.warn .check-dot{background:#d19c3c}
+.drawer,.command-layer{display:none;position:fixed;inset:0;z-index:50;background:#10252166;backdrop-filter:blur(2px)}.drawer.open,.command-layer.open{display:block}.dialog-open{overflow:hidden}.drawer-card{width:min(550px,100vw);height:100dvh;margin-left:auto;padding:26px;background:var(--surface);overflow:auto;overscroll-behavior:contain;box-shadow:-15px 0 50px #0002}.drawer-head{display:flex;justify-content:space-between;align-items:center;gap:16px;border-bottom:1px solid var(--line);padding-bottom:20px}.drawer-head h2{font-size:21px;margin:0;overflow-wrap:anywhere}.drawer-head button{font-size:22px;width:40px;height:40px;padding:0;flex:none}.drawer-section{padding:22px 0;border-bottom:1px solid var(--line)}.drawer-card form{display:flex;width:100%;margin-right:0}.drawer-card label{flex:1;min-width:0}.drawer-card input{width:100%}.drawer-section>button{margin:10px 6px 0 0}.share-qr{display:block;width:180px;height:180px;margin-top:18px;background:white;padding:6px;border-radius:6px}.link-result{margin-top:14px}.command-layer{padding:14vh 18px 20px}.command-box{background:var(--surface);border:1px solid var(--line);border-radius:8px;width:min(550px,100%);margin:auto;overflow:hidden;box-shadow:0 20px 60px #0003}.command-box input{width:100%;border:0;border-bottom:1px solid var(--line);border-radius:0;min-height:55px}.command-list{padding:8px;max-height:60vh;overflow:auto}.command-item{display:block;padding:11px 14px;border-radius:5px;text-decoration:none}.command-item:hover{background:var(--nav-hover)}.command-item small{display:none}pre{margin:0;background:var(--nav-hover);color:var(--ink);padding:16px;border:1px solid var(--line);border-radius:6px;max-height:65vh;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;line-height:1.6}
+#operation-result{background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:24px;width:min(680px,calc(100vw - 24px));max-height:85dvh;box-shadow:0 20px 80px #0003}#operation-result::backdrop{background:#10252166}#operation-result h3{font-size:18px}#result-close{margin-top:18px}.busy-strip{display:none;position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:14px 20px;background:var(--ink);color:var(--surface);border-radius:6px;z-index:80;box-shadow:0 5px 20px #0002;width:max-content;max-width:calc(100vw - 32px);font-size:13px}.busy .busy-strip{display:block}.busy-strip:before{content:"";display:inline-block;width:12px;height:12px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;margin-right:10px;vertical-align:-2px;animation:spin 1s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}#mobile-menu,.mobile-nav,#nav-backdrop{display:none}[hidden]{display:none!important}
+@media(min-width:1600px){.content{padding-top:38px}}
+@media(max-width:1150px){.layout{grid-template-columns:210px minmax(0,1fr)}.content{padding:26px 24px 40px}.topbar{padding:0 24px}.overview-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.security-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.page-head{align-items:flex-start}.page-actions{justify-content:flex-end}.section-heading{flex-wrap:wrap}}
+@media(max-width:800px){.layout{display:block}.sidebar{position:fixed;z-index:70;top:0;bottom:0;left:0;width:270px;max-width:85vw;transform:translateX(-100%);transition:transform .2s}.nav-open{overflow:hidden}.nav-open .sidebar{transform:translateX(0)}.nav-open #nav-backdrop{display:block;position:fixed;inset:0;background:#10252166;z-index:60}#mobile-menu{display:inline-flex}.topbar{height:62px;padding:0 16px;position:sticky;top:0;z-index:20}.endpoint-context>span{display:none}.endpoint-context{flex:1;gap:8px}.content{padding:24px 18px 110px}.mobile-nav{display:flex;position:fixed;bottom:0;inset-inline:0;z-index:25;padding:6px 12px calc(6px + env(safe-area-inset-bottom));background:var(--surface);border-top:1px solid var(--line);justify-content:space-around}.mobile-nav a,.mobile-nav button{display:flex;flex-direction:column;gap:2px;flex:1;font-size:10px;min-height:48px;text-decoration:none;color:var(--muted);align-items:center;justify-content:center;border:0;padding:4px;background:transparent}.mobile-nav .active{color:var(--accent)}.mobile-nav .icon{width:21px;height:21px}.overview-columns{gap:20px}.busy-strip{bottom:85px}.form-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.topbar{gap:10px;padding:0 12px}.topbar .header-actions{gap:4px}.endpoint-context .icon{display:none}.endpoint-context strong{font-size:12px}.content{padding:23px 14px 100px}.page-head{display:block;margin-bottom:22px}.page-head h2{font-size:25px}.page-head p{font-size:12px}.page-actions{justify-content:flex-start;margin-top:16px}.page-head>form{margin-top:16px}.version-pill{margin:5px 0 0}.overview-metrics{gap:10px}.metric{padding:14px 12px}.metric strong{font-size:17px;margin:10px 0 5px}.metric small,.metric-caption{font-size:10px}.resource-bars{gap:18px;margin:20px 0}.network-rate{font-size:16px}.monitor-controls{gap:6px;width:100%}.monitor-controls select{flex:1;width:100px;font-size:12px}.section-heading{gap:14px;margin-bottom:14px}.chart-footer{display:block}.chart-footer>span{margin-top:8px}.overview-columns{grid-template-columns:1fr;gap:0}.security-grid{grid-template-columns:1fr}.security-check{padding:15px}.form-grid{grid-template-columns:1fr}form{display:flex;width:100%;gap:10px;margin-right:0}form label{flex:1 1 140px}input,select,textarea{font-size:16px}button,.button{min-height:44px}.table-toolbar{gap:8px}.table-toolbar .search{width:100%}.table-toolbar select{flex:1}.table-toolbar #client-count{font-size:11px}.table-wrap:has([data-client-row]){background:transparent;border:0;border-radius:0;overflow:visible}.table-wrap:has([data-client-row]) table,.table-wrap:has([data-client-row]) tbody{display:block}.table-wrap:has([data-client-row]) thead{display:none}[data-client-row]{display:grid;grid-template-columns:44px minmax(0,1fr) auto;border:1px solid var(--line);border-radius:7px;background:var(--surface);padding:13px;gap:10px;margin:10px 0}[data-client-row] td{border:0!important;padding:0;min-width:0}[data-client-row] td:nth-child(1){grid-row:1;grid-column:1}[data-client-row] td:nth-child(1) form{margin:0}[data-client-row] td:nth-child(2){grid-column:2/4;overflow-wrap:anywhere}[data-client-row] td:nth-child(3){display:none}[data-client-row] td:nth-child(4){grid-column:1/3;align-self:center}[data-client-row] td:nth-child(5){grid-column:3;grid-row:2}.toggle{min-height:22px;margin:2px 0}.pagination{justify-content:space-between}.table-wrap:not(:has([data-client-row])) table{min-width:540px}.drawer-card{padding:20px 16px}.drawer-card form label{flex:1 1 100%}.drawer-head button{min-height:40px}.header-actions button{width:36px;padding:0}dl{gap:14px;font-size:12px}.page-head>button{margin-top:14px}}
+@media(prefers-reduced-motion:reduce){*,*:before{animation:none!important;transition:none!important;scroll-behavior:auto!important}}
 '''
 
-PANEL_SCRIPT = r'''
-(function(){const command=document.getElementById('command-layer'),search=document.getElementById('command-search');const open=()=>{command.classList.add('open');setTimeout(()=>search&&search.focus(),0)},close=()=>command.classList.remove('open');document.querySelectorAll('[data-command-open]').forEach(b=>b.addEventListener('click',open));document.addEventListener('keydown',e=>{if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();open()}if(e.key==='Escape'){close();document.querySelectorAll('.drawer.open').forEach(x=>x.classList.remove('open'))}});if(command)command.addEventListener('click',e=>{if(e.target===command)close()});if(search)search.addEventListener('input',()=>{const q=search.value.toLowerCase();document.querySelectorAll('.command-item').forEach(x=>x.hidden=!x.textContent.toLowerCase().includes(q))});document.querySelectorAll('[data-drawer]').forEach(b=>b.addEventListener('click',()=>document.getElementById(b.dataset.drawer).classList.add('open')));document.querySelectorAll('[data-drawer-close]').forEach(b=>b.addEventListener('click',()=>b.closest('.drawer').classList.remove('open')));document.querySelectorAll('.drawer').forEach(d=>d.addEventListener('click',e=>{if(e.target===d)d.classList.remove('open')}));document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{const t=document.getElementById(b.dataset.copy);if(!t)return;try{await navigator.clipboard.writeText(t.value);b.textContent='Скопировано';setTimeout(()=>b.textContent='Копировать',1200)}catch(_){t.select&&t.select()}}));const clientSearch=document.getElementById('client-search'),filters=document.querySelectorAll('[data-client-filter]');let active='all';const filterRows=()=>{const q=(clientSearch?clientSearch.value:'').toLowerCase();document.querySelectorAll('[data-client-row]').forEach(row=>row.hidden=!(row.dataset.client.includes(q)&&(active==='all'||row.dataset.protocols.includes(active))))};if(clientSearch)clientSearch.addEventListener('input',filterRows);filters.forEach(b=>b.addEventListener('click',()=>{active=b.dataset.clientFilter;filters.forEach(x=>x.classList.toggle('active',x===b));filterRows()}));document.querySelectorAll('form[data-confirm]').forEach(f=>f.addEventListener('submit',e=>{if(!confirm(f.dataset.confirm))e.preventDefault()}));if(document.body.dataset.view==='dashboard')setTimeout(()=>location.reload(),30000)})();
-'''
 NAV_ITEMS = (
     ('dashboard', 'Обзор'), ('endpoint', 'Endpoint'), ('clients', 'Клиенты'),
     ('warp', 'WARP'), ('routing', 'Маршрутизация'), ('dns', 'DNS и AntiDPI'),
@@ -1073,19 +1269,80 @@ NAV_ITEMS = (
 )
 
 
+
+# Icon nodes from Lucide 1.8.0, bundled here to avoid a runtime dependency.
+LUCIDE_LICENSE = r'''
+ISC License
+
+Copyright (c) 2026 Lucide Icons and Contributors
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+---
+
+The following Lucide icons are derived from the Feather project:
+
+airplay, alert-circle, alert-octagon, alert-triangle, aperture, arrow-down-circle, arrow-down-left, arrow-down-right, arrow-down, arrow-left-circle, arrow-left, arrow-right-circle, arrow-right, arrow-up-circle, arrow-up-left, arrow-up-right, arrow-up, at-sign, calendar, cast, check, chevron-down, chevron-left, chevron-right, chevron-up, chevrons-down, chevrons-left, chevrons-right, chevrons-up, circle, clipboard, clock, code, columns, command, compass, corner-down-left, corner-down-right, corner-left-down, corner-left-up, corner-right-down, corner-right-up, corner-up-left, corner-up-right, crosshair, database, divide-circle, divide-square, dollar-sign, download, external-link, feather, frown, hash, headphones, help-circle, info, italic, key, layout, life-buoy, link-2, link, loader, lock, log-in, log-out, maximize, meh, minimize, minimize-2, minus-circle, minus-square, minus, monitor, moon, more-horizontal, more-vertical, move, music, navigation-2, navigation, octagon, pause-circle, percent, plus-circle, plus-square, plus, power, radio, rss, search, server, share, shopping-bag, sidebar, smartphone, smile, square, table-2, tablet, target, terminal, trash-2, trash, triangle, tv, type, upload, x-circle, x-octagon, x-square, x, zoom-in, zoom-out
+
+The MIT License (MIT) (for the icons listed above)
+
+Copyright (c) 2013-present Cole Bemis
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+'''
+ICONS = json.loads(r'''{"Activity":[["path",{"d":"M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"}]],"Server":[["rect",{"width":"20","height":"8","x":"2","y":"2","rx":"2","ry":"2"}],["rect",{"width":"20","height":"8","x":"2","y":"14","rx":"2","ry":"2"}],["line",{"x1":"6","x2":"6.01","y1":"6","y2":"6"}],["line",{"x1":"6","x2":"6.01","y1":"18","y2":"18"}]],"Users":[["path",{"d":"M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"}],["path",{"d":"M16 3.128a4 4 0 0 1 0 7.744"}],["path",{"d":"M22 21v-2a4 4 0 0 0-3-3.87"}],["circle",{"cx":"9","cy":"7","r":"4"}]],"Cloud":[["path",{"d":"M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"}]],"Route":[["circle",{"cx":"6","cy":"19","r":"3"}],["path",{"d":"M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"}],["circle",{"cx":"18","cy":"5","r":"3"}]],"Globe":[["circle",{"cx":"12","cy":"12","r":"10"}],["path",{"d":"M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"}],["path",{"d":"M2 12h20"}]],"ShieldCheck":[["path",{"d":"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"}],["path",{"d":"m9 12 2 2 4-4"}]],"KeyRound":[["path",{"d":"M2.586 17.414A2 2 0 0 0 2 18.828V21a1 1 0 0 0 1 1h3a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h1a1 1 0 0 0 1-1v-1a1 1 0 0 1 1-1h.172a2 2 0 0 0 1.414-.586l.814-.814a6.5 6.5 0 1 0-4-4z"}],["circle",{"cx":"16.5","cy":"7.5","r":".5","fill":"currentColor"}]],"Settings":[["path",{"d":"M9.671 4.136a2.34 2.34 0 0 1 4.659 0 2.34 2.34 0 0 0 3.319 1.915 2.34 2.34 0 0 1 2.33 4.033 2.34 2.34 0 0 0 0 3.831 2.34 2.34 0 0 1-2.33 4.033 2.34 2.34 0 0 0-3.319 1.915 2.34 2.34 0 0 1-4.659 0 2.34 2.34 0 0 0-3.32-1.915 2.34 2.34 0 0 1-2.33-4.033 2.34 2.34 0 0 0 0-3.831A2.34 2.34 0 0 1 6.35 6.051a2.34 2.34 0 0 0 3.319-1.915"}],["circle",{"cx":"12","cy":"12","r":"3"}]],"Logs":[["path",{"d":"M3 5h1"}],["path",{"d":"M3 12h1"}],["path",{"d":"M3 19h1"}],["path",{"d":"M8 5h1"}],["path",{"d":"M8 12h1"}],["path",{"d":"M8 19h1"}],["path",{"d":"M13 5h8"}],["path",{"d":"M13 12h8"}],["path",{"d":"M13 19h8"}]],"SlidersHorizontal":[["path",{"d":"M10 5H3"}],["path",{"d":"M12 19H3"}],["path",{"d":"M14 3v4"}],["path",{"d":"M16 17v4"}],["path",{"d":"M21 12h-9"}],["path",{"d":"M21 19h-5"}],["path",{"d":"M21 5h-7"}],["path",{"d":"M8 10v4"}],["path",{"d":"M8 12H3"}]],"Menu":[["path",{"d":"M4 5h16"}],["path",{"d":"M4 12h16"}],["path",{"d":"M4 19h16"}]],"X":[["path",{"d":"M18 6 6 18"}],["path",{"d":"m6 6 12 12"}]],"SunMoon":[["path",{"d":"M12 2v2"}],["path",{"d":"M14.837 16.385a6 6 0 1 1-7.223-7.222c.624-.147.97.66.715 1.248a4 4 0 0 0 5.26 5.259c.589-.255 1.396.09 1.248.715"}],["path",{"d":"M16 12a4 4 0 0 0-4-4"}],["path",{"d":"m19 5-1.256 1.256"}],["path",{"d":"M20 12h2"}]],"Search":[["path",{"d":"m21 21-4.34-4.34"}],["circle",{"cx":"11","cy":"11","r":"8"}]],"RotateCw":[["path",{"d":"M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"}],["path",{"d":"M21 3v5h-5"}]],"Power":[["path",{"d":"M12 2v10"}],["path",{"d":"M18.4 6.6a9 9 0 1 1-12.77.04"}]],"ArrowUpRight":[["path",{"d":"M7 7h10v10"}],["path",{"d":"M7 17 17 7"}]],"ChevronRight":[["path",{"d":"m9 18 6-6-6-6"}]],"Copy":[["rect",{"width":"14","height":"14","x":"8","y":"8","rx":"2","ry":"2"}],["path",{"d":"M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"}]],"Eye":[["path",{"d":"M2.062 12.348a1 1 0 0 1 0-.696 10.75 10.75 0 0 1 19.876 0 1 1 0 0 1 0 .696 10.75 10.75 0 0 1-19.876 0"}],["circle",{"cx":"12","cy":"12","r":"3"}]],"Plus":[["path",{"d":"M5 12h14"}],["path",{"d":"M12 5v14"}]],"RefreshCw":[["path",{"d":"M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"}],["path",{"d":"M21 3v5h-5"}],["path",{"d":"M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"}],["path",{"d":"M8 16H3v5"}]]}''')
+
+
+def icon(name):
+    parts = []
+    for tag, attrs in ICONS.get(name, []):
+        attributes = ' '.join(f'{k}="{html.escape(str(v), quote=True)}"' for k, v in attrs.items())
+        parts.append(f'<{tag} {attributes}></{tag}>')
+    return '<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + ''.join(parts) + '</svg>'
+
+
 def nav_html(view):
     groups = (
-        ('Сервер', ('dashboard', 'endpoint', 'clients')),
+        ('Основное', ('dashboard', 'clients', 'endpoint')),
         ('Сеть', ('warp', 'routing', 'dns')),
-        ('Управление', ('certificates', 'security', 'system', 'logs', 'panel')),
+        ('Администрирование', ('security', 'certificates', 'system', 'logs', 'panel')),
     )
+    icons = dict(zip(('dashboard', 'endpoint', 'clients', 'warp', 'routing', 'dns', 'certificates', 'security', 'system', 'panel', 'logs'),
+                     ('Activity', 'Server', 'Users', 'Cloud', 'Route', 'Globe', 'KeyRound', 'ShieldCheck', 'Settings', 'SlidersHorizontal', 'Logs')))
     labels = dict(NAV_ITEMS)
     parts = []
     for group, keys in groups:
         items = []
         for key in keys:
             cls = ' active' if key == view else ''
-            items.append(f'<a class="nav-item{cls}" href="/?view={key}">{labels[key]}</a>')
+            current = ' aria-current="page"' if key == view else ''
+            items.append(f'<a class="nav-item{cls}" href="/?view={key}"{current}>{icon(icons[key])}<span>{labels[key]}</span></a>')
         parts.append(f'<div class="nav-group"><span class="nav-label">{group}</span>{"".join(items)}</div>')
     return ''.join(parts)
 
@@ -1147,6 +1404,19 @@ def security_view():
 
 
 def system_view():
+    content = system_details_view()
+    boundary = content.index('<section')
+    return content[:boundary] + power_controls() + content[boundary:]
+
+
+def power_controls():
+    restart = admin_form('system-restart', '<button>' + icon('RotateCw') + 'Перезапустить TrustTunnel</button>', view='system', confirm='Перезапустить VPN? Текущие подключения кратковременно прервутся.')
+    reboot = admin_form('system-reboot', '<label>Подтверждение<input name="confirm" required pattern="REBOOT" placeholder="REBOOT" autocomplete="off"></label><button class="danger">' + icon('Power') + 'Перезагрузить VPS</button>', view='system')
+    cancel = admin_form('system-reboot-cancel', '<button>Отменить перезагрузку</button>', view='system')
+    return f'<section class="surface"><h3>Питание и сервисы</h3>{restart}<p class="muted">Перезагрузка VPS отключит VPN, панель и SSH. Задержка перед перезагрузкой: 60 секунд.</p>{reboot}{cancel}</section>'
+
+
+def system_details_view():
     return '''<div class="page-head"><div><h2>Система</h2><p>Обновления, диагностика, журнал и уведомления.</p></div></div><section class="surface"><form method="post" action="/maintenance"><button name="action" value="packages">Обновить пакеты VPS</button><button name="action" value="status">Статус планировщика</button><button name="action" value="enable">Включить daily check</button><button class="danger" name="action" value="disable">Отключить daily check</button></form></section><section class="surface"><form method="post" action="/action"><button name="action" value="speedtest">Speedtest</button><button name="action" value="diagnostics">Диагностика</button><button name="action" value="logs">Логи TrustTunnel</button><button name="action" value="audit">Журнал действий</button><button name="action" value="backup">Создать backup</button></form></section><section class="surface"><h3>Telegram</h3><form method="post" action="/telegram"><input name="token" placeholder="Bot token" required><input name="chat_id" placeholder="Chat ID" required><button>Сохранить и проверить</button></form></section>'''
 
 
@@ -1175,8 +1445,8 @@ def clients_console():
         if enabled:
             for proto, title in [('http2', 'HTTP/2')] + ([('http3', 'QUIC')] if quic_enabled() else []):
                 profiles += f'<a class="button" href="/client/{urllib.parse.quote(name)}/{proto}.toml">{title} TOML</a> '
-        link = deeplink(name) if enabled else ''
-        share = f'<label>Ссылка подключения<textarea id="share-{index}" readonly>{html.escape(link)}</textarea></label><button type="button" data-copy="share-{index}">Копировать ссылку</button><img class="share-qr" loading="lazy" alt="QR подключения {safe}" src="/qr-link/{urllib.parse.quote(name)}.png">' if link else '<p class="muted">Ссылка доступна для включённого клиента, если endpoint поддерживает экспорт.</p>'
+        link = ''
+        share = (f'<button type="button" data-load-link="{html.escape(name, quote=True)}" data-link-index="{index}">{icon("KeyRound")}Ссылка и QR-код</button><div id="link-result-{index}" class="link-result" aria-live="polite"></div>' if enabled else '<p class="muted">Доступ отключён. Включите клиента, чтобы получить ссылку.</p>')
         toggle = admin_form('client-disable' if enabled else 'client-enable', f'<button role="switch" aria-checked="{str(enabled).lower()}" class="toggle {state}" title="{label}"><span></span></button>', name, confirm='Изменить доступ клиента? Активные подключения TrustTunnel переподключатся.')
         rows.append(f'<tr data-client-row data-client="{safe.lower()} {html.escape(client["note"].lower(), quote=True)}" data-protocols="http2 http3" data-state="{state}"><td>{toggle}</td><td><strong>{safe}</strong><span class="muted">{html.escape(client["note"])}</span></td><td><span class="badge {state}">{label}</span></td><td><span class="protocol">HTTP/2</span> {"<span class=protocol>QUIC</span>" if quic_enabled() else ""}</td><td class="table-actions"><button type="button" data-drawer="{drawer_id}">Управлять</button></td></tr>')
         note = admin_form('client-note', f'<label>Заметка<input name="note" maxlength="300" value="{html.escape(client["note"], quote=True)}"></label><button>Сохранить</button>', name)
@@ -1191,9 +1461,15 @@ def clients_console():
 
 def overview_console():
     stats = monitor_snapshot()
-    cards = ''.join(f'<div class="metric"><small>{label}</small><strong id="stat-{key}">{html.escape(stats[key])}</strong></div>' for key, label in [('cpu', 'Нагрузка CPU'), ('memory', 'Оперативная память'), ('disk', 'Диск'), ('uptime', 'Время работы')])
-    services = ''.join(f'<tr><td>{name}</td><td id="service-{name}"><span class="badge {status}">{status}</span></td></tr>' for name, status in stats['services'].items())
-    return f'<div class="page-head"><div><h2>Обзор</h2><p>{html.escape(domain())}:{endpoint_port()} · {html.escape(endpoint_version())}</p></div><span id="monitor-status" class="badge active">Подключено</span></div><div class="metrics overview-metrics">{cards}</div><div class="resource-bars"><label>RAM <meter id="ram-meter" min="0" max="100" value="{stats["memory_percent"]}"></meter></label><label>Диск <meter id="disk-meter" min="0" max="100" value="{stats["disk_percent"]}"></meter></label></div><section class="surface"><div class="page-head"><h3>Сетевой трафик VPS</h3><span id="network-rate">Ожидание второго измерения</span></div><canvas id="traffic-chart" height="150" aria-label="Скорость входящего и исходящего трафика"></canvas><div class="chart-legend"><span class="rx">● Приём</span><span class="tx">● Отправка</span><span>Последние 60 измерений · байт/с</span></div><div id="interface-totals"></div></section><div class="overview-columns"><section class="surface"><h3>Сервисы</h3><table><tbody>{services}</tbody></table></section><section class="surface"><h3>Подключение</h3><dl><dt>Исходящий маршрут</dt><dd id="stat-route">{html.escape(stats["route"])}</dd><dt>Транспорты</dt><dd>HTTP/2 {"· QUIC / HTTP3" if quic_enabled() else ""}</dd><dt>Сертификат</dt><dd>{cert_mode()}</dd></dl><a class="button" href="/?view=endpoint">Настройки подключения</a></section></div>'
+    cards = ''.join(f'<div class="metric"><small>{label}</small><strong id="stat-{key}">{html.escape(stats[key])}</strong><span class="metric-caption">{caption}</span></div>' for key, label, caption in [('cpu', 'Процессор', 'Загрузка всех ядер'), ('memory', 'Память', 'Использовано / всего'), ('disk', 'Хранилище', 'Корневой раздел'), ('uptime', 'Время работы', 'С последнего запуска')])
+    names = {'trusttunnel': 'TrustTunnel', 'warp-wireproxy': 'WARP', 'fail2ban': 'Fail2ban', 'trusttunnel-panel': 'Панель'}
+    services = ''.join(f'<div class="service-row"><span>{html.escape(names.get(name, name))}</span><span id="service-{name}" class="badge {html.escape(status)}">{html.escape(status)}</span></div>' for name, status in stats['services'].items())
+    restart = admin_form('system-restart', '<button>' + icon('RotateCw') + 'Перезапустить VPN</button>', view='dashboard', confirm='Перезапустить TrustTunnel? VPN кратковременно отключится.')
+    return f'''<div class="page-head"><div><span class="eyebrow">СЕРВЕР</span><h2>Обзор</h2><p>{html.escape(domain())}:{endpoint_port()} <span class="version-pill">Endpoint {html.escape(endpoint_version())}</span></p></div><div class="page-actions"><a class="button" href="/?view=clients">{icon('Users')}Клиенты</a>{restart}</div></div>
+<div class="metrics overview-metrics">{cards}</div><div class="resource-bars"><label>Память <meter id="ram-meter" min="0" max="100" value="{stats['memory_percent']}"></meter></label><label>Диск <meter id="disk-meter" min="0" max="100" value="{stats['disk_percent']}"></meter></label></div>
+<section class="surface traffic-surface"><div class="section-heading"><div><h3>Трафик сервера</h3><span id="network-rate" class="network-rate">Ожидание измерения</span></div><div class="monitor-controls"><label class="sr-only" for="interface-select">Сетевой интерфейс</label><select id="interface-select"></select><label class="sr-only" for="refresh-interval">Частота обновления</label><select id="refresh-interval"><option value="10">Каждые 10 с</option><option value="30">Каждые 30 с</option><option value="0">Пауза</option></select><button type="button" id="monitor-refresh" class="icon-button" title="Обновить" aria-label="Обновить">{icon('RefreshCw')}</button></div></div>
+<canvas id="traffic-chart" height="190" aria-label="График скорости выбранного сетевого интерфейса"></canvas><div class="chart-footer"><div class="chart-legend"><span class="rx">Приём</span><span class="tx">Отправка</span><span id="chart-scale"></span></div><span id="monitor-status" class="muted" role="status">Подключено</span></div><div id="interface-totals" class="muted"></div></section>
+<div class="overview-columns"><section class="surface"><div class="section-heading"><h3>Сервисы</h3><a class="text-link" href="/?view=logs">Журналы {icon('ArrowUpRight')}</a></div>{services}</section><section class="surface"><div class="section-heading"><h3>Подключение</h3><a class="text-link" href="/?view=endpoint">Настройки {icon('ArrowUpRight')}</a></div><dl><dt>Исходящий маршрут</dt><dd id="stat-route">{html.escape(stats['route'])}</dd><dt>Транспорты</dt><dd>HTTP/2 {"· QUIC" if quic_enabled() else ""}</dd><dt>Сертификат</dt><dd>{cert_mode()}</dd><dt>Панель</dt><dd>{ADMIN_VERSION}</dd></dl></section></div>'''
 
 
 def logs_console():
@@ -1203,11 +1479,20 @@ def logs_console():
 
 
 def security_console():
-    status = admin_form('security-status', '<button class="primary">Проверить безопасность</button>', view='security')
-    jail = admin_form('security-fail2ban', '<label>Попыток<input name="retry" type="number" min="1" max="100" value="5"></label><label>Окно, с<input name="findtime" type="number" min="60" max="86400" value="600"></label><label>Бан, с<input name="bantime" type="number" min="60" max="604800" value="3600"></label><button>Применить</button>', view='security', confirm='Изменить параметры защиты SSH?')
-    bans = ''.join(admin_form('security-' + action, '<label>IP-адрес<input name="ip" required></label><button>' + title + '</button>', view='security', confirm='Изменить блокировку IP в SSH jail?') for action, title in [('ban', 'Забанить'), ('unban', 'Разбанить')])
-    ports = ''.join(admin_form('security-' + action, '<label>Порт<input type="number" name="port" min="1" max="65535" required></label><label>Протокол<select name="proto"><option>tcp</option><option>udp</option></select></label><button>' + title + '</button>', view='security', confirm='Изменить правило UFW?') for action, title in [('open', 'Разрешить'), ('close', 'Удалить разрешение')])
-    return f'<div class="page-head"><h2>Безопасность сервера</h2>{status}</div><section class="surface"><h3>Защита SSH · fail2ban</h3>{jail}<div>{bans}</div></section><section class="surface"><h3>Сетевой экран · UFW</h3><p class="warning">Порты SSH, TrustTunnel и панели защищены от удаления разрешения. Удаление разрешения не блокирует порт, если его разрешает другое правило.</p>{ports}</section>'
+    checks = security_snapshot()['checks']
+    tiles = ''.join(f'<article class="security-check {c["state"]}"><span class="check-dot"></span><div><h3>{html.escape(c["title"])}</h3><p>{html.escape(c["detail"])}</p></div></article>' for c in checks)
+    status = admin_form('security-status', '<button>' + icon('ShieldCheck') + '<span>Полный отчёт</span></button>', view='security')
+    settings = jail_settings()
+    jail = admin_form('security-fail2ban', f'''<label>Попыток<input name="retry" type="number" min="1" max="100" value="{settings['maxretry']}" required></label><label>Окно, секунд<input name="findtime" type="number" min="60" max="86400" value="{settings['findtime']}" required></label><label>Бан, секунд<input name="bantime" type="number" min="60" max="604800" value="{settings['bantime']}" required></label><button>Применить</button>''', view='security', confirm='Применить указанные параметры SSH jail?')
+    bans = admin_form('security-ban', '<label>IP-адрес<input name="ip" placeholder="203.0.113.10" required></label><button class="danger">Заблокировать</button>', view='security', confirm='Заблокировать IP для доступа по SSH?') + admin_form('security-unban', '<label>IP-адрес<input name="ip" required></label><button>Разблокировать</button>', view='security')
+    trusted = admin_form('security-ignore-list', '<button>Текущие исключения</button>', view='security')
+    trusted += ''.join(admin_form('security-ignore-' + action, '<label>IP или подсеть<input name="ip" placeholder="203.0.113.10/32" required></label><button>' + title + '</button>', view='security', confirm='Изменить постоянные исключения SSH jail?') for action, title in [('add', 'Добавить исключение'), ('remove', 'Удалить исключение')])
+    ports = ''.join(admin_form('security-' + action, '<label>Порт<input type="number" name="port" min="1" max="65535" required></label><label>Протокол<select name="proto"><option>tcp</option><option>udp</option></select></label><label>Источник IP / CIDR<input name="source" placeholder="Пусто: любой IP"></label><button>' + title + '</button>', view='security', confirm='Изменить указанное правило UFW?') for action, title in [('open', 'Разрешить'), ('close', 'Удалить разрешение')])
+    inspect = admin_form('security-listeners', '<button>' + icon('Globe') + 'Открытые сокеты</button>', view='security') + admin_form('security-logins', '<button>' + icon('Logs') + 'Журнал SSH</button>', view='security')
+    return f'''<div class="page-head"><div><span class="eyebrow">ЗАЩИТА И ДОСТУП</span><h2>Безопасность</h2><p>Текущее состояние сервера и контроль входящих подключений.</p></div>{status}</div><div class="security-grid">{tiles}</div><div class="inline-actions">{inspect}</div>
+<section class="surface"><h3>Блокировки SSH</h3>{bans}<details><summary>Параметры fail2ban</summary><p class="muted">Значения ниже будут применены после подтверждения. Текущие настройки доступны в полном отчёте.</p>{jail}</details></section>
+<section class="surface"><h3>Доверенные IP для SSH</h3><p class="muted">Исключения из блокировок fail2ban для SSH. Правила сетевого экрана остаются отдельными.</p>{trusted}</section>
+<section class="surface"><h3>Сетевой экран</h3><p class="muted">Источник ограничивает одно правило. Уже существующее разрешение для всех IP продолжит действовать. Порты SSH, VPN и панели защищены от удаления.</p>{ports}</section>'''
 
 
 def routing_console():
@@ -1234,63 +1519,169 @@ def dns_console():
     return f'<div class="page-head"><h2>DNS и настройки клиента</h2></div><section class="surface"><h3>DNS-серверы клиентов</h3>{save}<div>{check}{apply}</div><p class="muted">Сохранение не меняет текущие профили. IP DNS проверяется запросом с VPS; для DoH/DoT/DoQ проверяется разрешение имени сервера.</p></section><details class="surface"><summary>TLS и AntiDPI</summary>{advanced}</details>'
 
 
-PANEL_STYLE += r'''
-*{letter-spacing:0} :root{--nav:#fff;--nav-hover:#f1f5f9;--nav-active:#e8f3ff;--ink:#20252b;--accent:#1677ff;--canvas:#f5f5f5;--line:#e8e8e8}
-.sidebar{border-right:1px solid var(--line);color:var(--ink)}.brand{color:var(--ink);border-color:var(--line);display:block}.brand:before{display:none}.brand small{color:var(--muted)}.nav-item{color:#4b5563}.nav-item:hover{color:var(--accent)}.nav-item.active{color:var(--accent);box-shadow:none}.nav-label{color:#8b929c}.topbar{position:static}.endpoint-context:before{display:none}.content{max-width:1600px}.surface{border:0;border-radius:0;background:transparent;padding:20px 0;border-top:1px solid var(--line)}.surface .surface{border:0}.table-wrap{background:var(--surface);border:1px solid var(--line);border-radius:6px}th{font-size:12px;text-transform:none;background:#fafafa}table{min-width:0}td,th{padding:12px}th:first-child{width:74px}.table-toolbar,.pagination{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:16px 0}.pagination{justify-content:flex-end}.table-actions{display:table-cell;text-align:right}.toggle{padding:2px;width:36px;min-height:20px;height:20px;border:0;border-radius:10px;background:#c7cbd1;display:flex;justify-content:flex-start}.toggle span{width:16px;height:16px;background:white;border-radius:50%}.toggle.active{background:var(--accent);justify-content:flex-end}.share-qr{display:block;width:180px;height:180px;margin:16px 0}.copy-row input{min-width:0;width:100%}.drawer-card input,.drawer-card textarea{max-width:100%;width:100%}.drawer-card form{display:flex;align-items:end}.drawer-card label{min-width:0;flex:1}.drawer-card{overscroll-behavior:contain}.drawer-section{display:flow-root}.drawer-head button{font-size:24px;line-height:1;width:36px;padding:0}.overview-metrics{grid-template-columns:repeat(4,minmax(0,1fr))}.overview-columns{display:grid;grid-template-columns:1fr 1fr;gap:28px}.metric{box-shadow:0 1px 2px #00000005}.metric strong{font-size:17px}.resource-bars{display:flex;gap:24px}.resource-bars label{flex:1}meter{width:100%;height:8px}.chart-legend{display:flex;flex-wrap:wrap;gap:16px;font-size:12px;color:var(--muted)}.rx{color:#1677ff}.tx{color:#21a366}#traffic-chart{width:100%;height:150px;display:block}dl{display:grid;grid-template-columns:1fr 1fr;gap:10px}dd{margin:0;overflow-wrap:anywhere}.notice{overflow-wrap:anywhere}.text-link{color:var(--accent)}input,select{max-width:100%;min-width:0}input[type=checkbox]{min-height:0}button:disabled{opacity:.55;cursor:wait}.endpoint-context{flex-wrap:wrap}h2{font-size:24px}.theme-toggle{width:36px;padding:0;font-size:20px}.header-actions{display:flex;gap:8px;align-items:center}
-html[data-theme=dark]{--ink:#e4e7ec;--muted:#a0a7b2;--canvas:#141414;--surface:#1f1f1f;--line:#343434;--nav:#1f1f1f;--nav-hover:#292929;--nav-active:#112c48}html[data-theme=dark] input,html[data-theme=dark] select,html[data-theme=dark] textarea,html[data-theme=dark] button,html[data-theme=dark] .button,html[data-theme=dark] .metric{background:var(--surface);color:var(--ink);border-color:#414141}html[data-theme=dark] .drawer-card,html[data-theme=dark] .command-box{background:var(--surface)}html[data-theme=dark] th{background:#252525}html[data-theme=dark] .nav-item{color:#b6bdc7}html[data-theme=dark] .primary{background:#1668dc}html[data-theme=dark] .nav-item.active{color:#69b1ff}html[data-theme=dark] tr:hover td{background:#242424}html[data-theme=dark] .toggle.active{background:#1668dc}html[data-theme=dark] .command-item:hover{background:#292929}
-@media(max-width:900px){.overview-metrics{grid-template-columns:repeat(2,minmax(0,1fr))}.sidebar{border-bottom:1px solid var(--line)}.overview-columns{grid-template-columns:1fr}.endpoint-context span{display:none}}@media(max-width:560px){.content{padding:16px 12px}.overview-metrics{grid-template-columns:1fr 1fr}.metric strong{font-size:14px}.metric{padding:10px}.table-wrap{overflow-x:auto}.table-wrap table{min-width:600px}.page-head h2{font-size:22px}.topbar{padding:0 12px}.page-head>button{margin-top:12px}.resource-bars{gap:12px}}
-'''
 
 CONSOLE_SCRIPT = r'''
 (() => {
-  let theme = 'light'; try { theme = localStorage.getItem('tt-theme') || theme; } catch (_) {}
-  document.documentElement.dataset.theme = theme;
-  document.getElementById('theme-toggle').onclick = () => { const value = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'; document.documentElement.dataset.theme = value; try { localStorage.setItem('tt-theme', value); } catch (_) {} };
-  document.querySelectorAll('[data-reveal]').forEach(b => b.onclick = () => { const input = document.getElementById(b.dataset.reveal); input.type = input.type === 'password' ? 'text' : 'password'; });
-  document.querySelectorAll('[data-drawer]').forEach(b => b.addEventListener('click', () => { document.getElementById(b.dataset.drawer).querySelector('button,input')?.focus(); }));
-  document.addEventListener('keydown', e => { if(e.key !== 'Tab') return; const d = document.querySelector('.drawer.open'); if(!d) return; const items = [...d.querySelectorAll('button,input:not([type=hidden]),textarea,a[href],select')]; const first = items[0], last = items.at(-1); if(e.shiftKey && document.activeElement === first) {e.preventDefault();last.focus();} else if(!e.shiftKey && document.activeElement === last) {e.preventDefault();first.focus();} });
-  document.querySelectorAll('form').forEach(f => f.addEventListener('submit', e => {if(e.defaultPrevented) return; setTimeout(() => f.querySelectorAll('button').forEach(b => b.disabled = true), 0);}));
-  const rows = [...document.querySelectorAll('[data-client-row]')]; let page = 0;
-  const search = document.getElementById('client-search'), state = document.getElementById('client-state'), size = document.getElementById('page-size');
-  function filter() { if(!state) return; const matches = rows.filter(r => r.dataset.client.includes(search.value.toLowerCase()) && (state.value === 'all' || r.dataset.state === state.value)); const pages = Math.max(1, Math.ceil(matches.length / +size.value)); page = Math.min(page,pages-1); rows.forEach(r => r.hidden = true); matches.slice(page*+size.value,(page+1)*+size.value).forEach(r => r.hidden=false); document.getElementById('page-label').textContent = `${page+1} / ${pages}`; document.getElementById('client-count').textContent = `Найдено: ${matches.length}`; document.getElementById('page-prev').disabled = page===0; document.getElementById('page-next').disabled = page===pages-1; }
-  if(state) { [search,state,size].forEach(x => x.addEventListener('input', () => {page=0;filter();})); document.getElementById('page-prev').onclick=()=>{page--;filter();};document.getElementById('page-next').onclick=()=>{page++;filter();}; filter(); }
-  const canvas = document.getElementById('traffic-chart'); if(!canvas) return;
-  let previous=null, history=[];
-  const bytes = value => {const units=['B','KiB','MiB','GiB','TiB'];let n=0;while(value>=1024 && n<4){value/=1024;n++;}return value.toFixed(1)+' '+units[n];};
-  function draw() { const w=canvas.clientWidth, h=150, ratio=devicePixelRatio||1;canvas.width=w*ratio;canvas.height=h*ratio;const c=canvas.getContext('2d');c.scale(ratio,ratio);c.clearRect(0,0,w,h);c.strokeStyle='#88888830';for(let y=0;y<h;y+=30){c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();}const max=Math.max(1024,...history.flat()); ['#1677ff','#21a366'].forEach((color,k)=>{c.strokeStyle=color;c.lineWidth=2;c.beginPath();history.forEach((v,i)=>{let x=i/59*w,y=h-8-v[k]/max*(h-16);i?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();}); }
-  async function poll() { try { const response=await fetch('/api/monitor',{cache:'no-store'}); if(!response.ok) throw Error(response.status); const data=await response.json(); for(const key of ['cpu','memory','disk','uptime','route']) document.getElementById('stat-'+key).textContent=data[key];document.getElementById('ram-meter').value=data.memory_percent;document.getElementById('disk-meter').value=data.disk_percent;for(const [name,value] of Object.entries(data.services)){const cell=document.getElementById('service-'+name);cell.textContent=value;}const status=document.getElementById('monitor-status');status.textContent='Обновлено '+new Date().toLocaleTimeString();status.className='badge active';document.getElementById('interface-totals').textContent=Object.entries(data.interfaces).map(([name,v])=>`${name}: принято ${bytes(v.rx)}, отправлено ${bytes(v.tx)}`).join(' · ');if(previous){const dt=data.time-previous.time;if(dt>0){let rx=0,tx=0;for(const [name,v] of Object.entries(data.interfaces)){const old=previous.interfaces[name];if(old){rx+=Math.max(0,v.rx-old.rx)/dt;tx+=Math.max(0,v.tx-old.tx)/dt;}}history.push([rx,tx]);history=history.slice(-60);document.getElementById('network-rate').textContent=`↓ ${bytes(rx)}/с   ↑ ${bytes(tx)}/с`;draw();}}previous=data;} catch(e) {const s=document.getElementById('monitor-status');s.textContent='Нет связи с панелью';s.className='badge failed';} finally {setTimeout(poll,5000);} }
-  window.addEventListener('resize',draw);poll();
+  const $ = id => document.getElementById(id);
+  const store = {get(k, fallback) {try{return localStorage.getItem(k)||fallback;}catch(_){return fallback;}},set(k,v){try{localStorage.setItem(k,v);}catch(_){}}};
+  $('theme-toggle').onclick=()=>{const t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;store.set('tt-theme',t);};
+  const nav=$('mobile-nav'), menu=$('mobile-menu');
+  function closeNav(){document.body.classList.remove('nav-open');menu.setAttribute('aria-expanded','false');}
+  function openNav(){document.body.classList.add('nav-open');menu.setAttribute('aria-expanded','true');document.querySelector('.sidebar .nav-item.active')?.focus();}
+  menu.onclick=()=>document.body.classList.contains('nav-open')?closeNav():openNav();
+  $('nav-backdrop').onclick=closeNav;
+  document.querySelectorAll('[data-nav-open]').forEach(b=>b.onclick=openNav);
+  let returnFocus=null;
+  function closeDrawers(){document.querySelectorAll('.drawer.open').forEach(d=>d.classList.remove('open'));document.body.classList.remove('dialog-open');returnFocus?.focus();}
+  function openDrawer(id,button){closeDrawers();const d=$(id);if(!d)return;returnFocus=button;d.classList.add('open');document.body.classList.add('dialog-open');d.querySelector('button,input:not([type=hidden])')?.focus();}
+  document.querySelectorAll('[data-drawer]').forEach(b=>b.onclick=()=>openDrawer(b.dataset.drawer,b));
+  document.querySelectorAll('[data-drawer-close]').forEach(b=>b.onclick=closeDrawers);
+  document.querySelectorAll('.drawer').forEach(d=>d.onclick=e=>{if(e.target===d)closeDrawers();});
+  const command=$('command-layer');
+  const closeCommand=()=>{command.classList.remove('open');document.body.classList.remove('dialog-open');};
+  const openCommand=()=>{command.classList.add('open');document.body.classList.add('dialog-open');$('command-search').focus();};
+  document.querySelectorAll('[data-command-open]').forEach(b=>b.onclick=openCommand);
+  command.onclick=e=>{if(e.target===command)closeCommand();};
+  $('command-search').oninput=e=>document.querySelectorAll('.command-item').forEach(x=>x.hidden=!x.textContent.toLowerCase().includes(e.target.value.toLowerCase()));
+  document.addEventListener('keydown',e=>{
+    if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openCommand();}
+    if(e.key==='Escape'){closeNav();closeCommand();closeDrawers();}
+    if(e.key!=='Tab')return;
+    const scope=document.querySelector('.drawer.open,.command-layer.open')||(document.body.classList.contains('nav-open')?document.querySelector('.sidebar'):null);
+    if(!scope)return;
+    const items=[...scope.querySelectorAll('button:not(:disabled),input:not([type=hidden]),textarea,a[href],select')].filter(x=>x.getClientRects().length);
+    const first=items[0],last=items.at(-1);if(!first)return;
+    if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus();}
+    else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus();}
+  });
+  document.addEventListener('click',async e=>{
+    const b=e.target.closest('[data-copy],[data-reveal]');if(!b)return;
+    const input=$(b.dataset.copy||b.dataset.reveal);if(!input)return;
+    if(b.dataset.reveal){input.type=input.type==='password'?'text':'password';return;}
+    try{await navigator.clipboard.writeText(input.value);const old=b.innerHTML;b.textContent='Скопировано';setTimeout(()=>b.innerHTML=old,1500);}
+    catch(_){input.focus();input.select();showResult('Копирование','Автоматическое копирование недоступно. Текст выделен.',false);}
+  });
+  document.querySelectorAll('[data-load-link]').forEach(b=>b.onclick=async()=>{
+    b.disabled=true;const target=$('link-result-'+b.dataset.linkIndex);target.textContent='Подготовка ссылки…';
+    try{
+      const r=await fetch('/api/client-link?username='+encodeURIComponent(b.dataset.loadLink),{cache:'no-store'});
+      if(!r.ok)throw Error('Не удалось получить ссылку ('+r.status+')');
+      const data=await r.json();if(!data.link)throw Error('Endpoint не вернул ссылку.');
+      const label=document.createElement('label');label.textContent='Ссылка подключения';
+      const text=document.createElement('textarea');text.readOnly=true;text.value=data.link;text.id='lazy-link-'+b.dataset.linkIndex;label.append(text);
+      const copy=document.createElement('button');copy.type='button';copy.dataset.copy=text.id;copy.textContent='Копировать ссылку';
+      const img=document.createElement('img');img.className='share-qr';img.alt='QR подключения';img.src='/qr-link/'+encodeURIComponent(b.dataset.loadLink)+'.png';img.onerror=()=>{img.remove();};
+      target.replaceChildren(label,copy,img);b.hidden=true;
+    }catch(e){target.textContent=e.message;}finally{b.disabled=false;}
+  });
+  const result=$('operation-result');let shouldRefresh=false;
+  function showResult(title,output,refresh=false){$('result-title').textContent=title;$('result-output').textContent=output;shouldRefresh=refresh;if(!result.open)result.showModal();}
+  result.addEventListener('close',()=>{if(shouldRefresh)location.reload();});
+  $('result-close').onclick=()=>result.close();
+  document.querySelectorAll('form').forEach(f=>f.addEventListener('submit',async e=>{
+    if(f.dataset.confirm&&!confirm(f.dataset.confirm)){e.preventDefault();return;}
+    const shared=new URL(f.getAttribute('action'),location.href).pathname==='/manage';
+    if(!shared){document.body.classList.add('busy');$('busy-message').textContent='Операция выполняется. Дождитесь результата.';return;}
+    e.preventDefault();const data=new URLSearchParams(new FormData(f));
+    if(e.submitter?.name)data.set(e.submitter.name,e.submitter.value);
+    const buttons=[...f.querySelectorAll('button')];buttons.forEach(b=>b.disabled=true);f.setAttribute('aria-busy','true');
+    document.body.classList.add('busy');$('busy-message').textContent='Операция выполняется…';
+    try{
+      const response=await fetch('/manage',{method:'POST',headers:{'Accept':'application/json','Content-Type':'application/x-www-form-urlencoded'},body:data});
+      if(!response.ok&&response.headers.get('Content-Type')?.includes('text/html'))throw Error(response.status===403?'Сессия обновлена. Перезагрузите страницу.':'Ошибка HTTP '+response.status);
+      const answer=await response.json();showResult(answer.ok?'Готово':'Операция не выполнена',answer.output,answer.ok&&answer.refresh);
+    }catch(error){showResult('Не удалось получить результат',error.message+' Если связь прервалась после запуска, проверьте состояние перед повтором.');}
+    finally{document.body.classList.remove('busy');buttons.forEach(b=>b.disabled=false);f.removeAttribute('aria-busy');}
+  }));
+  window.addEventListener('pageshow',()=>document.body.classList.remove('busy'));
+  const rows=[...document.querySelectorAll('[data-client-row]')];let page=0;
+  const search=$('client-search'),state=$('client-state'),size=$('page-size');
+  function filter(){
+    if(!state)return;
+    const matches=rows.filter(r=>r.dataset.client.includes(search.value.toLowerCase())&&(state.value==='all'||r.dataset.state===state.value));
+    const pages=Math.max(1,Math.ceil(matches.length/+size.value));page=Math.min(page,pages-1);
+    rows.forEach(r=>r.hidden=true);matches.slice(page*+size.value,(page+1)*+size.value).forEach(r=>r.hidden=false);
+    $('page-label').textContent=`${page+1} / ${pages}`;$('client-count').textContent=`Найдено: ${matches.length}`;$('page-prev').disabled=page===0;$('page-next').disabled=page===pages-1;
+  }
+  if(state){[search,state,size].forEach(x=>x.addEventListener('input',()=>{page=0;filter();}));$('page-prev').onclick=()=>{page--;filter();};$('page-next').onclick=()=>{page++;filter();};filter();}
+  const canvas=$('traffic-chart');if(!canvas)return;
+  const interval=$('refresh-interval'),interfaces=$('interface-select'),status=$('monitor-status');
+  interval.value=['0','10','30'].includes(store.get('tt-refresh','10'))?store.get('tt-refresh','10'):'10';
+  let previous=null,history=[],timer=null,running=false,failures=0;
+  const bytes=v=>{let n=0;while(v>=1024&&n<4){v/=1024;n++;}return v.toFixed(1)+' '+['Б','КиБ','МиБ','ГиБ','ТиБ'][n];};
+  function draw(){
+    const w=canvas.clientWidth,h=190,ratio=Math.min(devicePixelRatio||1,2);canvas.width=w*ratio;canvas.height=h*ratio;
+    const c=canvas.getContext('2d');c.scale(ratio,ratio);c.clearRect(0,0,w,h);c.strokeStyle=getComputedStyle(document.body).getPropertyValue('--line');c.setLineDash([3,5]);
+    for(let y=12;y<h;y+=42){c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();}c.setLineDash([]);
+    const max=Math.max(1024,...history.flat());$('chart-scale').textContent='Шкала: '+bytes(max)+'/с';
+    ['#2586db','#16937a'].forEach((color,k)=>{c.strokeStyle=color;c.lineWidth=2;c.beginPath();history.forEach((v,i)=>{const x=i/59*w,y=h-12-v[k]/max*(h-28);i?c.lineTo(x,y):c.moveTo(x,y);});c.stroke();});
+  }
+  function schedule(){clearTimeout(timer);if(!document.hidden&&+interval.value)timer=setTimeout(poll,Math.min(60000,+interval.value*1000*2**Math.min(failures,3)));}
+  async function poll(){
+    if(running||document.hidden)return;running=true;clearTimeout(timer);
+    try{
+      const response=await fetch('/api/monitor',{cache:'no-store',signal:AbortSignal.timeout(12000)});if(!response.ok)throw Error(response.status);
+      const data=await response.json();failures=0;
+      for(const key of ['cpu','memory','disk','uptime','route']){if($('stat-'+key))$('stat-'+key).textContent=data[key];}
+      $('ram-meter').value=data.memory_percent;$('disk-meter').value=data.disk_percent;
+      for(const [name,value] of Object.entries(data.services)){const cell=$('service-'+name);if(cell){cell.textContent=({active:'Работает',inactive:'Остановлен',failed:'Ошибка',activating:'Запуск'})[value]||value;cell.className='badge '+value;}}
+      const keys=Object.keys(data.interfaces);const selected=interfaces.value||store.get('tt-interface','');
+      if([...interfaces.options].map(o=>o.value).join()!==keys.join()){
+        interfaces.replaceChildren(...keys.map(key=>new Option(key,key)));interfaces.value=keys.includes(selected)?selected:(keys.find(k=>/^(en|eth)/.test(k))||keys[0]||'');
+      }
+      const name=interfaces.value,v=data.interfaces[name],old=previous?.interfaces[name],dt=previous?data.time-previous.time:0;
+      if(v&&old&&dt>0){const rx=Math.max(0,v.rx-old.rx)/dt,tx=Math.max(0,v.tx-old.tx)/dt;history.push([rx,tx]);history=history.slice(-60);$('network-rate').textContent='↓ '+bytes(rx)+'/с   ↑ '+bytes(tx)+'/с';}
+      $('interface-totals').textContent=v?'С запуска интерфейса: принято '+bytes(v.rx)+' · отправлено '+bytes(v.tx):'Нет сетевых интерфейсов';
+      status.textContent='Обновлено '+new Date(data.time*1000).toLocaleTimeString();status.className='muted';previous=data;draw();
+    }catch(e){failures++;status.textContent='Связь недоступна · повтор автоматически';status.className='error-text';}
+    finally{running=false;schedule();}
+  }
+  interval.onchange=()=>{store.set('tt-refresh',interval.value);schedule();if(interval.value==='0')status.textContent='Обновление на паузе';};
+  interfaces.onchange=()=>{store.set('tt-interface',interfaces.value);previous=null;history=[];draw();poll();};
+  $('monitor-refresh').onclick=poll;
+  document.addEventListener('visibilitychange',()=>{clearTimeout(timer);if(document.hidden){previous=null;}else if(+interval.value){poll();}});
+  window.addEventListener('resize',draw);
+  poll();
 })();
 '''
+
+
+ASSET_VERSION = hashlib.sha256((PANEL_STYLE + CONSOLE_SCRIPT).encode()).hexdigest()[:12]
 
 
 def page_shell(message='', log='', view='dashboard'):
     views = {'dashboard': overview_console, 'endpoint': endpoint_view, 'clients': clients_console, 'warp': warp_view, 'routing': routing_console, 'dns': dns_console, 'certificates': certificates_view, 'security': security_console, 'system': system_view, 'panel': panel_view, 'logs': logs_console}
     view = view if view in views else 'dashboard'
     content = views[view]()
-    notice = f'<div class="notice">{html.escape(message)}</div>' if message else ''
+    notice = f'<div class="notice" role="status">{html.escape(message)}</div>' if message else ''
     output = f'<section class="surface"><pre>{html.escape(log)}</pre></section>' if log else ''
     labels = dict(NAV_ITEMS)
-    commands = ''.join(f'<a class="command-item" href="/?view={key}">{label}<small>Открыть раздел</small></a>' for key, label in NAV_ITEMS)
-    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TrustTunnel Panel</title><style>{PANEL_STYLE}</style></head><body data-view="{view}"><div class="layout"><aside class="sidebar"><div class="brand">TrustTunnel<small>Панель управления сервером</small></div>{nav_html(view)}</aside><div class="workspace"><header class="topbar"><div class="endpoint-context"><strong>{html.escape(domain())}:{endpoint_port()}</strong><span>{html.escape(labels[view])}</span></div><button type="button" class="command-trigger" data-command-open>Команды <kbd>Ctrl K</kbd></button></header><main class="content">{notice}{content}{output}</main></div></div><div class="command-layer" id="command-layer"><div class="command-box"><input id="command-search" placeholder="Перейти к разделу" autocomplete="off"><div class="command-list">{commands}</div></div></div><script>{PANEL_SCRIPT}</script></body></html>'''
+    commands = ''.join(f'<a class="command-item" href="/?view={key}">{label}</a>' for key, label in NAV_ITEMS)
+    bottom = ''.join(f'<a href="/?view={key}" class="{"active" if key == view else ""}">{icon(symbol)}{labels[key]}</a>' for key, symbol in [('dashboard', 'Activity'), ('clients', 'Users'), ('security', 'ShieldCheck')])
+    return f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>{html.escape(labels[view])} · TrustTunnel</title><script>try{{document.documentElement.dataset.theme=localStorage.getItem('tt-theme')||'light'}}catch(_){{}}</script><link rel="stylesheet" href="/assets/{ASSET_VERSION}.css"><script defer src="/assets/{ASSET_VERSION}.js"></script></head><body data-view="{view}">
+<div class="layout"><aside class="sidebar" aria-label="Главная навигация"><a class="brand" href="/">{icon('ShieldCheck')}<span>TrustTunnel<small>Server console</small></span></a><nav>{nav_html(view)}</nav><div class="sidebar-footer"><strong>TrustTunnel Panel</strong>Версия {ADMIN_VERSION}</div></aside><div id="nav-backdrop"></div><div class="workspace"><header class="topbar"><button id="mobile-menu" class="icon-button" aria-label="Открыть меню" aria-expanded="false">{icon('Menu')}</button><div class="endpoint-context"><span>{html.escape(labels[view])}</span>{icon('ChevronRight')}<strong>{html.escape(domain())}:{endpoint_port()}</strong></div><div class="header-actions"><button type="button" class="icon-button" data-command-open title="Поиск разделов" aria-label="Поиск разделов">{icon('Search')}</button><button id="theme-toggle" class="icon-button" title="Светлая / тёмная тема" aria-label="Сменить тему">{icon('SunMoon')}</button></div></header><main class="content">{notice}{content}{output}</main></div></div>
+<nav class="mobile-nav" id="mobile-nav" aria-label="Быстрая навигация">{bottom}<button data-nav-open>{icon('Menu')}Ещё</button></nav><div class="command-layer" id="command-layer" role="dialog" aria-modal="true" aria-label="Поиск раздела"><div class="command-box"><input id="command-search" aria-label="Поиск раздела" placeholder="Найти раздел…" autocomplete="off"><div class="command-list">{commands}</div></div></div>
+<dialog id="operation-result" aria-labelledby="result-title"><h3 id="result-title"></h3><pre id="result-output"></pre><button class="primary" id="result-close">Закрыть</button></dialog><div class="busy-strip" role="status"><span id="busy-message"></span></div></body></html>'''
+
 
 def html_page(message='', log='', view='dashboard'):
     page = page_shell(message, log, view)
     page = re.sub(r'(<form\b[^>]*>)', lambda m: m[1] + f'<input type="hidden" name="_csrf" value="{CSRF_TOKEN}">', page)
-    page = page.replace('</header>', '<button id="theme-toggle" class="theme-toggle" title="Светлая / тёмная тема" aria-label="Сменить тему">◐</button></header>')
-    page = page.replace("if(document.body.dataset.view==='dashboard')setTimeout(()=>location.reload(),30000)", '')
-    page = page.replace('</body>', '<script>' + CONSOLE_SCRIPT + '</script></body>')
-    # Restore the selected TLS option instead of silently resetting it to Chrome.
     selected = html.escape(client_tls_profile(), quote=True)
     page = page.replace(f'<option value="{selected}">{selected}</option>', f'<option value="{selected}" selected>{selected}</option>')
     return page
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(20)
+
     def end_headers(self):
-        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Cache-Control', 'private, max-age=86400, immutable' if getattr(self, '_asset_response', False) else 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
         self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'same-origin')
         super().end_headers()
 
     def authenticated(self):
@@ -1298,13 +1689,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_error(503, 'Panel password is not configured')
             return False
         auth = self.headers.get('Authorization', '')
+        peer = self.client_address[0]
+        delay = login_delay(peer)
+        if delay:
+            self.send_response(429)
+            self.send_header('Retry-After', str(delay))
+            self.end_headers()
+            return False
         expected = 'Basic ' + base64.b64encode(f'{PANEL_USER}:{PANEL_PASSWORD}'.encode()).decode()
-        if secrets.compare_digest(auth, expected):
+        if secrets.compare_digest(auth.encode('utf-8'), expected.encode('utf-8')):
+            login_delay(peer, success=True)
             return True
+        if auth:
+            login_delay(peer, failed=True)
         self.send_response(401)
         self.send_header('WWW-Authenticate', 'Basic realm="TrustTunnel Panel"')
         self.end_headers()
         return False
+
+    def send_json(self, data, status=200):
+        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def send_html(self, message='', log='', view='dashboard'):
         body = html_page(message, log, view).encode('utf-8')
@@ -1336,6 +1745,31 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authenticated():
             return
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path in (f'/assets/{ASSET_VERSION}.css', f'/assets/{ASSET_VERSION}.js'):
+            self._asset_response = True
+            is_css = parsed.path.endswith('.css')
+            content = PANEL_STYLE if is_css else CONSOLE_SCRIPT
+            etag = '"' + ASSET_VERSION + ('-css' if is_css else '-js') + '"'
+            if self.headers.get('If-None-Match') == etag:
+                self.send_response(304)
+                self.send_header('ETag', etag)
+                self.end_headers()
+                return
+            body = content.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/css; charset=utf-8' if is_css else 'text/javascript; charset=utf-8')
+            self.send_header('ETag', etag)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if parsed.path == '/api/client-link':
+            username = urllib.parse.parse_qs(parsed.query).get('username', [''])[0]
+            if not client_name_valid(username) or username not in {c['username'] for c in load_clients()}:
+                self.send_json({'error': 'Клиент не найден'}, 404)
+                return
+            self.send_json({'link': deeplink(username)})
+            return
         if parsed.path == '/api/monitor':
             body = json.dumps(monitor_snapshot()).encode()
             self.send_response(200)
@@ -1396,17 +1830,34 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not secrets.compare_digest(f.get('_csrf', ''), CSRF_TOKEN):
             self.send_error(403, 'Reload page and try again'); return
         if self.path == '/manage':
+            wants_json = 'application/json' in self.headers.get('Accept', '')
+            read_only = {'monitor', 'logs', 'audit', 'security-audit', 'security-status', 'security-listeners', 'security-logins', 'security-ignore-list', 'dns-check', 'routing-check', 'client-list', 'client-link'}
             try:
                 f['_peer'] = self.client_address[0]
                 result = admin_operation(f.get('action', ''), f)
-                self.send_html('Операция выполнена.', result, f.get('view', 'clients'))
+                refresh = f.get('action') not in read_only
+                if refresh:
+                    with CACHE_LOCK: SNAPSHOT_CACHE.clear()
+                if wants_json:
+                    self.send_json({'ok': True, 'output': result, 'refresh': refresh})
+                else:
+                    self.send_html('Операция выполнена.', result, f.get('view', 'clients'))
             except (ValueError, RuntimeError, OSError) as exc:
-                self.send_html('Операция не выполнена.', str(exc), f.get('view', 'clients'))
+                if wants_json:
+                    self.send_json({'ok': False, 'output': str(exc), 'refresh': False}, 400)
+                else:
+                    self.send_html('Операция не выполнена.', str(exc), f.get('view', 'clients'))
             return
         if self.path == '/action':
             action = f.get('action', '')
-            if action == 'restart':
-                rc, out = run(['systemctl', 'restart', 'trusttunnel'], timeout=20); self.send_html('TrustTunnel restarted.', out); return
+            if action in ('restart', 'reboot'):
+                try:
+                    result = admin_operation('system-' + action, f)
+                    with CACHE_LOCK: SNAPSHOT_CACHE.clear()
+                    self.send_html('Операция выполнена.', result, 'system')
+                except (ValueError, RuntimeError, OSError) as exc:
+                    self.send_html('Операция не выполнена.', str(exc), 'system')
+                return
             if action == 'warp':
                 try: self.redirect(admin_operation('routing-switch', {'mode': 'warp'}))
                 except (ValueError, RuntimeError, OSError) as exc: self.send_html('Маршрут не изменён.', str(exc), 'warp')
@@ -1493,14 +1944,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
 
+class PanelServer(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+    request_queue_size = 32
+
+    def __init__(self, *args, **kwargs):
+        self.slots = threading.BoundedSemaphore(16)
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def main():
     bind = os.environ.get('PANEL_BIND', '127.0.0.1')
     port = int(os.environ.get('PANEL_PORT', '8088'))
-    server = http.server.ThreadingHTTPServer((bind, port), Handler)
+    server = PanelServer((bind, port), Handler)
     if PANEL_TLS:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.load_cert_chain(PANEL_CERT, PANEL_KEY)
-        server.socket = context.wrap_socket(server.socket, server_side=True)
+        # Complete TLS in a bounded worker, under the connection timeout.
+        server.socket = context.wrap_socket(server.socket, server_side=True, do_handshake_on_connect=False)
     server.serve_forever()
 
 

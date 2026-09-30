@@ -2193,7 +2193,11 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q '^def admin_operation(' "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.09.30'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.09.30'" /usr/local/lib/trusttunnel/admin.py; then
+    ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
+    return
+  fi
   local candidate
   candidate="$(mktemp)"
   if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
@@ -2270,6 +2274,15 @@ manage_admin() {
     echo "14) Сохранить DNS для будущих профилей"
     echo "15) Проверить DNS с сервера"
     echo "16) Применить DNS к TOML"
+    echo "17) Сводка безопасности сервера"
+    echo "18) Слушающие порты и процессы"
+    echo "19) Журнал входов SSH"
+    echo "20) Доверенные IP (исключения fail2ban SSH)"
+    echo "21) Добавить доверенный IP / CIDR"
+    echo "22) Удалить доверенный IP / CIDR"
+    echo "23) Перезапустить TrustTunnel"
+    echo "24) Перезагрузить VPS через 60 секунд"
+    echo "25) Отменить запланированную перезагрузку"
     echo "0) Назад"
     prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
@@ -2287,7 +2300,8 @@ manage_admin() {
       8|9)
         prompt_value "Порт: "; value="$REPLY_VALUE"
         prompt_value "Протокол [tcp]: "; second="${REPLY_VALUE:-tcp}"
-        if [ "$choice" = 8 ]; then admin_call security-open "port=$value" "proto=$second"; else admin_call security-close "port=$value" "proto=$second"; fi ;;
+        prompt_value "Источник IP / CIDR (пусто = любой): "; third="$REPLY_VALUE"
+        if [ "$choice" = 8 ]; then admin_call security-open "port=$value" "proto=$second" "source=$third"; else admin_call security-close "port=$value" "proto=$second" "source=$third"; fi ;;
       10)
         prompt_value "Режим (direct / warp / socks5): "; value="$REPLY_VALUE"; second=""
         if [ "$value" = socks5 ]; then prompt_value "SOCKS5 host:port: "; second="$REPLY_VALUE"; fi
@@ -2305,7 +2319,17 @@ manage_admin() {
       14) prompt_value "DNS через запятую: "; admin_call dns-save "dns=$REPLY_VALUE" ;;
       15) admin_call dns-check ;;
       16) confirm_action "Клиентские TOML будут пересобраны."; admin_call dns-apply ;;
-      *) echo "Выберите 0–16." ;;
+      17) admin_call security-audit ;;
+      18) admin_call security-listeners ;;
+      19) admin_call security-logins ;;
+      20) admin_call security-ignore-list ;;
+      21|22)
+        prompt_value "IP / CIDR: "; value="$REPLY_VALUE"
+        if [ "$choice" = 21 ]; then admin_call security-ignore-add "ip=$value"; else admin_call security-ignore-remove "ip=$value"; fi ;;
+      23) confirm_action "TrustTunnel будет перезапущен, VPN кратковременно отключится."; admin_call system-restart ;;
+      24) prompt_value "Перезагрузка отключит VPN, SSH и панель. Введите REBOOT: "; admin_call system-reboot "confirm=$REPLY_VALUE" ;;
+      25) admin_call system-reboot-cancel ;;
+      *) echo "Выберите 0–25." ;;
     esac
   done
 }

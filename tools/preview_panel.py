@@ -8,8 +8,11 @@ panel.quic_enabled = lambda: True
 panel.cert_mode = lambda: 'letsencrypt'
 panel.endpoint_version = lambda: 'TrustTunnel test fixture'
 panel.client_tls_profile = lambda: 'chrome'
+panel.jail_settings = lambda: {'maxretry':'5','findtime':'600','bantime':'3600'}
 panel.forwarder_label = lambda: 'WARP/SOCKS'
 panel.client_inventory = lambda: [dict(username=f'client{i:02}', password='synthetic-password', enabled=i % 3 != 0, note='Тестовый профиль') for i in range(1, 28)]
+panel.load_clients = lambda: [c for c in panel.client_inventory() if c['enabled']]
+panel.security_snapshot = lambda: dict(checks=[dict(title=title, state=state, detail=detail) for title,state,detail in [('Сетевой экран','ok','Status: active'),('Защита SSH','ok','SSH jail работает'),('Вход по SSH','warn','Пароль: yes; root: yes. Базовые настройки без учёта Match-блоков.'),('Доступ к панели','ok','Публичный HTTPS'),('Приватные файлы','ok','Файлы учётных данных и ключа доступны только владельцу'),('Сертификат VPN','ok','Действителен ещё 58 дней'),('Перезагрузка ОС','ok','Не требуется')]])
 panel.deeplink = lambda name: 'tt://synthetic-preview-' + name
 panel.panel_settings = lambda: {'DNS_UPSTREAMS': '1.1.1.1', 'CLIENT_ANTI_DPI': '0', 'TLS_PROFILE': 'chrome', 'POST_QUANTUM': '0'}
 panel.rules_text = lambda: '[[rule]]\ncidr="192.0.2.0/24"\naction="deny"\n'
@@ -18,7 +21,10 @@ panel.monitor_snapshot = lambda: dict(cpu='load: 0.11 / 0.22 / 0.18', memory='51
 
 class Preview(panel.Handler):
     def authenticated(self): return True
-    def do_POST(self): self.send_error(405)
+    def do_POST(self):
+        if self.path == '/manage':
+            self.send_json({'ok':True,'output':'Тестовый отчёт: изменений на сервере нет.','refresh':False})
+        else: self.send_error(405)
     def log_message(self, *args): pass
     def do_GET(self):
         if self.path.startswith('/qr-link/'):
