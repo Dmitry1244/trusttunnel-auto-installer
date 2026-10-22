@@ -11,7 +11,9 @@ import urllib.request
 from pathlib import Path
 
 env = dict(line.split('=',1) for line in Path('/etc/trusttunnel-panel.env').read_text().splitlines() if '=' in line and not line.startswith('#'))
-base = ('https' if env.get('PANEL_TLS')=='1' else 'http') + '://127.0.0.1:' + env.get('PANEL_PORT','8088')
+import os
+env['PANEL_PORT'] = os.environ.get('TT_PANEL_TEST_PORT', env.get('PANEL_PORT','8088'))
+base = ('https' if env.get('PANEL_TLS')=='1' else 'http') + '://127.0.0.1:' + env['PANEL_PORT']
 auth = 'Basic ' + base64.b64encode((env['PANEL_USER']+':'+env['PANEL_PASSWORD']).encode()).decode()
 context = ssl._create_unverified_context()
 
@@ -32,7 +34,7 @@ for attempt in range(20):
 
 for view in ('dashboard','clients','endpoint','warp','routing','dns','security','system','certificates','panel','logs'):
     page=request('/?view='+view)
-    assert '<script>' in page and 'id="theme-toggle"' in page, view
+    assert '<script nonce=' in page and 'id="theme-toggle"' in page, view
     assert 'name="_csrf"' in page or view=='dashboard', view
     print(view+': HTTP OK')
 page=request('/?view=clients')
@@ -68,6 +70,30 @@ except urllib.error.HTTPError as exc:
     assert not json.loads(exc.read())['ok']
 else: raise AssertionError('Reboot confirmation was bypassed')
 print('Private asset caching, asynchronous read action and reboot confirmation: PASS')
+
+for target in ('/api/client-link?username=missing', '/client/../../etc/shadow/http2.toml', '/etc/trusttunnel-panel.env', '/qr-link/missing.png', '/api/clients-metrics'):
+    try: request(target, authenticated=False)
+    except urllib.error.HTTPError as exc: assert exc.code == 401
+    else: raise AssertionError('Unauthenticated private endpoint')
+req = urllib.request.Request(base + '/?view=clients&msg=' + urllib.parse.quote('<script>alert(1)</script>'), headers={'Authorization': auth})
+with urllib.request.urlopen(req, context=context) as response:
+    policy = response.headers['Content-Security-Policy']
+    body = response.read().decode()
+    assert "'unsafe-inline'" not in policy and "frame-ancestors 'none'" in policy
+    nonce = re.search(r'<script nonce="([^"]+)"', body)[1]
+    assert "'nonce-" + nonce + "'" in policy
+    assert '<script>alert(1)</script>' not in body
+for action, values in [('certificate-switch', {'cert_mode':'self-signed'}), ('client-add', {'username':'../../root'}), ('dns-save', {'dns':'https://resolver.test/\nBAD=value'}), ('logs', {'unit':'trusttunnel;id'}), ('system-reboot', {'confirm':'no'})]:
+    payload = {'action': action, '_csrf': token, **values}
+    req = urllib.request.Request(base + '/manage', headers={'Authorization':auth, 'Accept':'application/json'}, data=urllib.parse.urlencode(payload).encode())
+    try: urllib.request.urlopen(req, context=context)
+    except urllib.error.HTTPError as exc: assert exc.code == 400
+    else: raise AssertionError('Invalid mutation accepted: ' + action)
+req = urllib.request.Request(base + '/manage', headers={'Authorization':auth, 'Origin':'https://untrusted.example'}, data=urllib.parse.urlencode({'action':'monitor', '_csrf':token}).encode())
+try: urllib.request.urlopen(req, context=context)
+except urllib.error.HTTPError as exc: assert exc.code == 403
+else: raise AssertionError('Cross-origin request accepted')
+print('Private endpoints, CSP nonce, XSS escaping, injection guards and cross-origin rejection: PASS')
 
 if env.get('PANEL_TLS') == '1':
     # An idle TCP peer must not block the HTTPS listener's accept loop.

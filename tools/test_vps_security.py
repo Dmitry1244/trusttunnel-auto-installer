@@ -1,9 +1,10 @@
 """Exercise temporary firewall/jail changes on the test VPS, then undo them."""
 import configparser
 import importlib.util
+import os
 from pathlib import Path
 
-spec = importlib.util.spec_from_file_location('panel', '/tmp/trusttunnel-panel.py')
+spec = importlib.util.spec_from_file_location('panel', os.environ.get('TT_PANEL_SOURCE','/usr/local/sbin/trusttunnel-panel.py'))
 p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
 jail = Path('/etc/fail2ban/jail.d/sshd.local')
 old = jail.read_text() if jail.exists() else None
@@ -37,4 +38,5 @@ finally:
     if old is not None: p.atomic_write(jail,old)
     else: jail.unlink(missing_ok=True)
     p.checked_run(['systemctl','restart','fail2ban'])
+    p.wait_fail2ban()
     print('Original jail restored; temporary ban and firewall rule removed')

@@ -6,13 +6,14 @@ import os
 from pathlib import Path
 import secrets
 
-spec = importlib.util.spec_from_file_location('candidate', '/tmp/trusttunnel-panel.py')
+spec = importlib.util.spec_from_file_location('candidate', os.environ.get('TT_PANEL_SOURCE','/usr/local/sbin/trusttunnel-panel.py'))
 p = importlib.util.module_from_spec(spec); spec.loader.exec_module(p)
 original_clients = p.load_clients()
 original_files = [p.TT_DIR/'credentials.toml', p.TT_DIR/'clients-state.json', p.TT_DIR/'vpn.toml', p.TT_DIR/'rules.toml', p.PANEL_SETTINGS]
 saved = {file: file.read_bytes() if file.exists() else None for file in original_files}
 protected = [p.TT_DIR/'certs/cert.pem', p.TT_DIR/'certs/key.pem'] + list(p.CLIENT_DIR.glob('*.toml'))
 hashes = {file: hashlib.sha256(file.read_bytes()).hexdigest() for file in protected}
+export_snapshot={file:file.read_bytes() for file in p.CLIENT_DIR.iterdir() if file.is_file()}
 username = 'qa-' + secrets.token_hex(5)
 try:
     p.client_operation('add', {'username': username})
@@ -52,7 +53,7 @@ finally:
         else: p.atomic_write(file, data.decode())
     for protocol in ('http2','http3'):
         (p.CLIENT_DIR / f'{username}-{protocol}.toml').unlink(missing_ok=True)
-    p.write_text(p.CLIENT_DIR/'clients-credentials.txt',''.join(f"{c['username']} {c['password']}\n" for c in original_clients))
+    for file,data in export_snapshot.items():file.write_bytes(data)
     p.checked_run(['systemctl','restart','trusttunnel'])
     assert p.service_status('trusttunnel') == 'active'
     print('Original configuration restored; TrustTunnel active')

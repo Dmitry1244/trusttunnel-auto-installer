@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Интерактивный установщик TrustTunnel endpoint + WARP.
-# Целевая система: чистый Ubuntu/Debian VPS, запускать от root.
+# Ubuntu/Debian VPS, в том числе с существующими настройками. Запускать от root.
 #
 # Интерактивный запуск:
 #   bash install-trusttunnel-warp.sh
@@ -22,10 +22,12 @@ ENABLE_FAIL2BAN="${ENABLE_FAIL2BAN:-}"
 ENABLE_SYSTEM_UPGRADE="${ENABLE_SYSTEM_UPGRADE:-}"
 ACTION="${ACTION:-}"
 CONFIRM_FIREWALL_RESET="${CONFIRM_FIREWALL_RESET:-}"
+RESET_UFW="${RESET_UFW:-0}"
 PRESERVE_CLIENT_CONFIGS="${PRESERVE_CLIENT_CONFIGS:-}"
 CERT_MODE="${CERT_MODE:-}"
 FORCE_CERT_RENEW="${FORCE_CERT_RENEW:-0}"
 TT_VERSION="${TT_VERSION:-latest}"
+TT_CHANNEL="${TT_CHANNEL:-stable}"
 WGCF_VERSION="${WGCF_VERSION:-2.2.31}"
 WIREPROXY_VERSION="${WIREPROXY_VERSION:-v1.1.2}"
 PANEL_PORT="${PANEL_PORT:-8088}"
@@ -55,9 +57,9 @@ need_root() {
 prompt_value() {
   local message="$1"
   if [ -r /dev/tty ] && { true </dev/tty; } 2>/dev/null; then
-    read -r -p "$message" REPLY_VALUE </dev/tty || REPLY_VALUE=""
+    read -r -p "$message" REPLY_VALUE </dev/tty || { echo "Ввод закрыт. Для автоматического запуска задайте ACTION и все параметры явно." >&2; return 1; }
   else
-    read -r -p "$message" REPLY_VALUE || REPLY_VALUE=""
+    read -r -p "$message" REPLY_VALUE || { echo "Ввод закрыт. Для автоматического запуска задайте ACTION и все параметры явно." >&2; return 1; }
   fi
 }
 
@@ -210,6 +212,13 @@ choose_action() {
     echo "26) DNS, TLS profile, AntiDPI и post-quantum для TOML"
     echo "27) Система, диагностика и журнал"
     echo "28) Расширенное управление: безопасность, маршруты, DNS, мониторинг"
+    echo "29) WARP MASQUE: установить, проверить, включить, остановить, удалить"
+    echo "30) Обновления endpoint, метрики клиентов и HTTPS-подписки"
+    echo "31) WARP через интерфейс без SOCKS (только трафик TrustTunnel)"
+    echo "32) Все варианты WARP: управление и попытка сменить IP"
+    echo "33) Рекомендации по безопасности и настройкам"
+    echo "34) Защита от сканирования и ClientHello-фильтр"
+    echo "35) Безопасность VPS, входящий ping и расписания обслуживания"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -242,8 +251,15 @@ choose_action() {
       26) ACTION="manage-client-network"; return ;;
       27) ACTION="manage-system-tools"; return ;;
       28) ACTION="manage-admin"; return ;;
+      29) ACTION="manage-masque"; return ;;
+      30) ACTION="manage-endpoint-features"; return ;;
+      31) ACTION="manage-interface"; return ;;
+      32) ACTION="manage-warp"; return ;;
+      33) ACTION="recommendations"; return ;;
+      34) ACTION="manage-protection"; return ;;
+      35) ACTION="manage-server-security"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0-28 из меню." ;;
+      *) echo "Нужно выбрать 0-35 из меню." ;;
     esac
   done
 }
@@ -256,6 +272,7 @@ collect_config() {
   echo "=== Установка TrustTunnel + WARP ==="
   echo
   ask_required DOMAIN "Домен для TrustTunnel, например vpn.example.com: "
+  [[ "$DOMAIN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && [[ "$DOMAIN" == *.* ]] && [[ "$DOMAIN" != *..* ]] || { echo "Введите корректное доменное имя без URL и пробелов." >&2; return 1; }
   ask_default CLIENTS "Сколько клиентов создать" "21"
   ask_default ENDPOINT_PORT "Порт TrustTunnel для клиентов" "443"
   ask_yes_no CHANGE_SSH_PORT "Поменять SSH-порт сервера" "1"
@@ -285,7 +302,7 @@ collect_config() {
 
   if [ -z "$CONFIRM_FIREWALL_RESET" ]; then
     echo
-    echo "Скрипт сбросит UFW firewall и откроет только:"
+    echo "Скрипт сохранит существующие правила UFW и добавит:"
     echo "- ${SSH_PORT}/tcp для SSH"
     echo "- ${ENDPOINT_PORT}/tcp для TrustTunnel"
     if [ "$ENABLE_QUIC" = "1" ]; then
@@ -385,6 +402,7 @@ install_packages() {
     fi
   fi
   packages="ca-certificates curl tar gzip openssl ufw iproute2 python3 coreutils sed grep gawk util-linux"
+  if ! python3 -c 'import tomllib' 2>/dev/null; then packages="$packages python3-tomli"; fi
   if [ "$CERT_MODE" = "letsencrypt" ]; then
     packages="$packages certbot"
   fi
@@ -422,10 +440,12 @@ resolve_trusttunnel_version() {
   fi
 
   local latest
-  latest="$(curl -fsSL https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest \
-    | sed -nE 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' \
-    | head -1)"
-  if [ -z "$latest" ]; then
+  case "$TT_CHANNEL" in
+    stable) latest="$(curl -fsSL https://api.github.com/repos/TrustTunnel/TrustTunnel/releases/latest | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')" ;;
+    beta) latest="$(curl -fsSL 'https://api.github.com/repos/TrustTunnel/TrustTunnel/releases?per_page=20' | python3 -c 'import json,sys; print(next(r["tag_name"] for r in json.load(sys.stdin) if r["prerelease"] and not r["draft"]))')" ;;
+    *) echo "Канал обновлений: stable или beta." >&2; return 1 ;;
+  esac
+  if ! [[ "$latest" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]; then
     echo "Не удалось определить latest TrustTunnel release через GitHub API." >&2
     exit 1
   fi
@@ -435,6 +455,9 @@ resolve_trusttunnel_version() {
 download_trusttunnel() {
   local arch asset url tmp resolved_version backup_dir now
   resolved_version="$(resolve_trusttunnel_version)"
+  if ! [[ "$resolved_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][a-zA-Z0-9.-]+)?$ ]]; then
+    echo "Некорректная версия TrustTunnel." >&2; return 1
+  fi
   echo "TrustTunnel version: ${resolved_version}"
   arch="$(uname -m)"
   case "$arch" in
@@ -455,10 +478,15 @@ download_trusttunnel() {
   if [ -x "$TT_DIR/setup_wizard" ]; then
     cp "$TT_DIR/setup_wizard" "$backup_dir/setup_wizard.${now}" || true
   fi
-  curl -fL "$url" -o "$tmp/trusttunnel.tar.gz"
-  tar -xzf "$tmp/trusttunnel.tar.gz" -C "$tmp"
-  find "$tmp" -type f -name trusttunnel_endpoint -exec install -m 0755 {} "$TT_DIR/trusttunnel_endpoint" \;
-  find "$tmp" -type f -name setup_wizard -exec install -m 0755 {} "$TT_DIR/setup_wizard" \; || true
+  curl -fL "$url" -o "$tmp/trusttunnel.tar.gz" || { rm -rf "$tmp"; return 1; }
+  tar -xzf "$tmp/trusttunnel.tar.gz" -C "$tmp" || { rm -rf "$tmp"; return 1; }
+  find "$tmp" -type f -name trusttunnel_endpoint -exec install -m 0755 {} "$TT_DIR/trusttunnel_endpoint.new" \; || { rm -rf "$tmp"; return 1; }
+  if [ ! -x "$TT_DIR/trusttunnel_endpoint.new" ] || ! "$TT_DIR/trusttunnel_endpoint.new" --version; then
+    echo "Новый бинарный файл не прошёл проверку." >&2; rm -rf "$tmp"; return 1
+  fi
+  mv -f "$TT_DIR/trusttunnel_endpoint.new" "$TT_DIR/trusttunnel_endpoint"
+  find "$tmp" -type f -name setup_wizard -exec install -m 0755 {} "$TT_DIR/setup_wizard.new" \; || true
+  if [ -x "$TT_DIR/setup_wizard.new" ]; then mv -f "$TT_DIR/setup_wizard.new" "$TT_DIR/setup_wizard"; fi
   rm -rf "$tmp"
 
   if [ ! -x "$TT_DIR/trusttunnel_endpoint" ]; then
@@ -555,36 +583,15 @@ EOF
 switch_trusttunnel_forwarder() {
   local mode="$1"
   local socks_addr="${2:-$SOCKS_ADDR}"
-  local config="$TT_DIR/vpn.toml"
-  local tmp
-  if [ ! -f "$config" ]; then
-    return
+  [ -f "$TT_DIR/vpn.toml" ] || return 0
+  ensure_admin_helper || return
+  if [ "$mode" = "direct" ]; then
+    admin_call routing-switch mode=direct
+  elif [ "$socks_addr" = "$SOCKS_ADDR" ]; then
+    admin_call routing-switch mode=warp
+  else
+    admin_call routing-switch mode=socks5 "address=$socks_addr"
   fi
-
-  cp "$config" "$config.backup.$(date +%Y%m%d%H%M%S)"
-  tmp="$(mktemp)"
-  awk -v mode="$mode" -v socks_addr="$socks_addr" '
-    BEGIN { inserted = 0; skip = 0 }
-    /^\[forward_protocol\.socks5\]$/ { skip = 1; next }
-    /^\[forward_protocol\.direct\]$/ { skip = 1; next }
-    skip && /^\[/ { skip = 0 }
-    skip { next }
-    { print }
-    /^\[forward_protocol\]$/ && !inserted {
-      print ""
-      if (mode == "socks5") {
-        print "[forward_protocol.socks5]"
-        print "address = \"" socks_addr "\""
-        print "extended_auth = false"
-      } else {
-        print "[forward_protocol.direct]"
-      }
-      inserted = 1
-    }
-  ' "$config" > "$tmp"
-  cat "$tmp" > "$config"
-  rm -f "$tmp"
-  systemctl restart trusttunnel 2>/dev/null || true
 }
 
 cert_matches_domain() {
@@ -603,6 +610,64 @@ cert_is_letsencrypt() {
   openssl x509 -in "$cert_path" -noout -issuer 2>/dev/null | grep -qiE "Let's Encrypt|ISRG"
 }
 
+deploy_certificate_pair() {
+  python3 - "$TT_DIR" "$DOMAIN" "$1" "$2" <<'PY'
+import os, re, ssl, subprocess, sys, tempfile, time
+try: import tomllib
+except ImportError: import tomli as tomllib
+from pathlib import Path
+root, domain, cert, key = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), Path(sys.argv[4])
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(cert, key)
+subprocess.run(['openssl', 'x509', '-in', str(cert), '-noout', '-checkend', '0', '-checkhost', domain], check=True, stdout=subprocess.DEVNULL)
+targets = {root / 'certs/cert.pem': (cert.read_bytes(), 0o644), root / 'certs/key.pem': (key.read_bytes(), 0o600)}
+hosts = root / 'hosts.toml'
+if hosts.exists():
+    text = hosts.read_text()
+    data = tomllib.loads(text)
+    if sum(h.get('hostname') == domain for h in data.get('main_hosts', [])) != 1:
+        raise ValueError('Expected exactly one matching main host; certificate was not changed')
+    def update(match):
+        block = match.group(0)
+        if tomllib.loads(block)['main_hosts'][0].get('hostname') != domain:
+            return block
+        for field, value in (('cert_chain_path', 'certs/cert.pem'), ('private_key_path', 'certs/key.pem')):
+            block, count = re.subn(r'(?m)^' + field + r'\s*=.*$', field + ' = "' + value + '"', block)
+            if count != 1: raise ValueError('Ambiguous certificate path; no changes applied')
+        return block
+    text = re.sub(r'(?ms)^\[\[main_hosts\]\][ \t]*\n.*?(?=^\[|\Z)', update, text)
+    selected = next(h for h in tomllib.loads(text)['main_hosts'] if h['hostname'] == domain)
+    if selected.get('cert_chain_path') != 'certs/cert.pem' or selected.get('private_key_path') != 'certs/key.pem':
+        raise ValueError('Certificate references were not updated')
+    targets[hosts] = (text.encode(), 0o600)
+def atomic(path, body, mode):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(dir=path.parent, prefix='.certificate-')
+    try:
+        with os.fdopen(fd, 'wb') as output: output.write(body); output.flush(); os.fsync(output.fileno())
+        os.chmod(name, mode); os.replace(name, path)
+    finally:
+        if os.path.exists(name): os.unlink(name)
+original = {p: (p.read_bytes(), p.stat().st_mode & 0o777) if p.exists() else None for p in targets}
+has_service = hosts.exists() and subprocess.run(['systemctl', 'cat', 'trusttunnel'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+try:
+    for path, (body, mode) in targets.items(): atomic(path, body, mode)
+    if has_service:
+        subprocess.run(['systemctl', 'restart', 'trusttunnel'], check=True)
+        time.sleep(1)
+        subprocess.run(['systemctl', 'is-active', '--quiet', 'trusttunnel'], check=True)
+except Exception:
+    for path, previous in original.items():
+        if previous: atomic(path, *previous)
+        else: path.unlink(missing_ok=True)
+    if has_service: subprocess.run(['systemctl', 'restart', 'trusttunnel'])
+    raise
+if subprocess.run(['systemctl', 'is-active', '--quiet', 'trusttunnel-panel'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+    subprocess.Popen(['sh', '-c', 'sleep 3; systemctl try-restart trusttunnel-panel >/dev/null 2>&1'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print('Сертификат и ключ проверены; пути endpoint синхронизированы.')
+PY
+}
+
 write_self_signed_cert() {
   mkdir -p "$TT_DIR/certs"
   if [ "${FORCE_CERT_RENEW:-0}" != "1" ] && [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/certs/cert.pem" ] && [ -f "$TT_DIR/certs/key.pem" ]; then
@@ -611,7 +676,9 @@ write_self_signed_cert() {
       return
     fi
   fi
-  openssl ecparam -name prime256v1 -genkey -noout -out "$TT_DIR/certs/key.pem"
+  local staged
+  staged="$(mktemp -d "$TT_DIR/certs/.self-signed-XXXXXX")"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$staged/key.pem"
   cat > "$TT_DIR/certs/openssl.cnf" <<EOF
 [req]
 distinguished_name = dn
@@ -629,15 +696,16 @@ DNS.1 = ${DOMAIN}
 DNS.2 = *.${DOMAIN}
 EOF
   openssl req -x509 -new -nodes \
-    -key "$TT_DIR/certs/key.pem" \
+    -key "$staged/key.pem" \
     -sha256 -days 365 \
-    -out "$TT_DIR/certs/cert.pem" \
+    -out "$staged/cert.pem" \
     -config "$TT_DIR/certs/openssl.cnf"
-  chmod 0600 "$TT_DIR/certs/key.pem"
-  chmod 0644 "$TT_DIR/certs/cert.pem"
+  deploy_certificate_pair "$staged/cert.pem" "$staged/key.pem"
+  rm -rf -- "$staged"
 }
 
-write_letsencrypt_cert() {
+write_letsencrypt_cert() (
+  [[ "$DOMAIN" =~ ^[A-Za-z0-9.-]+$ ]] || { echo "Некорректный домен." >&2; return 1; }
   ensure_letsencrypt_packages
   local certbot_name added_ufw_rule live_dir
   mkdir -p "$TT_DIR/certs"
@@ -649,24 +717,25 @@ write_letsencrypt_cert() {
   fi
 
   added_ufw_rule=0
+  cleanup_initial_acme() { [ "$added_ufw_rule" != "1" ] || ufw --force delete allow 80/tcp >/dev/null 2>&1 || true; }
+  trap cleanup_initial_acme EXIT
+  trap 'exit 143' TERM INT
   if ufw status 2>/dev/null | grep -q "Status: active"; then
-    if ! ufw status numbered 2>/dev/null | grep -qE '(^|\s)80/tcp(\s|$)'; then
-      ufw allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null 2>&1 || true
+    if ! ufw status 2>/dev/null | awk '$1 == "80/tcp" && $2 == "ALLOW" && ($3 == "Anywhere" || ($3 == "IN" && $4 == "Anywhere")) { found=1 } END { exit !found }'; then
+      ufw insert 1 allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null
       added_ufw_rule=1
     fi
   fi
 
   certbot_name="$DOMAIN"
   if ! certbot certonly --standalone --non-interactive --agree-tos -m "$EMAIL" -d "$DOMAIN" --preferred-challenges http $([ "${FORCE_CERT_RENEW:-0}" = "1" ] && printf '%s' '--force-renewal' || printf '%s' '--keep-until-expiring') --cert-name "$certbot_name"; then
-    if [ "$added_ufw_rule" = "1" ]; then
-      ufw delete allow 80/tcp >/dev/null 2>&1 || true
-    fi
     echo "Let's Encrypt issuance failed. Check DNS for ${DOMAIN} and inbound 80/tcp reachability." >&2
     exit 1
   fi
 
   if [ "$added_ufw_rule" = "1" ]; then
-    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+    ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
+    added_ufw_rule=0
   fi
 
   live_dir="/etc/letsencrypt/live/${certbot_name}"
@@ -675,20 +744,22 @@ write_letsencrypt_cert() {
     exit 1
   fi
 
-  cp "${live_dir}/fullchain.pem" "$TT_DIR/certs/cert.pem"
-  cp "${live_dir}/privkey.pem" "$TT_DIR/certs/key.pem"
-  chmod 0600 "$TT_DIR/certs/key.pem"
-  chmod 0644 "$TT_DIR/certs/cert.pem"
-}
+  deploy_certificate_pair "${live_dir}/fullchain.pem" "${live_dir}/privkey.pem"
+)
 
 write_certificate_automation() {
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nTT_DIR=%q\nDOMAIN=%q\n' "$TT_DIR" "$DOMAIN"
+    declare -f deploy_certificate_pair
+    printf 'deploy_certificate_pair "$1/fullchain.pem" "$1/privkey.pem"\n'
+  } > /usr/local/sbin/trusttunnel-cert-deploy
+  chmod 0700 /usr/local/sbin/trusttunnel-cert-deploy
   cat > /usr/local/sbin/trusttunnel-cert-renew <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 TT_DIR="${TT_DIR}"
 CERT_MODE="${CERT_MODE}"
 DOMAIN="${DOMAIN}"
-EMAIL="${EMAIL}"
 
 if [ "\${CERT_MODE}" != "letsencrypt" ]; then
   exit 0
@@ -697,19 +768,20 @@ fi
 added_ufw_rule=0
 cleanup() {
   if [ "\${added_ufw_rule}" = "1" ]; then
-    ufw delete allow 80/tcp >/dev/null 2>&1 || true
+    ufw --force delete allow 80/tcp >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
+trap 'exit 143' TERM INT
 
 if ufw status 2>/dev/null | grep -q "Status: active"; then
-  if ! ufw status numbered 2>/dev/null | grep -qE '(^|[[:space:]])80/tcp([[:space:]]|$)'; then
-    ufw allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null 2>&1 || true
+  if ! ufw status 2>/dev/null | awk '\$1 == "80/tcp" && \$2 == "ALLOW" && (\$3 == "Anywhere" || (\$3 == "IN" && \$4 == "Anywhere")) { found=1 } END { exit !found }'; then
+    ufw insert 1 allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null
     added_ufw_rule=1
   fi
 fi
 
-certbot renew --standalone --non-interactive --deploy-hook "cp /etc/letsencrypt/live/${DOMAIN}/fullchain.pem ${TT_DIR}/certs/cert.pem && cp /etc/letsencrypt/live/${DOMAIN}/privkey.pem ${TT_DIR}/certs/key.pem && chmod 0600 ${TT_DIR}/certs/key.pem && chmod 0644 ${TT_DIR}/certs/cert.pem && systemctl restart trusttunnel"
+certbot renew --standalone --non-interactive --no-random-sleep-on-renew --cert-name "\${DOMAIN}" "\$@" --deploy-hook '/usr/local/sbin/trusttunnel-cert-deploy "\$RENEWED_LINEAGE"'
 EOF
   chmod 0755 /usr/local/sbin/trusttunnel-cert-renew
 
@@ -746,6 +818,7 @@ remove_certificate_automation() {
   rm -f /etc/systemd/system/trusttunnel-cert-renew.service
   rm -f /etc/systemd/system/trusttunnel-cert-renew.timer
   rm -f /usr/local/sbin/trusttunnel-cert-renew
+  rm -f /usr/local/sbin/trusttunnel-cert-deploy
   systemctl daemon-reload
 }
 
@@ -1113,13 +1186,23 @@ EOF
 }
 
 configure_firewall() {
-  ufw --force reset
-  ufw default deny incoming
-  ufw default allow outgoing
+  if [ "$RESET_UFW" = "1" ]; then ufw --force reset; fi
+  if ! ufw status | grep -q '^Status: active'; then
+    ufw default deny incoming
+    ufw default allow outgoing
+  fi
   ufw allow "${SSH_PORT}/tcp" comment "SSH"
   ufw allow "${ENDPOINT_PORT}/tcp" comment "TrustTunnel TCP"
   if [ "$ENABLE_QUIC" = "1" ]; then
     ufw allow "${ENDPOINT_PORT}/udp" comment "TrustTunnel QUIC"
+  fi
+  if [ -f /etc/trusttunnel-panel.env ]; then
+    local saved_panel_port saved_panel_tls
+    saved_panel_port="$(awk -F= '$1=="PANEL_PORT" {print $2}' /etc/trusttunnel-panel.env)"
+    saved_panel_tls="$(awk -F= '$1=="PANEL_TLS" {print $2}' /etc/trusttunnel-panel.env)"
+    if [ "$saved_panel_tls" = "1" ] && [[ "$saved_panel_port" =~ ^[0-9]{1,5}$ ]]; then
+      ufw allow "${saved_panel_port}/tcp" comment "TrustTunnel Panel HTTPS"
+    fi
   fi
   ufw --force enable
 }
@@ -1167,7 +1250,8 @@ configure_fail2ban() {
     return
   fi
   mkdir -p /etc/fail2ban/jail.d
-  cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+  if [ ! -f /etc/fail2ban/jail.d/sshd.local ]; then
+    cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
 port = ${SSH_PORT}
@@ -1178,6 +1262,15 @@ findtime = 10m
 bantime = 1h
 ignoreip = 127.0.0.1/8 ::1
 EOF
+  else
+    # Keep custom bans/exclusions; override only our managed enabled/port keys.
+    cat > /etc/fail2ban/jail.d/zz-trusttunnel-port.local <<EOF
+[sshd]
+enabled = true
+port = ${SSH_PORT}
+EOF
+  fi
+  fail2ban-client -t
   systemctl enable --now fail2ban
   systemctl restart fail2ban
 }
@@ -1202,12 +1295,229 @@ update_trusttunnel_only() {
     exit 1
   fi
   install_download_tools
-  systemctl stop trusttunnel 2>/dev/null || true
-  download_trusttunnel
-  systemctl daemon-reload
-  systemctl restart trusttunnel
+  local rollback
+  mkdir -p "$TT_DIR/backups"
+  rollback="$(mktemp -d "$TT_DIR/backups/update-XXXXXX")"
+  cp "$TT_DIR/trusttunnel_endpoint" "$rollback/trusttunnel_endpoint"
+  if [ -x "$TT_DIR/setup_wizard" ]; then cp "$TT_DIR/setup_wizard" "$rollback/setup_wizard"; fi
+  if ! download_trusttunnel; then
+    install -m 0755 "$rollback/trusttunnel_endpoint" "$TT_DIR/trusttunnel_endpoint.rollback"
+    mv -f "$TT_DIR/trusttunnel_endpoint.rollback" "$TT_DIR/trusttunnel_endpoint"
+    echo "Не удалось скачать обновление. Прежний endpoint продолжает работать." >&2; return 1
+  fi
+  if ! systemctl restart trusttunnel; then
+    echo "Не удалось перезапустить endpoint после обновления." >&2
+  fi
+  sleep 2
+  if ! systemctl is-active --quiet trusttunnel; then
+    install -m 0755 "$rollback/trusttunnel_endpoint" "$TT_DIR/trusttunnel_endpoint.rollback"
+    mv -f "$TT_DIR/trusttunnel_endpoint.rollback" "$TT_DIR/trusttunnel_endpoint"
+    if [ -x "$rollback/setup_wizard" ]; then install -m 0755 "$rollback/setup_wizard" "$TT_DIR/setup_wizard.rollback"; mv -f "$TT_DIR/setup_wizard.rollback" "$TT_DIR/setup_wizard"; fi
+    systemctl restart trusttunnel
+    echo "Новый endpoint не запустился. Восстановлена предыдущая версия." >&2; return 1
+  fi
   echo "TrustTunnel endpoint обновлен и перезапущен."
   trusttunnel-status 2>/dev/null || show_status
+}
+
+manage_masque() {
+  ensure_admin_helper || return
+  local choice confirm
+  while true; do
+    echo "=== WARP MASQUE (usque, локальный TCP/UDP-прокси) ==="
+    echo "Маршрут SSH не меняется. Сначала установка и проверка, затем включение."
+    echo "1) Установить / обновить MASQUE"
+    echo "2) Проверить TCP и UDP"
+    echo "3) Направить TrustTunnel через MASQUE"
+    echo "4) Перезапустить MASQUE"
+    echo "5) Остановить MASQUE (сначала смените маршрут)"
+    echo "6) Удалить MASQUE с backup аккаунта"
+    echo "7) Перерегистрировать аккаунт MASQUE"
+    echo "8) Статус MASQUE"
+    echo "9) Вернуть TrustTunnel на WARP WireGuard"
+    echo "10) Вернуть TrustTunnel на Direct"
+    echo "0) Назад"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
+    case "$choice" in
+      0) return ;;
+      1)
+        echo "usque — сторонний клиент Cloudflare WARP. Условия: https://www.cloudflare.com/application/terms/"
+        prompt_value "Принимаете условия Cloudflare? да/нет: "
+        case "$REPLY_VALUE" in да|yes|YES|y|Y) admin_call masque-install accept_tos=1 ;; *) echo "Отменено." ;; esac ;;
+      2) admin_call masque-check ;;
+      3) admin_call masque-enable ;;
+      4) admin_call masque-restart ;;
+      5) admin_call masque-stop ;;
+      6) prompt_value "Введите REMOVE: "; confirm="$REPLY_VALUE"; admin_call masque-remove "confirm=$confirm" ;;
+      7) prompt_value "Введите REREGISTER: "; confirm="$REPLY_VALUE"; admin_call masque-reregister "confirm=$confirm" ;;
+      8) admin_call masque-status ;;
+      9) admin_call routing-switch mode=warp ;;
+      10) admin_call routing-switch mode=direct ;;
+      *) echo "Выберите 0–10." ;;
+    esac
+  done
+}
+
+manage_server_security() {
+  ensure_admin_helper
+  local choice kind day clock ack confirmed=0
+  echo "1) Проверить сервер и получить рекомендации"
+  echo "2) Запретить входящий ping через UFW"
+  echo "3) Вернуть исходную политику ping"
+  echo "4) Показать расписания"
+  echo "5) Создать / изменить расписание"
+  echo "6) Отключить расписание"
+  echo "0) Назад"
+  prompt_value "Выбор [1]: "; choice="${REPLY_VALUE:-1}"
+  case "$choice" in
+    1) admin_call security-scan; return ;;
+    2|3)
+      ask_yes_no confirmed "Изменить только входящие echo-request, сохраняя необходимые ICMPv6" 0
+      [ "$confirmed" = 1 ] || return
+      local enabled=0; [ "$choice" = 2 ] || enabled=1
+      admin_call security-ping "enabled=$enabled" confirm=CONFIRMED; return ;;
+    4) admin_call schedule-status; return ;;
+    5|6) ;;
+    *) return ;;
+  esac
+  echo "Задачи: reboot (перезагрузка), packages (обновление ОС), security (проверка безопасности), releases (версии endpoint)."
+  ask_default kind "Задача" "security"
+  ask_yes_no confirmed "Изменить автоматическое обслуживание выбранной задачи" 0
+  [ "$confirmed" = 1 ] || return
+  if [ "$choice" = 6 ]; then admin_call schedule-disable "kind=$kind" confirm=CONFIRMED; return; fi
+  ask_default day "День: daily или Mon/Tue/Wed/Thu/Fri/Sat/Sun" "daily"
+  ask_default clock "Время сервера ЧЧ:ММ" "03:30"
+  ack=0
+  if [ "$kind" = packages ]; then ask_yes_no ack "Обновления ОС могут перезапускать службы. Допускаете" 0; fi
+  admin_call schedule-save "kind=$kind" "day=$day" "time=$clock" "updates_ack=$ack" confirm=CONFIRMED
+}
+
+manage_protection() {
+  ensure_admin_helper
+  local choice op ready
+  echo "=== Защита от сканирования ==="
+  echo "1) Проверить состояние и совместимость"
+  echo "2) Скрыть служебные HTTP-ответы без смены клиентских настроек"
+  echo "3) Подготовить защищённые tt-ссылки (ничего не блокировать)"
+  echo "4) Включить строгий ClientHello-фильтр: старые профили перестанут работать"
+  echo "5) Отключить строгий фильтр и вернуть прежние правила"
+  echo "6) Вернуть прежние HTTP-настройки"
+  echo "0) Назад"
+  prompt_value "Выбор [1]: "; choice="${REPLY_VALUE:-1}"
+  case "$choice" in
+    1) admin_call protection-status; return ;;
+    2) op=camouflage ;;
+    3) op=prepare ;;
+    4) op=enforce ;;
+    5) op=disable ;;
+    6) op=camouflage-restore ;;
+    *) return ;;
+  esac
+  echo "Это снижение обнаруживаемости, а не гарантия невидимости. Встроенные AntiDPI и TLS profile находятся в пункте 26."
+  ready=0
+  if [ "$op" = enforce ]; then
+    ask_yes_no ready "Все устройства уже проверены с защищёнными ссылками" 0
+    [ "$ready" = 1 ] || return
+  fi
+  local confirmed=0
+  ask_yes_no confirmed "Применить изменение защиты" 0
+  [ "$confirmed" = 1 ] || return
+  admin_call "protection-$op" confirm=CONFIRMED "clients_ready=$ready"
+}
+
+manage_warp() {
+  ensure_admin_helper || return
+  local backend choice operation
+  while true; do
+    echo "=== Вариант WARP ==="
+    echo "1) WireGuard через SOCKS"
+    echo "2) MASQUE через SOCKS"
+    echo "3) WireGuard через интерфейс без SOCKS"
+    echo "4) MASQUE через TUN без SOCKS"
+    echo "0) Назад"
+    prompt_value "Вариант [0]: "
+    case "${REPLY_VALUE:-0}" in 0) return ;; 1) backend=wg-socks ;; 2) backend=masque-socks ;; 3) backend=wg-interface ;; 4) backend=masque-interface ;; *) continue ;; esac
+    echo "1) Статус; 2) Проверить; 3) Установить / переустановить"
+    echo "4) Включить маршрут; 5) Отключить; 6) Перезапустить"
+    echo "7) Попробовать сменить IP; 8) Новая регистрация; 9) Удалить"
+    prompt_value "Действие [1]: "; choice="${REPLY_VALUE:-1}"
+    case "$choice" in 1) operation=status ;; 2) operation=check ;; 3) operation=install ;; 4) operation=enable ;; 5) operation=disable ;; 6) operation=restart ;; 7) operation=rotate ;; 8) operation=reregister ;; 9) operation=remove ;; *) continue ;; esac
+    if [ "$operation" != "status" ] && [ "$operation" != "check" ]; then
+      echo "VPN может кратковременно прерваться. Отключение активного SOCKS включает Direct с IP VPS. Новый IP не гарантирован."
+      prompt_value "Продолжить? да/нет: "
+      case "$REPLY_VALUE" in да|yes|YES|y|Y) ;; *) continue ;; esac
+    fi
+    local tos=0
+    if [ "$operation" = "install" ] || [ "$operation" = "reregister" ]; then
+      prompt_value "Принимаете условия Cloudflare WARP? да/нет: "
+      case "$REPLY_VALUE" in да|yes|YES|y|Y) tos=1 ;; *) continue ;; esac
+    fi
+    admin_call warp-operation "backend=$backend" "operation=$operation" confirm=CONFIRMED "accept_tos=$tos" || true
+  done
+}
+
+manage_interface() {
+  ensure_admin_helper || return
+  local choice confirm
+  while true; do
+    echo "=== WARP-интерфейс: только трафик TrustTunnel ==="
+    echo "SSH и маршруты других служб не меняются. Нужна отдельная WARP-регистрация."
+    echo "1) Установить / переустановить"
+    echo "2) Включить маршрут"
+    echo "3) Отключить (вернуть прежний маршрут)"
+    echo "4) Проверить"
+    echo "5) Перезапустить интерфейс и TrustTunnel"
+    echo "6) Перерегистрировать отдельный аккаунт"
+    echo "7) Удалить"
+    echo "8) Статус"
+    echo "0) Назад"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
+    case "$choice" in
+      0) return ;;
+      1)
+        prompt_value "Принимаете условия Cloudflare WARP? да/нет: "
+        case "$REPLY_VALUE" in да|yes|YES|y|Y) admin_call interface-install accept_tos=1 ;; *) echo "Отменено." ;; esac ;;
+      2) admin_call interface-enable ;;
+      3) admin_call interface-disable ;;
+      4) admin_call interface-check ;;
+      5) admin_call interface-restart ;;
+      6) prompt_value "Введите REREGISTER: "; confirm="$REPLY_VALUE"; admin_call interface-reregister "confirm=$confirm" ;;
+      7) prompt_value "Введите REMOVE: "; confirm="$REPLY_VALUE"; admin_call interface-remove "confirm=$confirm" ;;
+      8) admin_call interface-status ;;
+      *) echo "Выберите 0–8." ;;
+    esac
+  done
+}
+
+manage_endpoint_features() {
+  ensure_admin_helper || return
+  local choice enabled path confirm
+  while true; do
+    echo "=== Обновления и функции endpoint ==="
+    echo "1) Проверить стабильный и предварительный выпуски"
+    echo "2) Обновить до стабильного выпуска"
+    echo "3) Обновить до beta (предварительная версия)"
+    echo "4) Включить / выключить метрики пользователей (только localhost)"
+    echo "5) Включить / выключить HTTPS-подписки (нужен совместимый endpoint)"
+    echo "0) Назад"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
+    case "$choice" in
+      0) return ;;
+      1) admin_call endpoint-releases ;;
+      2) TT_CHANNEL=stable; update_trusttunnel_only ;;
+      3)
+        prompt_value "Beta может содержать ошибки. Введите BETA: "; confirm="$REPLY_VALUE"
+        if [ "$confirm" = BETA ]; then TT_CHANNEL=beta; update_trusttunnel_only; else echo "Отменено."; fi ;;
+      4)
+        prompt_value "Включить: 1; выключить: 0 [0]: "; enabled="${REPLY_VALUE:-0}"
+        admin_call endpoint-metrics "enabled=$enabled" ;;
+      5)
+        prompt_value "Включить: 1; выключить: 0 [0]: "; enabled="${REPLY_VALUE:-0}"
+        prompt_value "Путь [/subscription]: "; path="${REPLY_VALUE:-/subscription}"
+        admin_call endpoint-subscription "enabled=$enabled" "path=$path" ;;
+      *) echo "Выберите 0–5." ;;
+    esac
+  done
 }
 
 check_warp() {
@@ -1242,14 +1552,14 @@ enable_warp() {
 }
 
 disable_warp() {
-  systemctl disable --now warp-wireproxy 2>/dev/null || true
   switch_trusttunnel_forwarder direct
+  systemctl disable --now warp-wireproxy 2>/dev/null || true
   echo "WARP отключен без удаления файлов. TrustTunnel переключен на direct."
   check_warp
 }
 
 trusttunnel_uses_socks5() {
-  grep -q '^\[forward_protocol\.socks5\]$' "$TT_DIR/vpn.toml" 2>/dev/null
+  grep -Fq "address = \"${SOCKS_ADDR}\"" "$TT_DIR/vpn.toml" 2>/dev/null
 }
 
 reregister_warp_account() {
@@ -1260,11 +1570,22 @@ reregister_warp_account() {
   install_packages
   download_wireproxy
   mkdir -p "$WARP_DIR/wgcf"
+  local backup
+  mkdir -p /root/trusttunnel-warp-account-backups
+  chmod 0700 /root/trusttunnel-warp-account-backups
+  backup="$(mktemp -d /root/trusttunnel-warp-account-backups/wg-socks-XXXXXX)"
+  cp -a "$WARP_DIR/wgcf" "$backup/wgcf"
+  if [ -f "$WARP_DIR/wireproxy.conf" ]; then cp -a "$WARP_DIR/wireproxy.conf" "$backup/wireproxy.conf"; fi
+  WARP_REGISTRATION_BACKUP="$backup"
+  trap 'rc=$?; if [ "$rc" -ne 0 ]; then cp -a "$WARP_REGISTRATION_BACKUP/wgcf/." "$WARP_DIR/wgcf/"; if [ -f "$WARP_REGISTRATION_BACKUP/wireproxy.conf" ]; then cp -a "$WARP_REGISTRATION_BACKUP/wireproxy.conf" "$WARP_DIR/wireproxy.conf"; fi; systemctl restart warp-wireproxy || true; fi' EXIT
   systemctl disable --now warp-wireproxy 2>/dev/null || true
   rm -f "$WARP_DIR/wireproxy.conf"
   rm -f "$WARP_DIR/wgcf/wgcf-account.toml" "$WARP_DIR/wgcf/wgcf-profile.conf"
   generate_warp_profile
   write_warp_systemd
+  curl -fsS --max-time 15 --proxy "socks5h://${SOCKS_ADDR}" https://www.cloudflare.com/cdn-cgi/trace | grep -Eq '^warp=(on|plus)$'
+  trap - EXIT
+  unset WARP_REGISTRATION_BACKUP
   if trusttunnel_uses_socks5; then
     switch_trusttunnel_forwarder socks5
   fi
@@ -1280,20 +1601,19 @@ install_or_reinstall_warp_only() {
   download_wireproxy
   generate_warp_profile
   write_warp_systemd
-  switch_trusttunnel_forwarder socks5
-  echo "WARP установлен/переустановлен."
+  echo "WARP установлен/переустановлен. Текущий маршрут не изменён. Для включения выберите пункт 8."
   trusttunnel-status 2>/dev/null || true
 }
 
 remove_warp_only() {
-  confirm_action "Будет удален WARP/wireproxy. TrustTunnel переключится на direct, если он установлен."
+  confirm_action "Будет удален WARP/wireproxy. Только если этот вариант активен, TrustTunnel переключится на Direct с IP VPS."
+  if trusttunnel_uses_socks5; then switch_trusttunnel_forwarder direct; fi
   systemctl stop warp-wireproxy 2>/dev/null || true
   systemctl disable warp-wireproxy 2>/dev/null || true
   rm -f /etc/systemd/system/warp-wireproxy.service
   systemctl daemon-reload
   rm -rf "$WARP_DIR"
-  switch_trusttunnel_forwarder direct
-  echo "WARP удален. TrustTunnel переключен на direct."
+  echo "Wireproxy удален. Остальные варианты WARP не удалены."
   trusttunnel-status 2>/dev/null || true
 }
 
@@ -1421,9 +1741,10 @@ renew_certificate_manually() {
 }
 
 switch_certificate_mode() {
-  local current_mode target_mode
+  local current_mode target_mode requested_mode="${CERT_MODE:-}"
   load_current_trusttunnel_context
   current_mode="$CERT_MODE"
+  CERT_MODE="$requested_mode"
   if [ "$CERT_MODE" != "self-signed" ] && [ "$CERT_MODE" != "letsencrypt" ]; then
     if [ ! -r /dev/tty ]; then
       echo "For non-interactive certificate switch set CERT_MODE=self-signed or CERT_MODE=letsencrypt." >&2
@@ -1474,6 +1795,7 @@ backup_identity() {
     exit 1
   fi
   mkdir -p "$IDENTITY_BACKUP_DIR/certs" "$IDENTITY_BACKUP_DIR/client-files"
+  chmod 0700 "$IDENTITY_BACKUP_DIR" "$IDENTITY_BACKUP_DIR/certs" "$IDENTITY_BACKUP_DIR/client-files"
   cp "$TT_DIR/certs/cert.pem" "$IDENTITY_BACKUP_DIR/certs/cert.pem"
   cp "$TT_DIR/certs/key.pem" "$IDENTITY_BACKUP_DIR/certs/key.pem"
   cp "$TT_DIR/credentials.toml" "$IDENTITY_BACKUP_DIR/credentials.toml"
@@ -1484,6 +1806,10 @@ backup_identity() {
     rm -f "$IDENTITY_BACKUP_DIR/clients-state.json"
   fi
   cp "$TT_DIR/hosts.toml" "$IDENTITY_BACKUP_DIR/hosts.toml"
+  for item in rules.toml panel-protection.json; do
+    if [ -f "$TT_DIR/$item" ]; then cp "$TT_DIR/$item" "$IDENTITY_BACKUP_DIR/$item"; else rm -f "$IDENTITY_BACKUP_DIR/$item"; fi
+  done
+  find "$IDENTITY_BACKUP_DIR/client-files" -maxdepth 1 -type f -name '*.toml' -delete
   if [ -f "$CLIENT_DIR/clients-credentials.txt" ]; then
     cp "$CLIENT_DIR/clients-credentials.txt" "$IDENTITY_BACKUP_DIR/client-files/clients-credentials.txt"
   fi
@@ -1502,6 +1828,7 @@ EOF
   backup_name="${backup_domain:-trusttunnel}-identity-backup"
   archive_path="/root/${backup_name}.tar.gz"
   tar -czf "$archive_path" -C "$IDENTITY_BACKUP_DIR" .
+  chmod 0600 "$archive_path"
   echo "Identity backup создан:"
   echo "- Папка: ${IDENTITY_BACKUP_DIR}"
   echo "- Архив: ${archive_path}"
@@ -1509,11 +1836,32 @@ EOF
 
 restore_identity() {
   local backup_domain backup_port backup_cert_mode current_domain current_port
+  backup_cert_mode=""
   if [ ! -f "$IDENTITY_BACKUP_DIR/certs/cert.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/certs/key.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/credentials.toml" ]; then
     echo "Backup identity не найден в ${IDENTITY_BACKUP_DIR}."
     exit 1
   fi
   mkdir -p "$TT_DIR/certs" "$CLIENT_DIR"
+  python3 - "$IDENTITY_BACKUP_DIR" <<'PY'
+import json, pathlib, ssl, subprocess, sys
+try: import tomllib
+except ImportError: import tomli as tomllib
+root = pathlib.Path(sys.argv[1])
+ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(root/'certs/cert.pem', root/'certs/key.pem')
+credentials = tomllib.loads((root/'credentials.toml').read_text())
+clients = credentials.get('client', [])
+if not clients or any(not c.get('username') or not c.get('password') for c in clients): raise SystemExit('Backup credentials invalid')
+for name in ('hosts.toml','rules.toml'):
+    if (root/name).exists(): tomllib.loads((root/name).read_text())
+for name in ('clients-state.json','panel-protection.json'):
+    if (root/name).exists(): json.loads((root/name).read_text())
+for path in (root/'client-files').glob('*.toml'): tomllib.loads(path.read_text())
+subprocess.run(['openssl','x509','-in',str(root/'certs/cert.pem'),'-noout','-checkend','0'],check=True,stdout=subprocess.DEVNULL)
+PY
+  local rollback
+  rollback="$(mktemp -d /root/trusttunnel-before-restore.XXXXXX)"
+  cp -a "$TT_DIR" "$rollback/trusttunnel"
+  cp -a "$CLIENT_DIR" "$rollback/client-files"
   cp "$IDENTITY_BACKUP_DIR/certs/cert.pem" "$TT_DIR/certs/cert.pem"
   cp "$IDENTITY_BACKUP_DIR/certs/key.pem" "$TT_DIR/certs/key.pem"
   cp "$IDENTITY_BACKUP_DIR/credentials.toml" "$TT_DIR/credentials.toml"
@@ -1526,6 +1874,9 @@ restore_identity() {
   if [ -f "$IDENTITY_BACKUP_DIR/hosts.toml" ]; then
     cp "$IDENTITY_BACKUP_DIR/hosts.toml" "$TT_DIR/hosts.toml"
   fi
+  for item in rules.toml panel-protection.json; do
+    if [ -f "$IDENTITY_BACKUP_DIR/$item" ]; then cp "$IDENTITY_BACKUP_DIR/$item" "$TT_DIR/$item"; fi
+  done
   if [ -d "$IDENTITY_BACKUP_DIR/client-files" ]; then
     cp -f "$IDENTITY_BACKUP_DIR"/client-files/* "$CLIENT_DIR"/ 2>/dev/null || true
   fi
@@ -1545,7 +1896,14 @@ restore_identity() {
   else
     CERT_MODE="$(detect_current_cert_mode)"
   fi
-  echo "Identity восстановлен."
+  if ! systemctl restart trusttunnel || ! systemctl is-active --quiet trusttunnel; then
+    cp -a "$rollback/trusttunnel/." "$TT_DIR/"
+    cp -a "$rollback/client-files/." "$CLIENT_DIR/"
+    systemctl restart trusttunnel || true
+    echo "Восстановление не прошло проверку. Предыдущее состояние возвращено; backup: $rollback" >&2
+    return 1
+  fi
+  echo "Identity восстановлен. Состояние до восстановления: $rollback"
   [ -n "$backup_domain" ] && echo "Backup domain: ${backup_domain}"
   [ -n "$backup_port" ] && echo "Backup port: ${backup_port}"
   echo "Current domain after restore: ${current_domain}"
@@ -1556,14 +1914,22 @@ restore_identity() {
   else
     remove_certificate_automation
   fi
-  systemctl restart trusttunnel 2>/dev/null || true
+  systemctl try-restart trusttunnel-panel 2>/dev/null || true
 }
 
 remove_all() {
   confirm_action "Будут удалены TrustTunnel, WARP, клиентские файлы и порт TrustTunnel из UFW. SSH/fail2ban не удаляются."
   local endpoint_port
   endpoint_port="$(current_endpoint_port)"
+  backup_identity
   systemctl disable --now trusttunnel 2>/dev/null || true
+  systemctl stop trusttunnel-panel 2>/dev/null || true
+  systemctl disable --now warp-interface-watchdog.timer warp-interface.service warp-masque-tun.service warp-masque-bridge.service warp-masque.service 2>/dev/null || true
+  rm -f /etc/systemd/system/trusttunnel.service.d/40-warp-interface.conf
+  for unit in warp-interface.service warp-interface-watchdog.service warp-interface-watchdog.timer warp-masque-tun.service warp-masque-bridge.service warp-masque.service ttwarp.slice; do
+    rm -f "/etc/systemd/system/$unit"
+  done
+  rm -rf /opt/warp-interface /opt/warp-masque-tun /opt/warp-masque
   systemctl stop warp-wireproxy 2>/dev/null || true
   systemctl disable warp-wireproxy 2>/dev/null || true
   rm -f /etc/systemd/system/trusttunnel.service
@@ -1581,7 +1947,7 @@ remove_all() {
   systemctl daemon-reload
   ufw delete allow "${endpoint_port}/tcp" 2>/dev/null || true
   ufw delete allow "${endpoint_port}/udp" 2>/dev/null || true
-  echo "TrustTunnel и WARP удалены. SSH и fail2ban оставлены без изменений."
+  echo "TrustTunnel и все варианты WARP удалены. SSH и fail2ban оставлены без изменений. Identity backup сохранён. Веб-панель остановлена; её отдельное удаление доступно в меню."
 }
 
 run_speedtest() {
@@ -1820,6 +2186,17 @@ manage_ufw() {
   done
 }
 
+load_panel_environment() {
+  local env_key env_value
+  [ -f /etc/trusttunnel-panel.env ] || return 0
+  while IFS='=' read -r env_key env_value; do
+    case "$env_key" in
+      PANEL_BIND|PANEL_PORT|PANEL_USER|PANEL_PASSWORD|PANEL_TLS|PANEL_CERT|PANEL_KEY)
+        printf -v "$env_key" '%s' "$env_value" ;;
+    esac
+  done < /etc/trusttunnel-panel.env
+}
+
 install_panel() {
   local panel_path env_file panel_mode ssh_port default_port default_mode old_port requested_panel_port requested_panel_mode
   requested_panel_port="${PANEL_PORT:-}"
@@ -1829,7 +2206,7 @@ install_panel() {
   default_port="$PANEL_PORT"
   default_mode="localhost"
   if [ -f "$env_file" ]; then
-    . "$env_file" || true
+    load_panel_environment
     default_port="${PANEL_PORT:-$default_port}"
     if [ "${PANEL_TLS:-0}" = "1" ]; then
       default_mode="https"
@@ -1861,14 +2238,17 @@ install_panel() {
   fi
   apt_update_retry || true
   apt_install_retry -y --no-install-recommends --no-upgrade python3 python3-tomli dnsutils curl qrencode
-  if [ -f /tmp/trusttunnel-panel.py ]; then
-    cp /tmp/trusttunnel-panel.py "$panel_path"
-  elif [ -f ./trusttunnel-panel.py ]; then
-    cp ./trusttunnel-panel.py "$panel_path"
+  local panel_candidate
+  panel_candidate="$(mktemp)"
+  if [ -n "${PANEL_SCRIPT_SOURCE:-}" ]; then
+    python3 -c 'import os,stat,sys; s=os.stat(sys.argv[1]); assert s.st_uid==0 and not s.st_mode & 0o022 and stat.S_ISREG(s.st_mode), "Panel source must be root-owned and not writable by other users"' "$PANEL_SCRIPT_SOURCE"
+    cp "$PANEL_SCRIPT_SOURCE" "$panel_candidate"
   else
-    curl -fsSL -o "$panel_path" "$PANEL_SCRIPT_URL"
+    curl -fsSL -o "$panel_candidate" "$PANEL_SCRIPT_URL"
   fi
-  chmod 0755 "$panel_path"
+  python3 -m py_compile "$panel_candidate"
+  install -m 0755 "$panel_candidate" "$panel_path"
+  rm -f "$panel_candidate"
   old_port="$default_port"
   if [ -z "${PANEL_PASSWORD:-}" ]; then
     PANEL_PASSWORD="$(openssl rand -base64 18 | tr -d '=+/')"
@@ -1913,6 +2293,11 @@ EnvironmentFile=${env_file}
 ExecStart=/usr/bin/python3 ${panel_path}
 Restart=always
 RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectControlGroups=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
@@ -1946,7 +2331,7 @@ show_panel_credentials() {
     echo "Настройки веб-панели не найдены."
     return
   fi
-  . /etc/trusttunnel-panel.env
+  load_panel_environment
   panel_bind="${PANEL_BIND:-127.0.0.1}"
   panel_port="${PANEL_PORT:-8088}"
   panel_user="${PANEL_USER:-admin}"
@@ -1973,13 +2358,12 @@ change_panel_credentials() {
   fi
   prompt_value "Новый пароль панели (минимум 12 символов): "
   panel_password="$REPLY_VALUE"
-  if [ "${#panel_password}" -lt 12 ] || [[ "$panel_password" == *$'\n'* ]] || [[ "$panel_password" == *"="* ]]; then
-    echo "Пароль должен быть не короче 12 символов и не содержать перевод строки или =."
+  if ! [[ "$panel_password" =~ ^[A-Za-z0-9._~!@%+,:/-]{12,128}$ ]]; then
+    echo "Пароль: 12–128 букв, цифр или . _ ~ ! @ % + , : / -; без пробелов и кавычек."
     return
   fi
-  sed -i -E "s|^PANEL_USER=.*|PANEL_USER=${panel_user}|; s|^PANEL_PASSWORD=.*|PANEL_PASSWORD=${panel_password}|" /etc/trusttunnel-panel.env
-  chmod 0600 /etc/trusttunnel-panel.env
-  systemctl restart trusttunnel-panel
+  ensure_admin_helper || return
+  printf '{"username":"%s","password":"%s"}' "$panel_user" "$panel_password" | python3 "$ADMIN_HELPER_PATH" --admin panel-credentials
   echo "Данные входа веб-панели обновлены."
 }
 
@@ -2001,8 +2385,8 @@ manage_panel_service() {
     prompt_value "Выбери действие [3]: "
     choice="${REPLY_VALUE:-3}"
     case "$choice" in
-      1) systemctl enable --now trusttunnel-panel; echo "Веб-панель включена." ;;
-      2) systemctl disable --now trusttunnel-panel; echo "Веб-панель отключена. Настройки сохранены." ;;
+      1) ensure_admin_helper; admin_call panel-service enabled=1 confirm=CONFIRMED ;;
+      2) ensure_admin_helper; admin_call panel-service enabled=0 confirm=CONFIRMED ;;
       3) systemctl --no-pager --full status trusttunnel-panel || true; journalctl -u trusttunnel-panel -n 30 --no-pager || true ;;
       4) show_panel_credentials ;;
       5) change_panel_credentials ;;
@@ -2179,8 +2563,8 @@ manage_clients_legacy() {
         prompt_value "Логин клиента: "; user="$REPLY_VALUE"
         if ! existing_password_for_user "$user" "$TT_DIR/credentials.toml" >/dev/null; then echo "Клиент не найден."; continue; fi
         load_current_trusttunnel_context
-        link="$(cd "$TT_DIR" && ./trusttunnel_endpoint vpn.toml hosts.toml -c "$user" -a "${DOMAIN}:${ENDPOINT_PORT}" --format deeplink --name "$user" 2>/dev/null || true)"
-        if [[ "$link" == tt://* ]]; then printf '%s\n' "$link"; else echo "Не удалось создать tt:// ссылку. TOML-профиль остаётся рабочим вариантом."; fi
+        ensure_admin_helper || return
+        admin_call client-link "username=$user"
         ;;
       0) return ;;
       *) echo "Нужно выбрать 0-6." ;;
@@ -2193,8 +2577,8 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.09.30'" "$ADMIN_HELPER_PATH"; then return; fi
-  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.09.30'" /usr/local/lib/trusttunnel/admin.py; then
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.22'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.22'" /usr/local/lib/trusttunnel/admin.py; then
     ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
     return
   fi
@@ -2209,7 +2593,9 @@ ensure_admin_helper() {
 }
 
 admin_call() {
-  python3 "$ADMIN_HELPER_PATH" --admin "$@" </dev/null || echo "Операция не выполнена. Причина указана выше."
+  if python3 "$ADMIN_HELPER_PATH" --admin "$@" </dev/null; then return 0; fi
+  echo "Операция не выполнена. Причина указана выше." >&2
+  return 1
 }
 
 manage_clients() {
@@ -2227,6 +2613,7 @@ manage_clients() {
     echo "8) Включить клиента с прежним паролем"
     echo "9) Изменить заметку"
     echo "10) Создать группу клиентов"
+    echo "11) Лимиты соединений HTTP/2 и QUIC (не привязка к устройству)"
     echo "0) Назад"
     prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
@@ -2237,18 +2624,25 @@ manage_clients() {
         prompt_value "Префикс [client]: "; prefix="${REPLY_VALUE:-client}"
         prompt_value "Количество [5]: "; count="${REPLY_VALUE:-5}"
         admin_call client-batch "prefix=$prefix" "count=$count" ;;
+      11)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        prompt_value "Лимит HTTP/2 (пусто: по умолчанию): "; local h2="$REPLY_VALUE"
+        prompt_value "Лимит QUIC (пусто: по умолчанию): "; local h3="$REPLY_VALUE"
+        admin_call client-limits "username=$user" "max_http2_conns=$h2" "max_http3_conns=$h3" ;;
       2|3|4|6|7|8|9)
         prompt_value "Логин клиента: "; user="$REPLY_VALUE"
         case "$choice" in
           2) admin_call client-add "username=$user" ;;
           3) confirm_action "Будет изменён пароль клиента."; admin_call client-password "username=$user" ;;
           4) confirm_action "Клиент будет удалён."; admin_call client-delete "username=$user" ;;
-          6) admin_call client-link "username=$user" ;;
+          6)
+            prompt_value "Протокол http2 / http3 [http2]: "; local protocol="${REPLY_VALUE:-http2}"
+            admin_call client-link "username=$user" "protocol=$protocol" ;;
           7) confirm_action "Доступ клиента будет отключён. TrustTunnel переподключит клиентов."; admin_call client-disable "username=$user" ;;
           8) admin_call client-enable "username=$user" ;;
           9) prompt_value "Заметка: "; note="$REPLY_VALUE"; admin_call client-note "username=$user" "note=$note" ;;
         esac ;;
-      *) echo "Выберите 0–10." ;;
+      *) echo "Выберите 0–11." ;;
     esac
   done
 }
@@ -2500,13 +2894,33 @@ manage_system_tools() {
   done
 }
 write_tools() {
+  local installed_installer="/usr/local/lib/trusttunnel/install-trusttunnel-warp.sh"
+  mkdir -p /usr/local/lib/trusttunnel
+  if [ "$(readlink -f "${BASH_SOURCE[0]}")" != "$installed_installer" ]; then
+    install -m 0755 "${BASH_SOURCE[0]}" "$installed_installer"
+  fi
+  # Older installations used ttmenu -> trusttunnel-menu. Do not follow it
+  # while replacing the two commands, which would create a recursive wrapper.
+  for command_path in /usr/local/sbin/ttmenu /usr/local/sbin/trusttunnel-menu /usr/local/sbin/trusttunnel-status; do
+    if [ -L "$command_path" ]; then rm -f "$command_path"; fi
+  done
   cat > /usr/local/sbin/ttmenu <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 SCRIPT_URL="https://raw.githubusercontent.com/Dmitry1244/trusttunnel-auto-installer/main/install-trusttunnel-warp.sh"
-TMP_SCRIPT="/tmp/install-trusttunnel-warp.sh"
-curl -fsSL -o "$TMP_SCRIPT" "${SCRIPT_URL}?$(date +%s)"
-bash "$TMP_SCRIPT"
+INSTALLED="/usr/local/lib/trusttunnel/install-trusttunnel-warp.sh"
+if [ "${1:-}" = "--update" ] || [ ! -s "$INSTALLED" ]; then
+  mkdir -p /usr/local/lib/trusttunnel
+  umask 077
+  TMP_SCRIPT="$(mktemp /usr/local/lib/trusttunnel/.installer-XXXXXX)"
+  trap 'rm -f "$TMP_SCRIPT"' EXIT
+  curl -fsSL --max-time 45 -o "$TMP_SCRIPT" "${SCRIPT_URL}?$(date +%s)"
+  bash -n "$TMP_SCRIPT"
+  chmod 0755 "$TMP_SCRIPT"
+  mv -f "$TMP_SCRIPT" "$INSTALLED"
+  if [ "${1:-}" = "--update" ]; then shift; fi
+fi
+exec bash "$INSTALLED" "$@"
 EOF
   chmod 0755 /usr/local/sbin/ttmenu
 
@@ -2638,6 +3052,15 @@ main() {
   need_root
   choose_action
   case "$ACTION" in
+    refresh-tools)
+      write_tools
+      if [ -f "$TT_DIR/vpn.toml" ]; then
+        load_current_trusttunnel_context
+        if [ "$CERT_MODE" = letsencrypt ]; then write_certificate_automation; fi
+      fi
+      echo "Локальное меню и служебные команды обновлены. Клиенты и сертификаты не изменялись."
+      exit 0
+      ;;
     install|reinstall)
       ;;
     install-warp)
@@ -2732,6 +3155,35 @@ main() {
       manage_admin
       exit 0
       ;;
+    manage-masque)
+      manage_masque
+      exit 0
+      ;;
+    manage-endpoint-features)
+      manage_endpoint_features
+      exit 0
+      ;;
+    manage-interface)
+      manage_interface
+      exit 0
+      ;;
+    manage-warp)
+      manage_warp
+      exit 0
+      ;;
+    recommendations)
+      ensure_admin_helper
+      admin_call recommendations
+      exit 0
+      ;;
+    manage-protection)
+      manage_protection
+      exit 0
+      ;;
+    manage-server-security)
+      manage_server_security
+      exit 0
+      ;;
     configure-routing)
       configure_routing
       exit 0
@@ -2758,6 +3210,10 @@ main() {
       ;;
   esac
 
+  if [ -f /etc/systemd/system/trusttunnel.service.d/40-warp-interface.conf ]; then
+    echo "Перед полной переустановкой отключите интерфейсный WARP через пункт 32. Текущие настройки не изменены." >&2
+    return 1
+  fi
   collect_config
   install_packages
   download_trusttunnel
