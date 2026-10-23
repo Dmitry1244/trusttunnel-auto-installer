@@ -20,6 +20,8 @@ const path = require('path');
         if((await page.evaluate(()=>window.__securityViolations)).length)throw Error('Login CSP');
       }
       await page.goto('http://127.0.0.1:18089/?view=clients');
+      await page.waitForFunction(()=>document.querySelector('[data-client-metrics]')?.textContent.includes('всего'));
+      if(!(await page.locator('[data-client-seen]').first().innerText()).includes('сейчас'))throw Error('Last-online display');
       if(viewport.width<=800){
         await page.locator('#mobile-menu').click();
         await page.locator('.sidebar .nav-item.active').waitFor({state:'visible'});
@@ -63,6 +65,7 @@ const path = require('path');
       await page.locator('#page-next').click();
       if(await page.locator('#page-label').innerText()!=='2 / 3') throw Error('Pagination failed');
       await page.locator('#theme-toggle').click();
+      await page.waitForTimeout(220);
       await page.evaluate(()=>scrollTo(0,0));
       await page.screenshot({path:path.join(__dirname,`clients-${viewport.width}.png`),fullPage:true});
       for(const view of ['dashboard','security','routing','dns','logs','endpoint','warp','certificates','system','panel']) {
@@ -83,6 +86,16 @@ const path = require('path');
           await page.locator('#operation-result[open]').waitFor();
           if(!(await page.locator('#result-output').innerText()).includes('Тестовый отчёт'))throw Error('Shared action result failed');
           await page.locator('#result-close').click();
+        }
+        if(view==='routing'){
+          if(await page.locator('.route-picker input:checked').inputValue()!=='interface')throw Error('Current route is not preselected');
+          await page.locator('.route-picker input[value="socks5"]').check();
+          await page.locator('[data-cascade-address] input').fill('proxy.example.test:1080');
+          await page.getByRole('button',{name:'Применить выбранный маршрут',exact:true}).click();
+          await page.locator('#action-confirm[open]').waitFor();
+          await page.locator('#confirm-cancel').click();
+          await page.locator('.route-picker input[value="interface"]').check();
+          if(await page.locator('[data-cascade-address]').isVisible())throw Error('Irrelevant cascade input still visible');
         }
         await page.screenshot({path:path.join(__dirname,`${view}-${viewport.width}.png`),fullPage:true});
         if((await page.evaluate(()=>window.__securityViolations)).length)throw Error('CSP violation on '+view);

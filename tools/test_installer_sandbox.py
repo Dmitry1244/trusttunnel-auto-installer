@@ -15,7 +15,7 @@ with tempfile.TemporaryDirectory(prefix='tt-installer-test-') as directory:
     env = dict(os.environ, PATH=str(root / 'bin') + ':' + os.environ['PATH'], TT_TEST_ROOT=str(root))
     def bash(body, check=True):
         code = library + '\nTT_DIR="$TT_TEST_ROOT"\nDOMAIN=example.test\n' + body
-        return subprocess.run(['bash', '-c', code], env=env, check=check, text=True, capture_output=True, timeout=15)
+        return subprocess.run(['bash'], input=code, env=env, check=check, text=True, capture_output=True, timeout=15)
     for name in ('first', 'second'):
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', str(root / (name + '.key')), '-out', str(root / (name + '.pem')), '-days', '2', '-subj', '/CN=example.test', '-addext', 'subjectAltName=DNS:example.test'], check=True, capture_output=True)
     hosts = root / 'hosts.toml'
@@ -46,7 +46,7 @@ switch_certificate_mode
     unit_root = root / 'units'; unit_root.mkdir()
     command_root = root / 'commands'; command_root.mkdir()
     remapped = library.replace('/usr/local/sbin/', str(command_root) + '/').replace('/etc/systemd/system/', str(unit_root) + '/')
-    subprocess.run(['bash', '-c', remapped + '\nTT_DIR="$TT_TEST_ROOT"\nDOMAIN=example.test\nCERT_MODE=letsencrypt\nEMAIL=test@example.test\nwrite_certificate_automation\n'], env=env, check=True, capture_output=True)
+    subprocess.run(['bash'], input=remapped + '\nTT_DIR="$TT_TEST_ROOT"\nDOMAIN=example.test\nCERT_MODE=letsencrypt\nEMAIL=test@example.test\nwrite_certificate_automation\n', text=True, env=env, check=True, capture_output=True)
     for filename in ('trusttunnel-cert-renew', 'trusttunnel-cert-deploy'):
         subprocess.run(['bash', '-n', str(command_root / filename)], check=True)
     renew = (command_root / 'trusttunnel-cert-renew').read_text()
@@ -86,3 +86,27 @@ switch_certificate_mode
     result=subprocess.run(['bash',str(tools_root/'ttmenu')],env=dict(env,ACTION='exit'),capture_output=True,timeout=5)
     assert result.returncode==0
     print('Legacy symlink menu upgrade creates separate commands without an exec loop: PASS')
+    (root/'panel-protection.json').write_text('{"tls_enabled":true}')
+    for operation in ('write_server_config','update_trusttunnel_only','restore_identity'):
+        assert bash(operation+'\n',check=False).returncode != 0
+    (root/'panel-protection.json').write_text('{"transition":{"enabled":true}}')
+    assert bash('assert_protection_unlocked\n',check=False).returncode != 0
+    print('Strict and pending protection blocks reinstall, endpoint downgrade and identity restore: PASS')
+    (root/'panel-protection.json').unlink()
+    strict=root/'strict-backup'; (strict/'certs').mkdir(parents=True)
+    (strict/'certs/cert.pem').write_bytes((root/'first.pem').read_bytes())
+    (strict/'certs/key.pem').write_bytes((root/'first.key').read_bytes())
+    (strict/'credentials.toml').write_text('[[client]]\nusername="synthetic"\npassword="synthetic-password"\n')
+    (strict/'panel-protection.json').write_text('{"tls_enabled":true}')
+    (root/'vpn.toml').write_text('rules_file="rules.toml"\n[listen_protocols . quic]\n')
+    result=bash('IDENTITY_BACKUP_DIR="$TT_TEST_ROOT/strict-backup"\nCLIENT_DIR="$TT_TEST_ROOT/exports"\nrestore_identity\n',check=False)
+    assert result.returncode != 0 and 'QUIC-enabled' in result.stderr
+    print('Strict backup cannot silently enable protection on a QUIC-enabled destination: PASS')
+    credentials=root/'credentials.toml'; credentials.write_text('[[client]]\nusername="synthetic"\npassword="synthetic-password"\nmax_http2_conns=2\n')
+    exports=root/'exports'; exports.mkdir(exist_ok=True)
+    profile=exports/'synthetic-http2.toml'; profile.write_text('client_random_auth_key="abcdef"\n')
+    preserved=credentials.read_bytes(),profile.read_bytes()
+    result=bash('ensure_admin_helper() { :; }\nadmin_call() { test "$1" = client-rebuild; echo shared-preserving-backend; }\nCLIENT_DIR="$TT_TEST_ROOT/exports"\nPRESERVE_CLIENT_CONFIGS=1\nwrite_clients\n')
+    assert 'shared-preserving-backend' in result.stdout
+    assert preserved==(credentials.read_bytes(),profile.read_bytes())
+    print('Legacy maintenance delegates preservation to the shared backend without discarding limits/auth keys: PASS')

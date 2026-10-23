@@ -15,7 +15,8 @@ panel.cert_mode = lambda: 'letsencrypt'
 panel.endpoint_version = lambda: 'TrustTunnel test fixture'
 panel.client_tls_profile = lambda: 'chrome'
 panel.jail_settings = lambda: {'maxretry':'5','findtime':'600','bantime':'3600'}
-panel.forwarder_label = lambda: 'WARP/SOCKS'
+panel.forwarder_label = lambda: 'WARP · WireGuard интерфейс'
+panel.current_warp_backend = lambda: 'wg-interface'
 fixture_clients = [dict(username=f'client{i:02}', password='synthetic-password', enabled=i % 3 != 0, note='Тестовый профиль') for i in range(1, 28)]
 panel.client_inventory = lambda: [dict(c) for c in fixture_clients]
 panel.load_clients = lambda: [c for c in panel.client_inventory() if c['enabled']]
@@ -33,6 +34,7 @@ panel.PANEL_USER = 'preview'
 panel.PANEL_PASSWORD = 'synthetic-preview-password'
 panel.rules_text = lambda: '[[rule]]\ncidr="192.0.2.0/24"\naction="deny"\n'
 panel.monitor_snapshot = lambda: dict(cpu='2.4%', memory='512 МиБ / 2 ГиБ', disk='8 ГиБ / 40 ГиБ', uptime='14д 02ч', memory_percent=25, disk_percent=20, services=panel.service_snapshot(), route='WARP · WireGuard', interfaces={'ens3':{'rx':int(panel.time.time()*12345),'tx':int(panel.time.time()*6789)}}, time=panel.time.time())
+panel.client_metrics = lambda: dict(available=True,checked_at=panel.time.time(),clients=[dict(username=c['username'],online=c['enabled'],sessions=1 if c['enabled'] else 0,upload=123456789,download=987654321,last_seen=panel.time.time()-(0 if c['enabled'] else 3600)) for c in fixture_clients],guard={},accounting_error='')
 
 
 class Preview(panel.Handler):

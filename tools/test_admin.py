@@ -25,7 +25,7 @@ class AdminTests(unittest.TestCase):
                         patch.object(panel, 'client_profile', side_effect=lambda u, p, protocol: f'{u}:{p}:{protocol}')]
         for item in self.patches: item.start()
         (self.root / 'credentials.toml').write_text('[[client]]\nusername="original"\npassword="original-password"\n')
-        (self.root / 'vpn.toml').write_text('[listen_protocols.http2]\n[forward_protocol]\ndirect={}\n')
+        (self.root / 'vpn.toml').write_text('rules_file="rules.toml"\n[listen_protocols.http2]\n[forward_protocol]\ndirect={}\n')
         (self.root / 'exports').mkdir()
         (self.root / 'exports/original-http2.toml').write_text('original custom profile')
 

@@ -833,7 +833,18 @@ write_certs() {
   esac
 }
 
+assert_protection_unlocked() {
+  [ -f "$TT_DIR/panel-protection.json" ] || return 0
+  python3 - "$TT_DIR/panel-protection.json" <<'PY'
+import json,sys
+with open(sys.argv[1]) as source: state=json.load(source)
+if any(state.get(key) for key in ('enabled','tls_enabled','transition')):
+    raise SystemExit('Сначала явно отключите строгую TLS/ClientHello-защиту через ttmenu. Изменение правил или смена endpoint может обойти защиту.')
+PY
+}
+
 write_server_config() {
+  assert_protection_unlocked || return 1
   mkdir -p "$TT_DIR"
   cat > "$TT_DIR/vpn.toml" <<EOF
 listen_address = "0.0.0.0:${ENDPOINT_PORT}"
@@ -1087,6 +1098,11 @@ EOF
 }
 
 write_clients() {
+  if [ "${PRESERVE_CLIENT_CONFIGS:-0}" = "1" ] && [ -f "$TT_DIR/credentials.toml" ]; then
+    ensure_admin_helper || return 1
+    admin_call client-rebuild
+    return
+  fi
   local cert existing_clients existing_count existing_credentials generated_count index pass target_clients user zip_path
   mkdir -p "$CLIENT_DIR"
   rm -f "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt" "$CLIENT_DIR/server-cert.pem" 2>/dev/null || true
@@ -1290,6 +1306,7 @@ install_download_tools() {
 }
 
 update_trusttunnel_only() {
+  assert_protection_unlocked || return 1
   if [ ! -d "$TT_DIR" ]; then
     echo "TrustTunnel не найден в ${TT_DIR}. Сначала выполни установку."
     exit 1
@@ -1367,6 +1384,10 @@ manage_server_security() {
   echo "4) Показать расписания"
   echo "5) Создать / изменить расписание"
   echo "6) Отключить расписание"
+  echo "7) Применить выбранное исправление безопасности"
+  echo "8) Диагностика endpoint, портов и TLS"
+  echo "9) Проверить выход через текущий WARP"
+  echo "10) Проверить прямой DNS/TCP/TLS выход VPS"
   echo "0) Назад"
   prompt_value "Выбор [1]: "; choice="${REPLY_VALUE:-1}"
   case "$choice" in
@@ -1377,6 +1398,16 @@ manage_server_security() {
       local enabled=0; [ "$choice" = 2 ] || enabled=1
       admin_call security-ping "enabled=$enabled" confirm=CONFIRMED; return ;;
     4) admin_call schedule-status; return ;;
+    7)
+      echo "Исправления: ntp, syn-cookies, private-files, metrics-private, kernel-baseline."
+      ask_default kind "Исправление (сначала прочитайте отчёт проверки)" "ntp"
+      confirm_action "Применить только выбранную настройку? Изоляция метрик перезапустит VPN. SSH-пароль и маршруты WARP не меняются."
+      admin_call security-remediate "check=$kind" confirm=CONFIRMED; return ;;
+    8) admin_call diagnostics-stack; return ;;
+    9) admin_call diagnostics-warp; return ;;
+    10)
+      ask_default kind "Направление cloudflare/github" "cloudflare"
+      admin_call diagnostics-egress "target=$kind"; return ;;
     5|6) ;;
     *) return ;;
   esac
@@ -1402,6 +1433,11 @@ manage_protection() {
   echo "4) Включить строгий ClientHello-фильтр: старые профили перестанут работать"
   echo "5) Отключить строгий фильтр и вернуть прежние правила"
   echo "6) Вернуть прежние HTTP-настройки"
+  echo "7) Подготовить TLS-auth ссылки для App v1.3 (без блокировки)"
+  echo "8) Обязательная TLS-аутентификация (только после проверки совместимости)"
+  echo "9) Отключить обязательную TLS-аутентификацию"
+  echo "10) AntiDPI + Chrome TLS + DoH для новых профилей"
+  echo "11) Гибкая настройка AntiDPI новых профилей"
   echo "0) Назад"
   prompt_value "Выбор [1]: "; choice="${REPLY_VALUE:-1}"
   case "$choice" in
@@ -1411,18 +1447,35 @@ manage_protection() {
     4) op=enforce ;;
     5) op=disable ;;
     6) op=camouflage-restore ;;
+    7) op=tls-prepare ;;
+    8) op=tls-enforce ;;
+    9) op=tls-disable ;;
+    10) op=client-preset ;;
+    11)
+      local dns profile antidpi quantum
+      ask_default dns "DNS (IP / DoH / DoT через запятую)" "https://dns.adguard-dns.com/dns-query"
+      ask_default profile "TLS profile: chrome/safari/firefox/okhttp/openssl/default" "chrome"
+      ask_yes_no antidpi "Штатный AntiDPI клиента" 1
+      ask_yes_no quantum "Post-quantum TLS (не маскировка; нужен совместимый клиент)" 0
+      confirm_action "Изменить только настройки новых профилей, не переписывая текущие TOML."
+      admin_call protection-client-settings "dns=$dns" "tls_profile=$profile" "anti_dpi=$antidpi" "post_quantum=$quantum" confirm=CONFIRMED; return ;;
     *) return ;;
   esac
   echo "Это снижение обнаруживаемости, а не гарантия невидимости. Встроенные AntiDPI и TLS profile находятся в пункте 26."
   ready=0
-  if [ "$op" = enforce ]; then
+  if [ "$op" = enforce ] || [ "$op" = tls-enforce ]; then
     ask_yes_no ready "Все устройства уже проверены с защищёнными ссылками" 0
     [ "$ready" = 1 ] || return
   fi
   local confirmed=0
   ask_yes_no confirmed "Применить изменение защиты" 0
   [ "$confirmed" = 1 ] || return
-  admin_call "protection-$op" confirm=CONFIRMED "clients_ready=$ready"
+  local v13=0
+  if [ "$op" = tls-enforce ]; then
+    ask_yes_no v13 "На всех устройствах проверен App v1.3 с ключом TLS-auth (QUIC enforcement пока блокируется)" 0
+    [ "$v13" = 1 ] || return
+  fi
+  admin_call "protection-$op" confirm=CONFIRMED "clients_ready=$ready" "client_v13=$v13"
 }
 
 manage_warp() {
@@ -1806,7 +1859,7 @@ backup_identity() {
     rm -f "$IDENTITY_BACKUP_DIR/clients-state.json"
   fi
   cp "$TT_DIR/hosts.toml" "$IDENTITY_BACKUP_DIR/hosts.toml"
-  for item in rules.toml panel-protection.json; do
+  for item in rules.toml panel-protection.json client-guard.json; do
     if [ -f "$TT_DIR/$item" ]; then cp "$TT_DIR/$item" "$IDENTITY_BACKUP_DIR/$item"; else rm -f "$IDENTITY_BACKUP_DIR/$item"; fi
   done
   find "$IDENTITY_BACKUP_DIR/client-files" -maxdepth 1 -type f -name '*.toml' -delete
@@ -1835,6 +1888,7 @@ EOF
 }
 
 restore_identity() {
+  assert_protection_unlocked || return 1
   local backup_domain backup_port backup_cert_mode current_domain current_port
   backup_cert_mode=""
   if [ ! -f "$IDENTITY_BACKUP_DIR/certs/cert.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/certs/key.pem" ] || [ ! -f "$IDENTITY_BACKUP_DIR/credentials.toml" ]; then
@@ -1842,8 +1896,8 @@ restore_identity() {
     exit 1
   fi
   mkdir -p "$TT_DIR/certs" "$CLIENT_DIR"
-  python3 - "$IDENTITY_BACKUP_DIR" <<'PY'
-import json, pathlib, ssl, subprocess, sys
+  python3 - "$IDENTITY_BACKUP_DIR" "$TT_DIR" <<'PY'
+import hashlib, json, pathlib, ssl, subprocess, sys
 try: import tomllib
 except ImportError: import tomli as tomllib
 root = pathlib.Path(sys.argv[1])
@@ -1853,8 +1907,23 @@ clients = credentials.get('client', [])
 if not clients or any(not c.get('username') or not c.get('password') for c in clients): raise SystemExit('Backup credentials invalid')
 for name in ('hosts.toml','rules.toml'):
     if (root/name).exists(): tomllib.loads((root/name).read_text())
-for name in ('clients-state.json','panel-protection.json'):
+for name in ('clients-state.json','panel-protection.json','client-guard.json'):
     if (root/name).exists(): json.loads((root/name).read_text())
+protection = json.loads((root/'panel-protection.json').read_text()) if (root/'panel-protection.json').exists() else {}
+if protection.get('transition'): raise SystemExit('Backup contains an unfinished protection transition')
+if protection.get('enabled') or protection.get('tls_enabled'):
+    destination = pathlib.Path(sys.argv[2])
+    config = tomllib.loads((destination/'vpn.toml').read_text())
+    if 'quic' in config.get('listen_protocols', {}): raise SystemExit('Strict backup cannot be restored onto a QUIC-enabled endpoint')
+    configured = pathlib.Path(config.get('rules_file', ''))
+    if not configured.is_absolute(): configured = destination/configured
+    if configured.resolve() != (destination/'rules.toml').resolve() or configured.is_symlink(): raise SystemExit('Destination rules_file is not the managed rules.toml')
+    binary = destination/'trusttunnel_endpoint'
+    result = subprocess.run([str(binary),'--help'],check=True,capture_output=True,text=True,timeout=8)
+    flag = '--client-random-auth-key' if protection.get('tls_enabled') else '--client-random-prefix'
+    if flag not in result.stdout: raise SystemExit('Destination endpoint does not support the restored protection')
+    expected = protection.get('tls_rules_hash' if protection.get('tls_enabled') else 'rules_hash')
+    if hashlib.sha256((root/'rules.toml').read_bytes()).hexdigest() != expected: raise SystemExit('Backup protection hash does not match its rules')
 for path in (root/'client-files').glob('*.toml'): tomllib.loads(path.read_text())
 subprocess.run(['openssl','x509','-in',str(root/'certs/cert.pem'),'-noout','-checkend','0'],check=True,stdout=subprocess.DEVNULL)
 PY
@@ -1874,7 +1943,7 @@ PY
   if [ -f "$IDENTITY_BACKUP_DIR/hosts.toml" ]; then
     cp "$IDENTITY_BACKUP_DIR/hosts.toml" "$TT_DIR/hosts.toml"
   fi
-  for item in rules.toml panel-protection.json; do
+  for item in rules.toml panel-protection.json client-guard.json; do
     if [ -f "$IDENTITY_BACKUP_DIR/$item" ]; then cp "$IDENTITY_BACKUP_DIR/$item" "$TT_DIR/$item"; fi
   done
   if [ -d "$IDENTITY_BACKUP_DIR/client-files" ]; then
@@ -1981,6 +2050,7 @@ configure_cascade() {
 }
 
 configure_routing() {
+  ensure_admin_helper || return
   local choice cidr
   while true; do
     echo
@@ -1997,27 +2067,18 @@ configure_routing() {
         cat "$TT_DIR/rules.toml" 2>/dev/null || echo "rules.toml не найден."
         ;;
       2)
+        assert_protection_unlocked || return
         ask_required cidr "CIDR для блокировки, например 1.2.3.4/32: "
         if ! printf '%s' "$cidr" | grep -Eq '^[0-9A-Fa-f:.]+/[0-9]{1,3}$'; then
           echo "Неверный CIDR: ${cidr}" >&2
           exit 1
         fi
-        cat >> "$TT_DIR/rules.toml" <<EOF
-
-[[rule]]
-cidr = "${cidr}"
-action = "deny"
-EOF
-        systemctl restart trusttunnel 2>/dev/null || true
-        echo "Deny rule добавлен: ${cidr}"
+        admin_call routing-rule-add "cidr=$cidr" decision=deny
         ;;
       3)
+        assert_protection_unlocked || return
         confirm_action "rules.toml будет сброшен: все authenticated clients будут разрешены."
-        cat > "$TT_DIR/rules.toml" <<'EOF'
-# Empty rules file: all authenticated clients are allowed.
-EOF
-        systemctl restart trusttunnel 2>/dev/null || true
-        echo "rules.toml сброшен."
+        admin_call routing-rule-reset confirm=CONFIRMED
         ;;
       0) return ;;
       *) echo "Нужно выбрать 0-3." ;;
@@ -2577,15 +2638,19 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.22'" "$ADMIN_HELPER_PATH"; then return; fi
-  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.22'" /usr/local/lib/trusttunnel/admin.py; then
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.23'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.23'" /usr/local/lib/trusttunnel/admin.py; then
     ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
     return
   fi
   local candidate
   candidate="$(mktemp)"
   if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
-  if ! python3 -m py_compile "$candidate"; then rm -f "$candidate"; return 1; fi
+  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.10.23'" "$candidate"; then
+    rm -f "$candidate"
+    echo "Требуется общий backend панели 2026.10.23. Обновите панель; старый backend не будет менять профили." >&2
+    return 1
+  fi
   mkdir -p /usr/local/lib/trusttunnel
   ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
   install -m 0700 "$candidate" "$ADMIN_HELPER_PATH"
@@ -2614,11 +2679,44 @@ manage_clients() {
     echo "9) Изменить заметку"
     echo "10) Создать группу клиентов"
     echo "11) Лимиты соединений HTTP/2 и QUIC (не привязка к устройству)"
+    echo "12) Статистика: online, последний онлайн и накопленный трафик"
+    echo "13) Антишаринг: общий лимит трафика и срок"
+    echo "14) Убрать квоту и срок"
+    echo "15) Одноразовое HTTPS-приглашение"
+    echo "16) Отозвать неиспользованные приглашения"
+    echo "17) Обновить сетевые параметры выбранного профиля"
+    echo "18) Диагностика клиента (без секретов)"
     echo "0) Назад"
     prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
       0) return ;;
       1) admin_call client-list ;;
+      12) admin_call guard-status ;;
+      13)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        local quota expiry automatic ack
+        ask_default quota "Общая квота ГиБ (0: без лимита; не месячная)" "0"
+        prompt_value "Действует до UTC, ГГГГ-ММ-ДДTЧЧ:ММ (пусто: бессрочно): "; expiry="$REPLY_VALUE"
+        ask_yes_no automatic "Автоматически отзывать доступ по квоте/сроку" 0
+        ack=0
+        if [ "$automatic" = 1 ]; then ask_yes_no ack "Допускаю краткий перезапуск VPN при автоотзыве" 0; fi
+        confirm_action "Сохранить политику? Квота проверяется каждые 15 с при работающей панели; последний активный клиент не отключается."
+        admin_call guard-save "username=$user" "quota_gib=$quota" "expires=$expiry" "auto_suspend=$automatic" "disconnect_ack=$ack" confirm=CONFIRMED ;;
+      14|15|16|17|18)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        case "$choice" in
+          14) confirm_action "Снять срок и квоту (не включает отключённого клиента)."; admin_call guard-remove "username=$user" confirm=CONFIRMED ;;
+          15)
+            local minutes protocol kind
+            ask_default minutes "Срок приглашения, минут (1–1440)" "15"
+            ask_default protocol "Протокол http2/http3" "http2"
+            ask_default kind "Профиль static/protected/tls-auth" "static"
+            confirm_action "Создать одноразовую выдачу? После получения сам профиль остаётся копируемым."
+            admin_call enrollment-issue "username=$user" "minutes=$minutes" "protocol=$protocol" "kind=$kind" confirm=CONFIRMED ;;
+          16) confirm_action "Отозвать непогашенные приглашения?"; admin_call enrollment-revoke "username=$user" confirm=CONFIRMED ;;
+          17) confirm_action "Обновить DNS/AntiDPI/TLS профиль выбранного клиента. Ключи и SNI сохраняются, нужен повторный импорт."; admin_call client-refresh-network "username=$user" confirm=CONFIRMED ;;
+          18) admin_call diagnostics-client "username=$user" ;;
+        esac ;;
       5) confirm_action "Будут пересобраны клиентские профили."; admin_call client-rebuild ;;
       10)
         prompt_value "Префикс [client]: "; prefix="${REPLY_VALUE:-client}"
@@ -2642,7 +2740,7 @@ manage_clients() {
           8) admin_call client-enable "username=$user" ;;
           9) prompt_value "Заметка: "; note="$REPLY_VALUE"; admin_call client-note "username=$user" "note=$note" ;;
         esac ;;
-      *) echo "Выберите 0–11." ;;
+      *) echo "Выберите 0–18." ;;
     esac
   done
 }
@@ -2697,9 +2795,11 @@ manage_admin() {
         prompt_value "Источник IP / CIDR (пусто = любой): "; third="$REPLY_VALUE"
         if [ "$choice" = 8 ]; then admin_call security-open "port=$value" "proto=$second" "source=$third"; else admin_call security-close "port=$value" "proto=$second" "source=$third"; fi ;;
       10)
-        prompt_value "Режим (direct / warp / socks5): "; value="$REPLY_VALUE"; second=""
+        admin_call routing-current
+        prompt_value "Режим direct / warp / masque / interface / interface-masque / socks5 (пусто: не менять): "; value="$REPLY_VALUE"; second=""
         if [ "$value" = socks5 ]; then prompt_value "SOCKS5 host:port: "; second="$REPLY_VALUE"; fi
         confirm_action "Будет изменён исходящий маршрут и перезапущен TrustTunnel."
+        [ -n "$value" ] || continue
         admin_call routing-switch "mode=$value" "address=$second" ;;
       11) admin_call routing-check ;;
       12)
@@ -3210,6 +3310,7 @@ main() {
       ;;
   esac
 
+  assert_protection_unlocked
   if [ -f /etc/systemd/system/trusttunnel.service.d/40-warp-interface.conf ]; then
     echo "Перед полной переустановкой отключите интерфейсный WARP через пункт 32. Текущие настройки не изменены." >&2
     return 1
