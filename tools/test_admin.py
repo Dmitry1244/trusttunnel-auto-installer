@@ -112,10 +112,12 @@ class AdminTests(unittest.TestCase):
 
     def test_scoped_firewall_rule_validation(self):
         with patch.object(panel, 'current_ssh_port', return_value='49222'), patch.object(panel, 'current_panel_env', return_value={'PANEL_PORT': '8088'}):
-            panel.network_operation('security-open', {'port': '59177', 'proto': 'tcp', 'source': '192.0.2.7/24'})
-            self.assertEqual(panel.run.call_args.args[0], ['ufw', 'allow', 'proto', 'tcp', 'from', '192.0.2.0/24', 'to', 'any', 'port', '59177'])
+            rule = panel.firewall_rule({'port': '59177', 'proto': 'tcp', 'source': '192.0.2.7/24'})
+            self.assertEqual(rule, ['ufw', 'allow', 'in', 'proto', 'tcp', 'from', '192.0.2.0/24', 'to', 'any', 'port', '59177'])
             with self.assertRaises(ValueError):
-                panel.network_operation('security-open', {'port': '59177', 'source': 'any; reboot'})
+                panel.firewall_rule({'port': '59177', 'source': 'any; reboot'})
+            with self.assertRaises(ValueError):
+                panel.network_operation('security-open', {'port':'59177'})
 
     def test_fail2ban_exclusion_preserves_existing_and_rolls_back(self):
         target = self.root / 'ignore.local'

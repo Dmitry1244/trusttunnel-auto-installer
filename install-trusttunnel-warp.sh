@@ -722,7 +722,7 @@ write_letsencrypt_cert() (
   trap 'exit 143' TERM INT
   if ufw status 2>/dev/null | grep -q "Status: active"; then
     if ! ufw status 2>/dev/null | awk '$1 == "80/tcp" && $2 == "ALLOW" && ($3 == "Anywhere" || ($3 == "IN" && $4 == "Anywhere")) { found=1 } END { exit !found }'; then
-      ufw insert 1 allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null
+      ufw insert 1 allow 80/tcp comment "TrustTunnel ACME" >/dev/null
       added_ufw_rule=1
     fi
   fi
@@ -765,6 +765,11 @@ if [ "\${CERT_MODE}" != "letsencrypt" ]; then
   exit 0
 fi
 
+if [ -e /var/lib/trusttunnel-panel/firewall-pending.json ]; then
+  echo "An unconfirmed UFW change is pending; certificate renewal deferred." >&2
+  exit 1
+fi
+
 added_ufw_rule=0
 cleanup() {
   if [ "\${added_ufw_rule}" = "1" ]; then
@@ -776,7 +781,7 @@ trap 'exit 143' TERM INT
 
 if ufw status 2>/dev/null | grep -q "Status: active"; then
   if ! ufw status 2>/dev/null | awk '\$1 == "80/tcp" && \$2 == "ALLOW" && (\$3 == "Anywhere" || (\$3 == "IN" && \$4 == "Anywhere")) { found=1 } END { exit !found }'; then
-    ufw insert 1 allow 80/tcp comment "TrustTunnel Let's Encrypt" >/dev/null
+    ufw insert 1 allow 80/tcp comment "TrustTunnel ACME" >/dev/null
     added_ufw_rule=1
   fi
 fi
@@ -2161,88 +2166,140 @@ manage_ports() {
 }
 
 manage_fail2ban() {
-  local choice ip
+  ensure_admin_helper || return
+  local choice ip jail retry window ban maximum increment action
   while true; do
     echo
-    echo "=== fail2ban ==="
-    echo "1) Статус sshd jail"
-    echo "2) Включить/переустановить fail2ban для SSH"
-    echo "3) Отключить fail2ban"
-    echo "4) Разбанить IP"
+    echo "=== fail2ban (общий backend с панелью) ==="
+    echo "1) Статус службы и список jail"
+    echo "2) Установить пакет"
+    echo "3) Включить службу"
+    echo "4) Отключить службу"
+    echo "5) Перезапустить службу"
+    echo "6) Проверить конфигурацию"
+    echo "7) Перечитать конфигурацию"
+    echo "8) Статистика, блокировки и настройки jail"
+    echo "9) Включить jail"
+    echo "10) Отключить jail"
+    echo "11) Настроить сроки и нарастающий бан"
+    echo "12) Заблокировать IP"
+    echo "13) Разблокировать IP"
+    echo "14) Добавить постоянное исключение"
+    echo "15) Удалить исключение"
+    echo "16) Журнал"
     echo "0) Назад"
-    prompt_value "Выбери действие [1]: "
-    choice="${REPLY_VALUE:-1}"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
-      1) fail2ban-client status sshd 2>/dev/null || systemctl --no-pager status fail2ban || true ;;
-      2)
-        ENABLE_FAIL2BAN=1
-        SSH_PORT="$(current_configured_ssh_port)"
-        SSH_PORT="${SSH_PORT:-$(detect_current_ssh_port)}"
-        apt_update_retry || true
-        apt_install_retry -y --no-install-recommends --no-upgrade fail2ban || true
-        configure_fail2ban
-        echo "fail2ban включен для SSH-порта ${SSH_PORT}."
-        ;;
-      3)
-        confirm_action "fail2ban будет остановлен и отключен."
-        systemctl disable --now fail2ban 2>/dev/null || true
-        echo "fail2ban отключен."
-        ;;
-      4)
-        ask_required ip "IP для разбана: "
-        fail2ban-client set sshd unbanip "$ip" || true
-        ;;
       0) return ;;
-      *) echo "Нужно выбрать 0-4." ;;
+      1) admin_call f2b-status ;;
+      6) admin_call f2b-test ;;
+      16) admin_call f2b-logs ;;
+      2|3|4|5|7)
+        case "$choice" in 2) action=install ;; 3) action=enable ;; 4) action=disable ;; 5) action=restart ;; 7) action=reload ;; esac
+        confirm_action "Изменить службу fail2ban (${action})? Остановка снимает защиту."
+        admin_call "f2b-$action" confirm=CONFIRMED || true ;;
+      8|9|10|11|12|13|14|15)
+        ask_default jail "Имя существующего jail" "sshd"
+        case "$choice" in
+          8) admin_call f2b-jail-status "jail=$jail" || true ;;
+          9|10)
+            action=jail-enable; [ "$choice" != 10 ] || action=jail-disable
+            confirm_action "Изменить постоянное состояние jail ${jail}?"
+            admin_call "f2b-$action" "jail=$jail" confirm=CONFIRMED || true ;;
+          11)
+            ask_default retry "Максимум попыток (1-100)" 5
+            ask_default window "Окно, секунд (60-86400)" 600
+            ask_default ban "Бан, секунд (60-604800)" 3600
+            ask_yes_no increment "Увеличивать повторный бан" 0
+            ask_default maximum "Предел нарастающего бана, секунд (до 2592000)" 604800
+            confirm_action "Применить указанные параметры к jail ${jail}?"
+            admin_call f2b-settings "jail=$jail" "retry=$retry" "findtime=$window" "bantime=$ban" "increment=$increment" "maxtime=$maximum" confirm=CONFIRMED || true ;;
+          12|13|14|15)
+            case "$choice" in 12) action=ban ;; 13) action=unban ;; 14) action=ignore-add ;; 15) action=ignore-remove ;; esac
+            ask_required ip "IP (для исключения допускается CIDR): "
+            confirm_action "Выполнить ${action} для ${ip} только в jail ${jail}?"
+            admin_call "f2b-$action" "jail=$jail" "ip=$ip" confirm=CONFIRMED || true ;;
+        esac ;;
+      *) echo "Выберите 0-16." ;;
     esac
   done
 }
 
 manage_ufw() {
-  local choice port proto ssh_port endpoint_port quic
+  ensure_admin_helper || return
+  local choice port proto decision direction source destination interface position comment action level policy snapshot version number token
   while true; do
     echo
-    echo "=== UFW firewall ==="
+    echo "=== UFW (без сброса чужих правил; откат через 120 секунд) ==="
     echo "1) Статус"
-    echo "2) Открыть порт"
-    echo "3) Закрыть порт"
-    echo "4) Пересобрать базовые правила SSH + TrustTunnel"
+    echo "2) Добавить правило (allow/deny/reject/limit, CIDR, диапазоны)"
+    echo "3) Удалить конкретную строку правила"
+    echo "4) Добавить разрешения SSH / VPN / панели без сброса"
+    echo "5) Включить UFW"
+    echo "6) Отключить UFW"
+    echo "7) Перезагрузить правила"
+    echo "8) Политика по умолчанию"
+    echo "9) Журналирование"
+    echo "10) Проверить новое правило без применения"
+    echo "11) Подтвердить сохранность доступа и сохранить изменения"
+    echo "12) Откатить ожидающее изменение"
+    echo "13) Журнал UFW"
+    echo "14) Профили приложений"
+    echo "15) Заблокировать входящий трафик IP / подсети на всех портах"
+    echo "16) Установить пакет UFW"
     echo "0) Назад"
-    prompt_value "Выбери действие [1]: "
-    choice="${REPLY_VALUE:-1}"
+    prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
-      1) ufw status verbose ;;
-      2)
-        ask_required port "Порт: "
-        validate_port "Порт" "$port"
-        ask_default proto "Протокол tcp/udp" "tcp"
-        ufw allow "${port}/${proto}" || true
-        ;;
-      3)
-        ask_required port "Порт: "
-        validate_port "Порт" "$port"
-        ask_default proto "Протокол tcp/udp" "tcp"
-        ufw delete allow "${port}/${proto}" || true
-        ;;
-      4)
-        endpoint_port="$(current_endpoint_port)"
-        quic="$(current_quic_enabled)"
-        ssh_port="$(current_configured_ssh_port)"
-        ssh_port="${ssh_port:-$(detect_current_ssh_port)}"
-        confirm_action "UFW будет сброшен. Будут открыты SSH ${ssh_port}/tcp, TrustTunnel ${endpoint_port}/tcp и UDP при включенном QUIC."
-        ufw --force reset
-        ufw default deny incoming
-        ufw default allow outgoing
-        ufw allow "${ssh_port}/tcp" comment "SSH"
-        ufw allow "${endpoint_port}/tcp" comment "TrustTunnel TCP"
-        if [ "$quic" = "1" ]; then
-          ufw allow "${endpoint_port}/udp" comment "TrustTunnel QUIC"
-        fi
-        ufw --force enable
-        ufw status verbose
-        ;;
       0) return ;;
-      *) echo "Нужно выбрать 0-4." ;;
+      1) admin_call ufw-status ;;
+      2|10)
+        ask_default decision "Действие allow/deny/reject/limit" allow
+        ask_default direction "Направление in/out" in
+        ask_required port "Порт или диапазон (10000:10100): "
+        ask_default proto "Протокол tcp/udp" tcp
+        prompt_value "Источник IP/CIDR (пусто: любой): "; source="$REPLY_VALUE"
+        prompt_value "Назначение IP/CIDR (пусто: любое): "; destination="$REPLY_VALUE"
+        prompt_value "Интерфейс (пусто: все): "; interface="$REPLY_VALUE"
+        ask_default position "Положение append/prepend" append
+        prompt_value "Комментарий (до 80 символов): "; comment="$REPLY_VALUE"
+        action=preview
+        if [ "$choice" = 2 ]; then confirm_action "Применить правило? После изменения подтвердите доступ пунктом 11 за 120 секунд."; action=rule; fi
+        admin_call "ufw-$action" "decision=$decision" "direction=$direction" "port=$port" "proto=$proto" "source=$source" "destination=$destination" "interface=$interface" "position=$position" "comment=$comment" confirm=CONFIRMED || true ;;
+      3)
+        snapshot="$(python3 "$ADMIN_HELPER_PATH" --admin ufw-snapshot </dev/null)" || continue
+        printf '%s\n' "$snapshot" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["verbose"]); [print(str(r["number"])+": "+r["text"]) for r in d["rules"]]'
+        version="$(printf '%s\n' "$snapshot" | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+        ask_required number "Номер строки (IPv4/IPv6 отдельно): "
+        confirm_action "Удалить только строку ${number}? После применения подтвердите доступ пунктом 11."
+        admin_call ufw-delete "number=$number" "version=$version" confirm=CONFIRMED || true ;;
+      4|5|6|7)
+        case "$choice" in 4) action=baseline ;; 5) action=enable ;; 6) action=disable ;; 7) action=reload ;; esac
+        confirm_action "Изменить UFW (${action}) без полного сброса? Подтвердите доступ пунктом 11 за 120 секунд."
+        admin_call "ufw-$action" confirm=CONFIRMED || true ;;
+      8)
+        ask_default direction "incoming/outgoing/routed" incoming
+        ask_default policy "Политика allow/deny/reject (для outgoing/routed только allow)" deny
+        confirm_action "Изменить политику UFW? Затем подтвердите доступ пунктом 11."
+        admin_call ufw-default "direction=$direction" "policy=$policy" confirm=CONFIRMED || true ;;
+      9)
+        ask_default level "Журналирование off/low/medium/high/full" low
+        confirm_action "Изменить журналирование? High/full могут увеличить нагрузку."
+        admin_call ufw-logging "level=$level" confirm=CONFIRMED || true ;;
+      11|12)
+        token="$(python3 "$ADMIN_HELPER_PATH" --admin ufw-pending </dev/null)" || continue
+        action=confirm; [ "$choice" != 12 ] || action=rollback
+        confirm_action "${action}: вы проверили новую SSH-сессию, VPN и доступ к панели?"
+        admin_call "ufw-$action" "token=$token" confirm=CONFIRMED || true ;;
+      13) admin_call ufw-logs ;;
+      14) admin_call ufw-applications ;;
+      15)
+        ask_required source "IP / CIDR источника: "
+        confirm_action "Заблокировать входящий трафик ${source} на всех портах? Проверьте доступ и подтвердите пунктом 11 за 120 секунд."
+        admin_call ufw-source-block "source=$source" confirm=CONFIRMED || true ;;
+      16)
+        confirm_action "Установить пакет UFW без обновления остальных пакетов?"
+        admin_call ufw-install confirm=CONFIRMED || true ;;
+      *) echo "Выберите 0-16." ;;
     esac
   done
 }
@@ -2638,17 +2695,17 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.23'" "$ADMIN_HELPER_PATH"; then return; fi
-  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.23'" /usr/local/lib/trusttunnel/admin.py; then
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.25'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.25'" /usr/local/lib/trusttunnel/admin.py; then
     ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
     return
   fi
   local candidate
   candidate="$(mktemp)"
   if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
-  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.10.23'" "$candidate"; then
+  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.10.25'" "$candidate"; then
     rm -f "$candidate"
-    echo "Требуется общий backend панели 2026.10.23. Обновите панель; старый backend не будет менять профили." >&2
+    echo "Требуется общий backend панели 2026.10.25. Обновите панель; старый backend не будет менять настройки." >&2
     return 1
   fi
   mkdir -p /usr/local/lib/trusttunnel

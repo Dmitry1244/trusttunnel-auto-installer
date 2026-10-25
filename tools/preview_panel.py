@@ -3,9 +3,11 @@ from test_admin import panel
 import http.server
 import io
 import sys
+import os
 from pathlib import Path
 import urllib.parse
 sys.path.insert(0, str(Path(__file__).parent / 'qa-deps'))
+if os.environ.get('TT_UI_DEPS'): sys.path.insert(0,os.environ['TT_UI_DEPS'])
 import qrcode
 
 panel.domain = lambda: 'vpn.example.test'
@@ -15,6 +17,9 @@ panel.cert_mode = lambda: 'letsencrypt'
 panel.endpoint_version = lambda: 'TrustTunnel test fixture'
 panel.client_tls_profile = lambda: 'chrome'
 panel.jail_settings = lambda: {'maxretry':'5','findtime':'600','bantime':'3600'}
+panel.firewall_snapshot = lambda: dict(available=True,active=True,verbose='Status: active\nDefault: deny (incoming), allow (outgoing)',added='ufw allow 49222/tcp',version='synthetic-version',rules=[dict(number=i+1,text=text) for i,text in enumerate(['49222/tcp  ALLOW IN  Anywhere','8443/tcp  ALLOW IN  Anywhere','8443/udp  ALLOW IN  Anywhere','8088/tcp  ALLOW IN  Anywhere','9000/tcp  ALLOW IN  192.0.2.0/24'])])
+panel.firewall_pending = lambda: None
+panel.fail2ban_snapshot = lambda: dict(available=True,active=['sshd','nginx-http-auth'],configured=['sshd','nginx-http-auth'],status='2 jails active',service='active')
 panel.forwarder_label = lambda: 'WARP · WireGuard интерфейс'
 panel.current_warp_backend = lambda: 'wg-interface'
 fixture_clients = [dict(username=f'client{i:02}', password='synthetic-password', enabled=i % 3 != 0, note='Тестовый профиль') for i in range(1, 28)]
@@ -61,4 +66,4 @@ class Preview(panel.Handler):
         super().do_GET()
 
 
-http.server.ThreadingHTTPServer(('127.0.0.1', 18089), Preview).serve_forever()
+http.server.ThreadingHTTPServer(('127.0.0.1', int(os.environ.get('TT_PREVIEW_PORT','18089'))), Preview).serve_forever()

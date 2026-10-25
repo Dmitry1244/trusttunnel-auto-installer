@@ -29,6 +29,8 @@ except ImportError:
     import tomli as tomllib
 import ipaddress
 import socket
+import configparser
+import io
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -42,7 +44,7 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 DEEPLINK_CACHE = {}
 DEEPLINK_CACHE_TTL = 300
-ADMIN_VERSION = '2026.10.23'
+ADMIN_VERSION = '2026.10.25'
 MASQUE_ADDR = '127.0.0.1:40002'
 MASQUE_DIR = Path('/opt/warp-masque')
 MASQUE_VERSION = 'v4.2.1'
@@ -67,6 +69,10 @@ SESSION_MAX_SECONDS = 12 * 3600
 CPU_SAMPLE = None
 IGNORE_FILE = Path('/etc/fail2ban/jail.d/zz-trusttunnel-ignore.local')
 UFW_DIR = Path('/etc/ufw')
+UFW_DEFAULTS = Path('/etc/default/ufw')
+FIREWALL_PENDING = Path('/var/lib/trusttunnel-panel/firewall-pending.json')
+FAIL2BAN_DIR = Path('/etc/fail2ban')
+FAIL2BAN_OVERRIDE = FAIL2BAN_DIR / 'jail.d/zzzz-trusttunnel-panel.local'
 SCHEDULE_DIR = Path('/etc/systemd/system')
 SECURITY_REPORT = Path('/var/cache/trusttunnel-panel/security.json')
 SYSCTL_DIR = Path('/etc/sysctl.d')
@@ -129,6 +135,7 @@ def login_delay(peer, failed=False, success=False):
 
 def run(cmd, timeout=40, input_text=None, env=None, cwd=None):
     try:
+        env = dict(os.environ if env is None else env, LC_ALL='C')
         p = subprocess.run(cmd, input=input_text, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout, env=env, cwd=cwd)
         return p.returncode, p.stdout.strip()
     except Exception as exc:
@@ -143,10 +150,7 @@ def read_text(path):
 
 
 def write_text(path, text, mode=0o600):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding='utf-8')
-    os.chmod(path, mode)
+    atomic_write(path, text, mode)
 
 
 def q(value):
@@ -415,6 +419,11 @@ def client_operation(action, values):
 
 
 def admin_operation(action, values):
+    if action.startswith(('ufw-', 'f2b-')):
+        with admin_lock():
+            result = firewall_operation(action[4:], values) if action.startswith('ufw-') else fail2ban_operation(action[4:], values)
+            with CACHE_LOCK: SNAPSHOT_CACHE.clear()
+            return result
     if action.startswith('diagnostics-'):
         return diagnostic_report(action[12:], values)
     if action.startswith('guard-'):
@@ -1544,6 +1553,12 @@ def validated_dns(value):
 
 
 def network_operation(action, values):
+    aliases = {'security-ban':'ban','security-unban':'unban','security-fail2ban':'settings',
+               'security-ignore-add':'ignore-add','security-ignore-remove':'ignore-remove'}
+    if action in aliases: return fail2ban_operation(aliases[action],values)
+    if action == 'security-open': return firewall_operation('rule',dict(values,decision='allow'))
+    if action == 'security-close':
+        raise ValueError('Для безопасного удаления выберите конкретную строку в списке UFW; закрытие порта без проверки версии списка запрещено.')
     if action == 'security-remediate':
         return security_remediate(values)
     if action == 'security-scan':
@@ -1562,59 +1577,9 @@ def network_operation(action, values):
         return recent_logs('ssh', 100) + '\n' + recent_logs('sshd', 100)
     if action == 'security-ignore-list':
         return checked_run(['fail2ban-client', 'get', 'sshd', 'ignoreip'])
-    if action in ('security-ignore-add', 'security-ignore-remove'):
-        return update_ignore_list(action, values)
     if action == 'security-status':
         report = '\n'.join(run(cmd)[1] for cmd in (['ufw', 'status', 'numbered'], ['fail2ban-client', 'status', 'sshd'], ['sshd', '-T']))
         return report + '\n\nSSH jail: ' + json.dumps(jail_settings(), ensure_ascii=False)
-    if action in ('security-ban', 'security-unban'):
-        address = str(ipaddress.ip_address(values.get('ip', '')))
-        if action == 'security-ban':
-            caller = values.get('_peer') or os.environ.get('SSH_CONNECTION', '').split(' ')[0]
-            if ipaddress.ip_address(address).is_loopback or address == caller:
-                raise ValueError('Нельзя заблокировать loopback или IP текущего администратора.')
-        return checked_run(['fail2ban-client', 'set', 'sshd', 'banip' if action == 'security-ban' else 'unbanip', address])
-    if action == 'security-fail2ban':
-        retry, findtime, bantime = (int(values.get(k, default)) for k, default in [('retry', '5'), ('findtime', '600'), ('bantime', '3600')])
-        if not 1 <= retry <= 100 or not 60 <= findtime <= 86400 or not 60 <= bantime <= 604800:
-            raise ValueError('Попытки: 1–100; окно: 60–86400 с; бан: 60–604800 с.')
-        path = Path('/etc/fail2ban/jail.d/sshd.local')
-        old = read_text(path)
-        import configparser
-        config = configparser.ConfigParser(interpolation=None)
-        config.read_string(old or '[sshd]\n')
-        if not config.has_section('sshd'):
-            config.add_section('sshd')
-        config['sshd'].update({'enabled': 'true', 'port': current_ssh_port(), 'backend': 'systemd', 'maxretry': str(retry), 'findtime': str(findtime), 'bantime': str(bantime)})
-        import io
-        output = io.StringIO(); config.write(output)
-        atomic_write(path, output.getvalue())
-        try:
-            checked_run(['fail2ban-client', '-t'])
-            checked_run(['systemctl', 'restart', 'fail2ban'])
-            wait_fail2ban()
-        except Exception:
-            if old: atomic_write(path, old)
-            else: path.unlink(missing_ok=True)
-            run(['systemctl', 'restart', 'fail2ban'])
-            raise
-        return 'Параметры SSH jail сохранены.'
-    if action in ('security-open', 'security-close'):
-        port, proto = values.get('port', ''), values.get('proto', 'tcp')
-        if not validate_port(port) or proto not in ('tcp', 'udp'):
-            raise ValueError('Некорректный порт или протокол.')
-        protected = {int(current_ssh_port()), int(endpoint_port()), int(current_panel_env().get('PANEL_PORT', '8088'))}
-        if action == 'security-close' and int(port) in protected:
-            raise ValueError('Этот порт используется SSH, TrustTunnel или панелью. Сначала смените порт сервиса.')
-        source = values.get('source', '').strip()
-        rule = ['allow', f'{int(port)}/{proto}']
-        if source:
-            source = str(ipaddress.ip_network(source, strict=False))
-            rule = ['allow', 'proto', proto, 'from', source, 'to', 'any', 'port', str(int(port))]
-        command = ['ufw'] + ([] if action == 'security-open' else ['--force', 'delete']) + rule
-        result = checked_run(command)
-        audit_log(action, f'{port}/{proto} from {source or "any"}')
-        return result
     if action == 'routing-check':
         return diagnostics_output()
     if action == 'routing-current':
@@ -1720,6 +1685,7 @@ def network_operation(action, values):
 
 
 def configure_echo_policy(values):
+    require_no_firewall_pending()
     if values.get('confirm') != 'CONFIRMED': raise ValueError('Подтвердите настройку входящего ping.')
     if values.get('enabled') not in ('0','1'): raise ValueError('Выберите разрешение или блокировку ping.')
     if 'Status: active' not in checked_run(['ufw','status']): raise ValueError('Для управляемого ping нужен активный UFW. Правила не изменены.')
@@ -1847,14 +1813,7 @@ def update_ignore_list(action, values):
     token = str(network)
     current = checked_run(['fail2ban-client', 'get', 'sshd', 'ignoreip'])
     # Preserve the effective exclusions, including hostnames from other config files.
-    tokens = []
-    for line in current.splitlines():
-        item = line.strip().lstrip('|`- ').strip()
-        if not item or any(ch.isspace() for ch in item) or not re.fullmatch(r'[A-Za-z0-9_.:/-]+', item):
-            continue
-        try: item = str(ipaddress.ip_network(item, strict=False))
-        except ValueError: pass
-        if item not in tokens: tokens.append(item)
+    tokens = fail2ban_ignores(current)
     if action.endswith('add'):
         if token not in tokens: tokens.append(token)
     else:
@@ -2503,8 +2462,11 @@ PANEL_TIMER = Path('/etc/systemd/system/trusttunnel-maintenance.timer')
 
 def audit_log(action, detail=''):
     stamp = time.strftime('%Y-%m-%d %H:%M:%S %z')
+    action = re.sub(r'[\x00-\x1f\x7f]', ' ', str(action))[:80]
+    detail = re.sub(r'[\x00-\x1f\x7f]', ' ', str(detail))[:2000]
     try:
-        with PANEL_AUDIT_LOG.open('a', encoding='utf-8') as fp:
+        fd = os.open(PANEL_AUDIT_LOG,os.O_WRONLY|os.O_CREAT|os.O_APPEND|getattr(os,'O_NOFOLLOW',0),0o600)
+        with os.fdopen(fd,'a',encoding='utf-8') as fp:
             fp.write(f'{stamp} {action} {detail}\n')
         os.chmod(PANEL_AUDIT_LOG, 0o600)
     except OSError:
@@ -2600,7 +2562,12 @@ def update_system_packages():
 
 
 def audit_output():
-    return read_text(PANEL_AUDIT_LOG) or 'No panel actions recorded yet.'
+    if not PANEL_AUDIT_LOG.is_file(): return 'No panel actions recorded yet.'
+    with PANEL_AUDIT_LOG.open('rb') as fp:
+        size = fp.seek(0,os.SEEK_END)
+        fp.seek(max(0,size-262144))
+        output = fp.read(262144).decode('utf-8',errors='replace')
+    return ('Показаны последние 256 КиБ журнала.\n' if size > 262144 else '')+output
 def rules_text():
     return read_text(TT_DIR / 'rules.toml') or '# Empty rules file: all authenticated clients are allowed.\n'
 
@@ -2627,6 +2594,7 @@ def current_panel_env():
 
 
 def change_endpoint_port(new_port):
+    require_no_firewall_pending()
     if interface_enabled():
         raise ValueError('Перед сменой VPN-порта временно переключите маршрут с интерфейсного WARP на SOCKS или Direct, затем включите интерфейс снова.')
     if not validate_port(new_port):
@@ -2680,6 +2648,7 @@ def change_endpoint_port(new_port):
 
 
 def update_panel_access(mode, port):
+    require_no_firewall_pending()
     if not validate_port(port) or mode not in ('https', 'localhost'):
         raise ValueError('Некорректный режим или порт панели.')
     port = str(int(port))
@@ -2717,6 +2686,7 @@ def update_panel_access(mode, port):
 
 
 def panel_firewall(open_port, port):
+    require_no_firewall_pending()
     if not validate_port(port):raise ValueError('Некорректный порт панели.')
     port = str(int(port))
     status = checked_run(['ufw','status'])
@@ -2756,6 +2726,7 @@ def installer_defaults():
 
 
 def installer_operation(action, values):
+    require_no_firewall_pending()
     if action in ('install','update-trusttunnel') and strict_protection_locked():
         raise ValueError('Сначала явно отключите строгую TLS/ClientHello-защиту. Переустановка/смена версии может удалить правила или установить несовместимый endpoint.')
     allowed = {'install', 'update-trusttunnel', 'install-warp', 'remove-warp', 'reregister-warp', 'enable-warp', 'disable-warp', 'check-warp', 'backup-identity', 'switch-certificate-mode'}
@@ -2815,49 +2786,370 @@ def installer_operation(action, values):
     SNAPSHOT_CACHE.clear()
     return out or 'Операция завершена.'
 
-def fail2ban_output(action, ip=''):
+def confirmed(values):
+    if values.get('confirm') != 'CONFIRMED':
+        raise ValueError('Подтвердите действие кнопкой; из CLI укажите confirm=CONFIRMED.')
+
+
+def normalized_ip(value):
+    address = ipaddress.ip_address(value)
+    return address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped else address
+
+
+def admin_peer(values):
+    value = values.get('_peer') or os.environ.get('SSH_CONNECTION', '').split(' ')[0]
+    return normalized_ip(value) if value else None
+
+
+def ssh_listener_ports():
+    ports = {(int(current_ssh_port()), 'tcp')}
+    rc, output = run(['sshd', '-T'], timeout=5)
+    if rc == 0:
+        ports.update((int(p), 'tcp') for p in re.findall(r'(?m)^port (\d+)$', output) if validate_port(p))
+    rc, output = run(['ss', '-H', '-lntp'], timeout=5)
+    if rc == 0:
+        for line in output.splitlines():
+            if '"sshd"' in line and len(line.split()) >= 4:
+                port = line.split()[3].rsplit(':', 1)[-1]
+                if validate_port(port): ports.add((int(port), 'tcp'))
+    rc, output = run(['systemctl','show','ssh.socket','sshd.socket','--property=Listen','--value'],timeout=5)
+    if rc == 0:
+        ports.update((int(p),'tcp') for p in re.findall(r':(\d+) \(Stream\)',output) if validate_port(p))
+    return sorted(ports)
+
+
+def protected_ports():
+    ports = set(ssh_listener_ports()) | {(int(endpoint_port()),'tcp')}
+    if quic_enabled(): ports.add((int(endpoint_port()),'udp'))
+    panel_port = current_panel_env().get('PANEL_PORT','8088')
+    if validate_port(panel_port): ports.add((int(panel_port),'tcp'))
+    return sorted(ports)
+
+
+def firewall_files():
+    names = ('user.rules', 'user6.rules', 'ufw.conf', 'before.rules', 'before6.rules', 'after.rules', 'after6.rules')
+    return {**{name: UFW_DIR/name for name in names}, 'defaults': UFW_DEFAULTS}
+
+
+def firewall_pending():
+    text = read_text(FIREWALL_PENDING)
+    return json.loads(text) if text else None
+
+
+def require_no_firewall_pending():
+    if firewall_pending(): raise ValueError('Сначала подтвердите или откатите ожидающее изменение UFW; смена портов и обслуживание пока заблокированы.')
+
+
+def firewall_rollback(token):
+    with admin_lock():
+        pending = firewall_pending()
+        if not pending or not secrets.compare_digest(pending['token'], token): return 'Ожидающего отката нет.'
+        for name, path in firewall_files().items():
+            saved = pending['files'][name]
+            if path.is_symlink(): raise RuntimeError('Откат остановлен: символическая ссылка '+str(path))
+            if saved is None: path.unlink(missing_ok=True)
+            else: atomic_write(path, saved['text'], saved['mode'])
+        checked_run(['ufw', '--force', 'enable' if pending['active'] else 'disable'])
+        FIREWALL_PENDING.unlink()
+        SNAPSHOT_CACHE.clear()
+        audit_log('ufw-rollback', token[:12])
+        return 'Прежние файлы и состояние UFW восстановлены.'
+
+
+def firewall_transaction(commands, values):
+    if firewall_pending(): raise ValueError('Сначала подтвердите или откатите предыдущее изменение UFW.')
+    if run(['systemctl','is-active','--quiet','trusttunnel-cert-renew.service'],timeout=5)[0] == 0:
+        raise ValueError('Сейчас выполняется обновление сертификата. Дождитесь завершения работы с временным портом ACME.')
+    files = {}
+    for name, path in firewall_files().items():
+        if path.is_symlink(): raise ValueError('Настройки UFW содержат символическую ссылку. Изменения отменены.')
+        if path.exists() and (not path.is_file() or path.stat().st_size > 2*1024*1024): raise ValueError('Некорректный файл UFW.')
+        files[name] = {'text': read_text(path), 'mode': path.stat().st_mode & 0o777} if path.exists() else None
+    token = secrets.token_hex(16)
+    unit = 'trusttunnel-ufw-rollback-'+token
+    pending = {'token': token, 'unit': unit, 'deadline': time.time()+120, 'files': files,
+               'active': 'Status: active' in checked_run(['ufw', 'status']), 'peer': str(admin_peer(values) or '')}
+    atomic_write(FIREWALL_PENDING, json.dumps(pending))
+    try:
+        # The independent systemd timer survives a hung or stopped panel process.
+        checked_run(['systemd-run', '--quiet', '--unit='+unit, '--on-active=120s',
+                     '--property=Restart=on-failure', '--property=RestartSec=5s',
+                     sys.executable, str(Path(__file__).resolve()), '--firewall-rollback', token])
+    except Exception:
+        FIREWALL_PENDING.unlink(missing_ok=True)
+        raise RuntimeError('Не удалось запустить независимый таймер отката; UFW не изменён.') from None
+    try:
+        output = '\n'.join(checked_run(cmd) for cmd in commands)
+    except Exception as exc:
+        try: firewall_rollback(token)
+        except Exception: raise RuntimeError('Ошибка UFW; автоматический откат ещё ожидается. Проверьте доступ через консоль хостинга.') from exc
+        run(['systemctl', 'stop', unit+'.timer'])
+        raise RuntimeError('Ошибка UFW; прежние настройки восстановлены: '+str(exc)) from None
+    audit_log('ufw-change', str(commands))
+    return output+'\n\nИзменения временные: подтвердите сохранность доступа в течение 120 секунд. Иначе UFW восстановится автоматически.'
+
+
+@cached_snapshot(5)
+def firewall_snapshot():
+    rc, verbose = run(['ufw', 'status', 'verbose'], timeout=5)
+    rc2, numbered = run(['ufw', 'status', 'numbered'], timeout=5)
+    rc3, added = run(['ufw', 'show', 'added'], timeout=5)
+    version = hashlib.sha256((numbered+'\n'+added+'\n'+''.join(read_text(p) for p in firewall_files().values())).encode()).hexdigest()
+    rows = [{'number': int(m[1]), 'text': m[2]} for m in re.finditer(r'(?m)^\[\s*(\d+)\]\s+(.+)$', numbered)]
+    return {'available': rc == rc2 == rc3 == 0, 'active': 'Status: active' in verbose,
+            'verbose': verbose, 'added': added, 'rules': rows, 'version': version}
+
+
+def firewall_rule(values):
+    decision, direction, proto = (values.get(k, default) for k, default in [('decision','allow'),('direction','in'),('proto','tcp')])
+    if decision not in ('allow','deny','reject','limit') or direction not in ('in','out') or proto not in ('tcp','udp'):
+        raise ValueError('Недопустимое действие, направление или протокол UFW.')
+    if decision == 'limit' and (proto != 'tcp' or direction != 'in'): raise ValueError('Limit поддерживается только для входящего TCP.')
+    port = values.get('port','').strip()
+    match = re.fullmatch(r'([0-9]{1,5})(?::([0-9]{1,5}))?', port)
+    if not match: raise ValueError('Укажите порт или диапазон вида 10000:10100.')
+    low, high = int(match[1]), int(match[2] or match[1])
+    if not 1 <= low <= high <= 65535: raise ValueError('Некорректный диапазон портов.')
+    source, destination = (values.get(k,'').strip() for k in ('source','destination'))
+    source = str(ipaddress.ip_network(source,strict=False)) if source else 'any'
+    destination = str(ipaddress.ip_network(destination,strict=False)) if destination else 'any'
+    if source != 'any' and destination != 'any' and ipaddress.ip_network(source).version != ipaddress.ip_network(destination).version:
+        raise ValueError('Источник и назначение должны быть одной версии IP.')
+    if decision != 'allow' and any(low <= p <= high and proto == pr for p,pr in protected_ports()):
+        raise ValueError('Нельзя ограничивать порты SSH, VPN или панели. Сначала измените настройки соответствующего сервиса.')
+    interface = values.get('interface','').strip()
+    if interface and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}',interface): raise ValueError('Некорректное имя интерфейса.')
+    comment = values.get('comment','').strip()
+    if len(comment) > 80 or any(ord(c) < 32 or ord(c) == 127 or c in "'\"" for c in comment): raise ValueError('Комментарий: до 80 символов без кавычек и управляющих знаков.')
+    rule = [decision,direction]+(['on',interface] if interface else [])
+    rule += ['proto',proto,'from',source,'to',destination,'port',str(low) if low == high else f'{low}:{high}']
+    if comment: rule += ['comment',comment]
+    position = values.get('position','append')
+    if position not in ('append','prepend'): raise ValueError('Неизвестное положение правила.')
+    return ['ufw']+(['prepend'] if position == 'prepend' else [])+rule
+
+
+def firewall_delete(values):
+    SNAPSHOT_CACHE.pop('firewall_snapshot',None)
+    snapshot = firewall_snapshot()
+    if not snapshot['available']: raise ValueError('Не удалось перечитать правила UFW.')
+    if not values.get('version') or not secrets.compare_digest(values['version'],snapshot['version']):
+        raise ValueError('Правила изменились или форма устарела. Обновите список и повторите действие.')
+    number = values.get('number','')
+    if not re.fullmatch(r'[0-9]{1,5}',number): raise ValueError('Некорректный номер правила.')
+    row = next((r for r in snapshot['rules'] if r['number'] == int(number)),None)
+    if row is None: raise ValueError('Правило не найдено.')
+    # Unknown application profiles and broad permits are fail-closed on deletion.
+    if re.search(r'\b(?:ALLOW|LIMIT)\b',row['text']):
+        target = re.split(r'\s{2,}',row['text'])[0]
+        tokens = re.findall(r'(?<![\w.:])([0-9]{1,5})(?::([0-9]{1,5}))?(?:/(tcp|udp))?(?![\w.:])',target)
+        if not tokens or any(int(lo) <= p <= int(hi or lo) and (not pr or pr == proto)
+                             for lo,hi,pr in tokens for p,proto in protected_ports()):
+            raise ValueError('Это разрешение может обеспечивать SSH, VPN или панель. Удаление из панели запрещено.')
+    return ['ufw','--force','delete',str(int(number))]
+
+
+def firewall_baseline_commands():
+    SNAPSHOT_CACHE.pop('firewall_snapshot',None)
+    data = firewall_snapshot()
+    if not data['available']: raise ValueError('Не удалось прочитать существующие правила. Базовые разрешения не изменены.')
+    permitted = []
+    for row in data['rules']:
+        if not re.search(r'\b(?:ALLOW|LIMIT) IN\b',row['text']): continue
+        target = re.split(r'\s{2,}',row['text'])[0].replace(' (v6)','')
+        if target == 'Anywhere': return []
+        match = re.fullmatch(r'(\d+)(?::(\d+))?(?:/(tcp|udp))?',target)
+        if not match: raise ValueError('Есть разрешение с профилем приложения или сложным назначением. Автоматическое добавление широких разрешений отменено; сначала проверьте правила вручную.')
+        permitted.append((int(match[1]),int(match[2] or match[1]),match[3]))
+    return [['ufw','insert','1','allow',f'{p}/{proto}','comment','TrustTunnel protected access']
+            for p,proto in protected_ports() if not any(lo <= p <= hi and (not pr or pr == proto) for lo,hi,pr in permitted)]
+
+
+def firewall_operation(action, values):
+    if action == 'snapshot':
+        SNAPSHOT_CACHE.pop('firewall_snapshot',None)
+        return json.dumps(firewall_snapshot(),ensure_ascii=False)
+    if action == 'pending':
+        pending = firewall_pending()
+        return pending['token'] if pending else ''
     if action == 'status':
-        return run(['fail2ban-client', 'status', 'sshd'], timeout=15)[1]
-    if action == 'enable':
-        checked_run(['apt-get', '-o', 'Acquire::Retries=3', 'install', '-y', '--no-install-recommends', '--no-upgrade', 'fail2ban'], timeout=90)
-        jail = '[sshd]\nenabled = true\nport = '+current_ssh_port()+'\nbackend = systemd\n'
-        atomic_write('/etc/fail2ban/jail.d/zz-trusttunnel-port.local',jail)
+        SNAPSHOT_CACHE.pop('firewall_snapshot',None)
+        data = firewall_snapshot()
+        return data['verbose']+'\n\n'+data['added']
+    if action == 'applications': return checked_run(['ufw','app','list'])
+    if action == 'logs': return checked_run(['journalctl','-k','--no-pager','-n','200','--grep=\\[UFW '])
+    if action in ('confirm','rollback'):
+        confirmed(values)
+        pending = firewall_pending()
+        if not pending or not secrets.compare_digest(values.get('token',''),pending['token']): raise ValueError('Ожидающее изменение уже завершено или устарело.')
+        if action == 'rollback': return firewall_rollback(pending['token'])
+        if time.time() >= pending['deadline']:
+            firewall_rollback(pending['token']); raise ValueError('Срок подтверждения истёк; настройки восстановлены.')
+        checked_run(['systemctl','stop',pending['unit']+'.timer'])
+        FIREWALL_PENDING.unlink()
+        audit_log('ufw-confirm',pending['token'][:12])
+        return 'Сохранность доступа подтверждена. Изменения UFW сохранены.'
+    if action == 'preview': return checked_run(['ufw','--dry-run',*firewall_rule(values)[1:]])
+    confirmed(values)
+    if action == 'install':
+        require_no_firewall_pending()
+        return checked_run(['apt-get','-o','Acquire::Retries=3','install','-y','--no-install-recommends','--no-upgrade','ufw'],timeout=180)
+    if action == 'rule': commands = [firewall_rule(values)]
+    elif action == 'source-block':
+        network = ipaddress.ip_network(values.get('source',''),strict=False)
+        if isinstance(network,ipaddress.IPv6Network) and network.prefixlen >= 96 and network.network_address.ipv4_mapped:
+            network = ipaddress.ip_network((network.network_address.ipv4_mapped,network.prefixlen-96),strict=False)
+        peer = admin_peer(values)
+        loopback = ipaddress.ip_network('127.0.0.0/8' if network.version == 4 else '::1/128')
+        if network.prefixlen == 0 or network.overlaps(loopback) or (peer and peer.version == network.version and peer in network):
+            raise ValueError('Нельзя заблокировать весь интернет, loopback или адрес текущего администратора.')
+        commands = [['ufw','prepend','deny','in','from',str(network),'to','any','comment','TrustTunnel blocked source']]
+    elif action == 'delete': commands = [firewall_delete(values)]
+    elif action in ('enable','baseline'):
+        commands = firewall_baseline_commands()
+        if action == 'enable': commands.append(['ufw','--force','enable'])
+    elif action in ('disable','reload'): commands = [['ufw','--force',action]]
+    elif action == 'logging':
+        level = values.get('level','')
+        if level not in ('off','low','medium','high','full'): raise ValueError('Некорректный уровень журналирования.')
+        commands = [['ufw','logging',level]]
+    elif action == 'default':
+        policy, direction = values.get('policy',''), values.get('direction','')
+        if direction not in ('incoming','outgoing','routed') or policy not in ('allow','deny','reject'): raise ValueError('Некорректная политика UFW.')
+        if direction != 'incoming' and policy != 'allow': raise ValueError('Блокировка исходящего/маршрутизируемого трафика может отключить WARP и DNS. Настройте отдельные адресные правила.')
+        commands = firewall_baseline_commands()
+        commands.append(['ufw','default',policy,direction])
+    else: raise ValueError('Неизвестная операция UFW. Полный сброс правил из панели запрещён.')
+    if not commands: return 'Необходимые разрешения уже существуют; ограничения источников сохранены. UFW не изменён.'
+    return firewall_transaction(commands,values)
+
+
+@cached_snapshot(10)
+def fail2ban_snapshot():
+    rc, status = run(['fail2ban-client','status'],timeout=5)
+    match = re.search(r'Jail list:\s*([^\n]*)',status)
+    active = [v.strip() for v in match[1].split(',') if re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}',v.strip())] if match else []
+    configured = {'sshd'}
+    for path in [FAIL2BAN_DIR/'jail.conf',FAIL2BAN_DIR/'jail.local',*sorted((FAIL2BAN_DIR/'jail.d').glob('*.conf')),*sorted((FAIL2BAN_DIR/'jail.d').glob('*.local'))]:
+        if path.is_file() and path.stat().st_size <= 1024*1024:
+            configured.update(s for s in re.findall(r'(?m)^\[([A-Za-z0-9][A-Za-z0-9_.-]{0,63})\]\s*$',read_text(path)) if s not in ('DEFAULT','INCLUDES'))
+    return {'available':rc == 0,'active':active,'configured':sorted(configured),'status':status,
+            'service':service_status('fail2ban')}
+
+
+def jail_name(values):
+    jail = values.get('jail','sshd')
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}',jail) or jail not in set(fail2ban_snapshot()['configured']+fail2ban_snapshot()['active']):
+        raise ValueError('Выберите существующий jail; произвольные имена запрещены.')
+    return jail
+
+
+def save_jail_override(jail, updates):
+    old = read_text(FAIL2BAN_OVERRIDE)
+    config = configparser.ConfigParser(interpolation=None)
+    if old:
+        try: config.read_string(old)
+        except configparser.Error: raise ValueError('Управляемый override fail2ban повреждён. Исправьте его вручную; файл не изменён.') from None
+    if not config.has_section(jail): config.add_section(jail)
+    config[jail].update(updates)
+    output = io.StringIO(); config.write(output)
+    atomic_write(FAIL2BAN_OVERRIDE,output.getvalue())
+    try:
         checked_run(['fail2ban-client','-t'])
-        checked_run(['systemctl','enable','--now','fail2ban'],timeout=20)
-        checked_run(['systemctl','restart','fail2ban'],timeout=20)
-        wait_fail2ban()
-        return 'fail2ban включён для SSH. Существующие исключения и сроки блокировки сохранены.'
-    if action == 'disable':
-        return run(['systemctl', 'disable', '--now', 'fail2ban'], timeout=20)[1] or 'fail2ban disabled.'
-    if action == 'unban' and ip:
-        return run(['fail2ban-client', 'set', 'sshd', 'unbanip', ip], timeout=15)[1]
-    return 'Unknown fail2ban action.'
+        if service_status('fail2ban') == 'active': checked_run(['fail2ban-client','reload'])
+    except Exception:
+        if old: atomic_write(FAIL2BAN_OVERRIDE,old)
+        else: FAIL2BAN_OVERRIDE.unlink(missing_ok=True)
+        if service_status('fail2ban') == 'active': run(['fail2ban-client','reload'])
+        raise
 
 
-def ufw_output(action, port='', proto='tcp'):
+def fail2ban_ignores(output):
+    tokens = []
+    for line in output.splitlines():
+        line = line.strip().lstrip('|`- ').strip()
+        if not line or line.endswith(':'): continue
+        for value in re.split(r'[\s,]+',line):
+            try: value = str(ipaddress.ip_network(value,strict=False))
+            except ValueError:
+                if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,252}',value): raise ValueError('Неподдерживаемый формат исключений; автоматическая перезапись отменена.') from None
+            if value not in tokens: tokens.append(value)
+    return tokens
+
+
+def fail2ban_operation(action, values):
     if action == 'status':
-        return run(['ufw', 'status', 'verbose'], timeout=20)[1]
-    if action in ('allow', 'delete'):
-        with admin_lock():
-            return network_operation('security-open' if action == 'allow' else 'security-close', {'port': port, 'proto': proto})
-    if action == 'rebuild':
-        ssh_port = current_ssh_port()
-        tt_port = endpoint_port()
-        cmds = [
-            ['ufw', 'allow', f'{ssh_port}/tcp', 'comment', 'SSH'], ['ufw', 'allow', f'{tt_port}/tcp', 'comment', 'TrustTunnel TCP']
-        ]
-        if quic_enabled():
-            cmds.append(['ufw', 'allow', f'{tt_port}/udp', 'comment', 'TrustTunnel QUIC'])
-        panel = current_panel_env()
-        if panel.get('PANEL_TLS') == '1' and validate_port(panel.get('PANEL_PORT', '')):
-            cmds.append(['ufw', 'allow', panel['PANEL_PORT'] + '/tcp', 'comment', 'TrustTunnel Panel HTTPS'])
-        cmds.append(['ufw', '--force', 'enable'])
-        out = []
-        for cmd in cmds:
-            out.append(checked_run(cmd))
-        out.append(run(['ufw', 'status', 'verbose'], timeout=20)[1])
-        return '\n'.join(out)
-    return 'Unknown UFW action.'
+        data = fail2ban_snapshot()
+        return 'Сервис: '+data['service']+'\n'+data['status']+'\nНастроенные jail: '+', '.join(data['configured'])
+    if action == 'test': return checked_run(['fail2ban-client','-t'])
+    if action == 'logs': return recent_logs('fail2ban',200)
+    if action in ('install','enable','disable','restart','reload'):
+        confirmed(values)
+        if action == 'install':
+            result = checked_run(['apt-get','-o','Acquire::Retries=3','install','-y','--no-install-recommends','--no-upgrade','fail2ban'],timeout=180)
+        elif action == 'disable': result = checked_run(['systemctl','disable','--now','fail2ban'])
+        else:
+            checked_run(['fail2ban-client','-t'])
+            if action == 'reload': result = checked_run(['fail2ban-client','reload'])
+            else:
+                result = checked_run(['systemctl',*(['enable','--now'] if action == 'enable' else ['restart']),'fail2ban'])
+                wait_fail2ban()
+        audit_log('f2b-'+action)
+        return result or 'Операция fail2ban завершена; включение службы не включает автоматически все jail.'
+    jail = jail_name(values)
+    if action == 'jail-status':
+        return checked_run(['fail2ban-client','status',jail])+'\n\n'+'\n'.join(k+': '+checked_run(['fail2ban-client','get',jail,k]) for k in ('maxretry','findtime','bantime','ignoreip'))
+    confirmed(values)
+    if action in ('ban','unban'):
+        address = normalized_ip(values.get('ip',''))
+        if action == 'ban' and (address.is_loopback or address.is_unspecified or address.is_multicast or address == admin_peer(values)):
+            raise ValueError('Нельзя заблокировать текущего администратора, loopback или служебный адрес.')
+        result = checked_run(['fail2ban-client','set',jail,'banip' if action == 'ban' else 'unbanip',str(address)])
+    elif action == 'settings':
+        retry, window, ban = (int(values.get(k,'')) for k in ('retry','findtime','bantime'))
+        if not 1 <= retry <= 100 or not 60 <= window <= 86400 or not 60 <= ban <= 604800: raise ValueError('Попытки 1–100, окно 60–86400 с, бан 60–604800 с.')
+        updates = {'maxretry':str(retry),'findtime':str(window),'bantime':str(ban)}
+        if 'increment' in values:
+            if values['increment'] not in ('0','1'): raise ValueError('Некорректный режим нарастающего бана.')
+            maximum = int(values.get('maxtime','604800'))
+            if not ban <= maximum <= 2592000: raise ValueError('Максимальный бан: от начального срока до 30 дней.')
+            updates.update({'bantime.increment':'true' if values['increment'] == '1' else 'false','bantime.maxtime':str(maximum)})
+        save_jail_override(jail,updates)
+        result = 'Параметры jail сохранены; чужие файлы и остальные jail не переписаны.'
+    elif action in ('jail-enable','jail-disable'):
+        updates = {'enabled':'true' if action.endswith('enable') else 'false'}
+        if jail == 'sshd' and action.endswith('enable'): updates.update({'port':','.join(str(p) for p,proto in ssh_listener_ports()),'backend':'systemd'})
+        save_jail_override(jail,updates)
+        result = 'Состояние jail сохранено. Если служба остановлена, включите её отдельно.'
+    elif action in ('ignore-add','ignore-remove'):
+        network = ipaddress.ip_network(values.get('ip',''),strict=False)
+        if network.prefixlen == 0: raise ValueError('Нельзя исключить из защиты весь интернет.')
+        tokens = fail2ban_ignores(checked_run(['fail2ban-client','get',jail,'ignoreip']))
+        token = str(network)
+        if action == 'ignore-add': tokens = list(dict.fromkeys(tokens+[token]))
+        else:
+            peer = admin_peer(values)
+            loopback = ipaddress.ip_network('127.0.0.0/8' if network.version == 4 else '::1/128')
+            if network.overlaps(loopback) or (peer and peer.version == network.version and peer in network): raise ValueError('Нельзя удалить исключение loopback или текущего администратора.')
+            if token not in tokens: raise ValueError('Исключение не найдено.')
+            tokens.remove(token)
+        save_jail_override(jail,{'ignoreip':' '.join(tokens)})
+        result = 'Постоянные исключения '+jail+': '+', '.join(tokens)
+    else: raise ValueError('Неизвестная операция fail2ban.')
+    audit_log('f2b-'+action,jail)
+    return result
+
+
+def fail2ban_output(action, ip='', values=None):
+    values = dict(values or {}, ip=ip)
+    with admin_lock(): return fail2ban_operation(action,values)
+
+
+def ufw_output(action, port='', proto='tcp', values=None):
+    values = dict(values or {},port=port,proto=proto)
+    if action == 'allow': action = 'rule'
+    if action == 'rebuild': action = 'baseline'
+    with admin_lock(): return firewall_operation(action,values)
 PANEL_STYLE = r'''
 :root{color-scheme:light;--canvas:#f5f7f8;--surface:#fff;--ink:#20292f;--muted:#68757c;--line:#dfe6e9;--accent:#147d71;--accent-soft:#e5f4f0;--danger:#b9323e;--danger-soft:#fff0f1;--warn:#916620;--warn-bg:#fff8e8;--blue:#2586db;--nav-active:#e9f5f1;--nav-hover:#f2f6f6}
 html[data-theme=dark]{color-scheme:dark;--canvas:#131818;--surface:#1c2222;--ink:#e7eeec;--muted:#a0afaa;--line:#35403d;--accent:#6acdb5;--accent-soft:#233d35;--nav-active:#243f36;--nav-hover:#283330;--danger:#ff9ca4;--danger-soft:#402a2e;--warn:#e2bd74;--warn-bg:#342e23}
@@ -3161,17 +3453,55 @@ def security_console():
         tiles += f'<article class="security-check {c["state"]}"><span class="check-dot"></span><div><h3>{html.escape(c["title"])}</h3><p>{html.escape(c["detail"])}</p>{advice}{action}</div></article>'
     status = admin_form('security-status', '<button>' + icon('ShieldCheck') + '<span>Полный отчёт</span></button>', view='security')
     status += admin_form('recommendations', '<button>' + icon('Info') + 'Рекомендации</button>', view='security')
-    settings = jail_settings()
-    jail = admin_form('security-fail2ban', f'''<label>Попыток<input name="retry" type="number" min="1" max="100" value="{settings['maxretry']}" required></label><label>Окно, секунд<input name="findtime" type="number" min="60" max="86400" value="{settings['findtime']}" required></label><label>Бан, секунд<input name="bantime" type="number" min="60" max="604800" value="{settings['bantime']}" required></label><button>Применить</button>''', view='security', confirm='Применить указанные параметры SSH jail?')
-    bans = admin_form('security-ban', '<label>IP-адрес<input name="ip" placeholder="203.0.113.10" required></label><button class="danger">Заблокировать</button>', view='security', confirm='Заблокировать IP для доступа по SSH?') + admin_form('security-unban', '<label>IP-адрес<input name="ip" required></label><button>Разблокировать</button>', view='security')
-    trusted = admin_form('security-ignore-list', '<button>Текущие исключения</button>', view='security')
-    trusted += ''.join(admin_form('security-ignore-' + action, '<label>IP или подсеть<input name="ip" placeholder="203.0.113.10/32" required></label><button>' + title + '</button>', view='security', confirm='Изменить постоянные исключения SSH jail?') for action, title in [('add', 'Добавить исключение'), ('remove', 'Удалить исключение')])
-    ports = ''.join(admin_form('security-' + action, '<label>Порт<input type="number" name="port" min="1" max="65535" required></label><label>Протокол<select name="proto"><option>tcp</option><option>udp</option></select></label><label>Источник IP / CIDR<input name="source" placeholder="Пусто: любой IP"></label><button>' + title + '</button>', view='security', confirm='Изменить указанное правило UFW?') for action, title in [('open', 'Разрешить'), ('close', 'Удалить разрешение')])
     inspect = admin_form('security-listeners', '<button>' + icon('Globe') + 'Открытые сокеты</button>', view='security') + admin_form('security-logins', '<button>' + icon('Logs') + 'Журнал SSH</button>', view='security')
     return f'''<div class="page-head"><div><span class="eyebrow">ЗАЩИТА И ДОСТУП</span><h2>Безопасность</h2><p>Текущее состояние сервера и контроль входящих подключений.</p></div>{status}</div><div class="security-grid">{tiles}</div><div class="inline-actions">{inspect}</div>
-<section class="surface"><h3>Блокировки SSH</h3>{bans}<details><summary>Параметры fail2ban</summary><p class="muted">Значения ниже будут применены после подтверждения. Текущие настройки доступны в полном отчёте.</p>{jail}</details></section>
-<section class="surface"><h3>Доверенные IP для SSH</h3><p class="muted">Исключения из блокировок fail2ban для SSH. Правила сетевого экрана остаются отдельными.</p>{trusted}</section>
-<section class="surface"><h3>Сетевой экран</h3><p class="muted">Источник ограничивает одно правило. Уже существующее разрешение для всех IP продолжит действовать. Порты SSH, VPN и панели защищены от удаления.</p>{ports}</section>{server_security_controls()}{protection_console()}'''
+{network_security_console()}{server_security_controls()}{protection_console()}'''
+
+
+def network_security_console():
+    def form(action, body, warning=''):
+        if warning: body = '<input type="hidden" name="confirm" value="CONFIRMED">'+body
+        return admin_form(action,body,view='security',confirm=warning)
+    firewall = firewall_snapshot()
+    pending = firewall_pending()
+    rollback = ''
+    if pending:
+        token = '<input type="hidden" name="token" value="'+html.escape(pending['token'],quote=True)+'">'
+        remaining = max(0,int(pending['deadline']-time.time()))
+        rollback = '<div class="warning" role="alert"><strong>Ожидается подтверждение UFW</strong><p>Автоматический откат через '+str(remaining)+' с. Проверьте новую SSH-сессию, VPN и доступ к панели.</p><div class="inline-actions">'
+        rollback += form('ufw-confirm',token+'<button class="primary">Доступ сохранён, оставить изменения</button>','Проверены SSH, VPN и доступ к панели? Остановить автоматический откат?')
+        rollback += form('ufw-rollback',token+'<button class="danger">Вернуть прежние настройки</button>','Восстановить настройки UFW до последнего изменения?')+'</div></div>'
+    controls = form('ufw-status','<button>'+icon('RefreshCw')+'Обновить правила</button>')
+    for action,label in [('install','Установить пакет UFW'),('enable','Включить UFW'),('disable','Отключить UFW'),('reload','Перезагрузить правила'),('baseline','Добавить разрешения SSH / VPN / панели')]:
+        controls += form('ufw-'+action,'<button>'+label+'</button>','Изменить UFW? Полного сброса не будет. Для сохранения потребуется подтверждение доступа за 120 секунд. При отключении UFW порты сервера станут доступны извне.')
+    rows = ''
+    for row in firewall['rules']:
+        body = '<input type="hidden" name="version" value="'+firewall['version']+'"><input type="hidden" name="number" value="'+str(row['number'])+'">'
+        body += '<button class="danger" title="Удалить именно эту строку UFW">'+icon('X')+'Удалить</button>'
+        rows += '<tr><td>'+str(row['number'])+'</td><td>'+html.escape(row['text'])+'</td><td>'+form('ufw-delete',body,'Удалить выбранную строку? Парное правило IPv4/IPv6 удаляется отдельно. Защищённые разрешения удалять нельзя.')+'</td></tr>'
+    rule_fields = '''<label>Действие<select name="decision"><option value="allow">Разрешить</option><option value="deny">Отбросить</option><option value="reject">Отклонить с ответом</option><option value="limit">Лимит новых TCP-подключений</option></select></label><label>Направление<select name="direction"><option value="in">Входящее</option><option value="out">Исходящее</option></select></label><label>Порт или диапазон<input name="port" placeholder="9000 или 10000:10100" required></label><label>Протокол<select name="proto"><option>tcp</option><option>udp</option></select></label><label>Источник IP / CIDR<input name="source" placeholder="Пусто: любой IP"></label><label>Назначение IP / CIDR<input name="destination" placeholder="Пусто: любой IP"></label><label>Интерфейс<input name="interface" placeholder="Пусто: все интерфейсы" maxlength="15"></label><label>Положение<select name="position"><option value="append">В конце</option><option value="prepend">В начале</option></select></label><label>Комментарий<input name="comment" maxlength="80"></label>'''
+    create = form('ufw-rule',rule_fields+'<button class="primary">Применить правило</button>','Применить правило UFW? Проверьте направление и адреса; более раннее правило имеет приоритет. Подтвердите доступ после применения.')
+    source_block = form('ufw-source-block','<label>Источник IP / CIDR<input name="source" required placeholder="192.0.2.10/32"></label><button class="danger">Заблокировать источник на всех портах</button>','Запретить входящий трафик указанного источника на всех портах? Для удаления блокировки используйте её строку в таблице UFW.')
+    preview = form('ufw-preview',rule_fields+'<button>Проверить без применения</button>')
+    logging = form('ufw-logging','<label>Журналирование<select name="level"><option>off</option><option selected>low</option><option>medium</option><option>high</option><option>full</option></select></label><button>Сохранить</button>','Изменить журналирование UFW? High / full могут существенно увеличить нагрузку и объём журналов.')
+    policy = form('ufw-default','<label>Направление<select name="direction"><option value="incoming">Входящие</option><option value="outgoing">Исходящие</option><option value="routed">Транзитные</option></select></label><label>Политика<select name="policy"><option>deny</option><option>reject</option><option>allow</option></select></label><button>Изменить политику</button>','Изменить политику по умолчанию? Исключения SSH / VPN / панели будут добавлены. Для исходящего и транзитного трафика допускается только allow, чтобы не нарушить WARP / DNS.')
+    reports = form('ufw-applications','<button>Профили приложений</button>')+form('ufw-logs','<button>'+icon('Logs')+'События UFW</button>')
+    data = fail2ban_snapshot()
+    options = ''.join('<option'+(' selected' if name == 'sshd' else '')+'>'+html.escape(name)+'</option>' for name in sorted(set(data['configured']+data['active'])))
+    selector = '<label>Jail<select name="jail">'+options+'</select></label>'
+    f2b_controls = form('f2b-status','<button>'+icon('RefreshCw')+'Состояние службы и jail</button>')
+    for action,label in [('install','Установить пакет'),('enable','Включить службу'),('disable','Отключить службу'),('restart','Перезапустить службу'),('reload','Применить конфигурацию')]:
+        f2b_controls += form('f2b-'+action,'<button>'+label+'</button>','Выполнить действие fail2ban? Остановка службы снимает её защиту; перезапуск может временно изменить блокировки.')
+    f2b_controls += form('f2b-test','<button>Проверить конфигурацию</button>')+form('f2b-logs','<button>'+icon('Logs')+'Журнал fail2ban</button>')
+    jail = form('f2b-jail-status',selector+'<button>Статистика, блокировки и настройки</button>')
+    for action,label in [('jail-enable','Включить jail'),('jail-disable','Отключить jail')]:
+        jail += form('f2b-'+action,selector+'<button>'+label+'</button>','Изменить постоянное состояние выбранного jail? Отключение снимает его защиту. Фильтры и команды действий не редактируются.')
+    settings = form('f2b-settings',selector+'''<label>Попыток<input name="retry" type="number" min="1" max="100" value="5" required></label><label>Окно, секунд<input name="findtime" type="number" min="60" max="86400" value="600" required></label><label>Бан, секунд<input name="bantime" type="number" min="60" max="604800" value="3600" required></label><label>Увеличивать повторный бан<select name="increment"><option value="0">Нет</option><option value="1">Да</option></select></label><label>Предел бана, секунд<input name="maxtime" type="number" min="60" max="2592000" value="604800" required></label><button>Сохранить параметры</button>''','Применить указанные значения к выбранному jail? Это предлагаемые значения, не считанные настройки; текущие параметры доступны в статистике jail.')
+    bans = ''
+    for action,label in [('ban','Заблокировать IP'),('unban','Разблокировать IP'),('ignore-add','Добавить постоянное исключение'),('ignore-remove','Удалить исключение')]:
+        bans += form('f2b-'+action,selector+'<label>IP'+(' / CIDR' if action.startswith('ignore') else '')+'<input name="ip" required></label><button>'+label+'</button>','Изменить блокировку или исключение только выбранного jail? Текущий IP администратора и loopback защищены.')
+    return f'''<section class="surface" id="ufw-controls"><div class="section-heading"><h3>UFW · сетевой экран</h3><span class="badge {'active' if firewall['active'] else ''}">{'Включён' if firewall['active'] else 'Отключён / недоступен'}</span></div>{rollback}<div class="inline-actions">{controls}</div><details><summary>Текущая политика</summary><pre>{html.escape(firewall['verbose'])}</pre></details><div class="table-wrap"><table><thead><tr><th>№</th><th>Правило</th><th>Действие</th></tr></thead><tbody>{rows or '<tr><td colspan="3">Нет доступных правил</td></tr>'}</tbody></table></div><p class="hint">Удаление затрагивает одну строку, не всю пару IPv4 / IPv6. Правила SSH, VPN и панели защищены. Существующие широкие разрешения не отменяются добавлением адресного разрешения.</p><details><summary>Новое правило</summary>{create}<details><summary>Предварительная проверка</summary>{preview}</details></details><details><summary>Блокировка IP / подсети</summary>{source_block}</details><details><summary>Политика и журналирование</summary>{policy}{logging}{reports}</details></section>
+<section class="surface" id="fail2ban-controls"><div class="section-heading"><h3>Fail2ban · защита служб</h3><span class="badge {'active' if data['service'] == 'active' else ''}">{html.escape(data['service'])}</span></div><p class="muted">Работающие jail: {html.escape(', '.join(data['active']) or 'нет подтверждённых')}. Изменения сохраняются отдельным override-файлом; чужие настройки не стираются.</p><div class="inline-actions">{f2b_controls}</div><details><summary>Управление jail</summary>{jail}</details><details><summary>Время и усиление блокировок</summary>{settings}</details><details><summary>Блокировки и доверенные адреса</summary>{bans}</details><p class="hint">Блокировка применяется к портам, указанным в выбранном jail. Исключение fail2ban не является разрешением UFW. Для диагностики сначала проверьте конфигурацию и журнал; отключение fail2ban не устраняет причину атак.</p></section>'''
 
 
 def server_security_controls():
@@ -3540,6 +3870,8 @@ document.getElementById('activation-link').value=data.link;document.getElementBy
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = 'TrustTunnelPanel'
+    sys_version = ''
     def setup(self):
         super().setup()
         self.connection.settimeout(20)
@@ -3628,7 +3960,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             data = self.form()
         except (ValueError, UnicodeError): self.send_error(400); return
         token = self.cookie('login')
-        if not token or not secrets.compare_digest(token, data.get('_login_token','')):
+        if not token or not secrets.compare_digest(token.encode(), data.get('_login_token','').encode()):
             self.send_login('Форма устарела. Попробуйте ещё раз.', 403); return
         username, password = data.get('username',''), data.get('password','')
         valid_user = secrets.compare_digest(username.encode(), PANEL_USER.encode())
@@ -3671,10 +4003,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def form(self):
+        if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) != 1:
+            raise ValueError('Ambiguous request framing')
+        if self.headers.get_content_type() != 'application/x-www-form-urlencoded':
+            raise ValueError('Expected a URL-encoded form')
         length = int(self.headers.get('Content-Length', '0'))
         if not 0 <= length <= 65536:
             raise ValueError('Request body too large')
-        return {k: v[0] for k, v in urllib.parse.parse_qs(self.rfile.read(length).decode()).items()}
+        body = self.rfile.read(length)
+        if len(body) != length: raise ValueError('Incomplete request body')
+        parsed = urllib.parse.parse_qs(body.decode('utf-8'),keep_blank_values=True,max_num_fields=80)
+        if any(len(v) != 1 for v in parsed.values()): raise ValueError('Duplicate form fields')
+        return {k:v[0] for k,v in parsed.items()}
 
     def redirect(self, message):
         if 'application/json' in self.headers.get('Accept', ''):
@@ -3691,6 +4031,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        try: self.handle_get()
+        except (ValueError,RuntimeError,OSError,sqlite3.Error):
+            self.send_json({'error':'Не удалось прочитать состояние панели. Проверьте журнал службы и конфигурацию.'},503)
+
+    def handle_get(self):
         if self.path == '/activate':
             self._csp_nonce = secrets.token_urlsafe(18)
             token = secrets.token_urlsafe(32)
@@ -3818,7 +4163,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not 0 < int(self.headers.get('Content-Length','0')) <= 4096: self.send_json({'error':'Некорректный запрос.'},400); return
         values = self.form(); csrf = values.get('_csrf','')
         if login_delay(peer): self.send_json({'error':'Слишком много попыток. Повторите через минуту.'},429); return
-        if not csrf or not secrets.compare_digest(csrf,self.cookie('activation')):
+        if not csrf or not secrets.compare_digest(csrf.encode(),self.cookie('activation').encode()):
             self.send_json({'error':'Откройте приглашение повторно.'},403); return
         try:
             result = redeem_enrollment(values.get('token',''))
@@ -3838,7 +4183,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             f = self.form()
         except (ValueError, UnicodeError):
             self.send_error(400, 'Invalid form'); return
-        if not secrets.compare_digest(f.get('_csrf', ''), CSRF_TOKEN):
+        if not secrets.compare_digest(f.get('_csrf', '').encode(), CSRF_TOKEN.encode()):
             self.send_error(403, 'Reload page and try again'); return
         if self.path == '/logout':
             token = self.cookie('session')
@@ -3849,6 +4194,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             wants_json = 'application/json' in self.headers.get('Accept', '')
             read_only = {'monitor', 'logs', 'audit', 'security-audit', 'security-scan', 'security-status', 'security-listeners', 'security-logins', 'security-ignore-list', 'dns-check', 'routing-check', 'client-list', 'client-link', 'endpoint-releases', 'masque-status', 'masque-check', 'certificate-status', 'recommendations', 'interface-status', 'interface-check', 'protection-status', 'schedule-status', 'guard-status'}
             read_only |= {'diagnostics-stack','diagnostics-client','diagnostics-egress','diagnostics-warp','routing-current'}
+            read_only |= {'ufw-applications','ufw-logs','ufw-preview','f2b-status','f2b-test','f2b-logs','f2b-jail-status'}
             try:
                 f['_peer'] = self.client_address[0]
                 result = admin_operation(f.get('action', ''), f)
@@ -3934,10 +4280,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_html('Panel credentials.', update_panel_credentials(f.get('username', '').strip(), f.get('password', '')))
             return
         if self.path == '/fail2ban':
-            self.send_html('fail2ban action finished.', fail2ban_output(f.get('action', 'status'), f.get('ip', '').strip()))
+            self.send_html('fail2ban action finished.', fail2ban_output(f.get('action', 'status'), f.get('ip', '').strip(), dict(f,_peer=self.client_address[0])))
             return
         if self.path == '/ufw':
-            self.send_html('UFW action finished.', ufw_output(f.get('action', 'status'), f.get('port', '').strip(), f.get('proto', 'tcp').strip()))
+            self.send_html('UFW action finished.', ufw_output(f.get('action', 'status'), f.get('port', '').strip(), f.get('proto', 'tcp').strip(), dict(f,_peer=self.client_address[0])))
             return
         if self.path == '/rules/add-deny':
             self.redirect(admin_operation('routing-rule-add', {'cidr':f.get('cidr', ''), 'decision':'deny'})); return
@@ -3995,7 +4341,9 @@ def main():
 
 
 if __name__ == '__main__':
-    if len(sys.argv) > 1 and sys.argv[1] == '--admin':
+    if len(sys.argv) == 3 and sys.argv[1] == '--firewall-rollback':
+        print(firewall_rollback(sys.argv[2]))
+    elif len(sys.argv) > 1 and sys.argv[1] == '--admin':
         try:
             action = sys.argv[2]
             values = dict(arg.split('=', 1) for arg in sys.argv[3:])
