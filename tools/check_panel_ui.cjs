@@ -1,9 +1,22 @@
 const {chromium} = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
 const path = require('path');
+const {spawn} = require('node:child_process');
 (async () => {
-  const browser = await chromium.launch({headless:true,channel:process.env.BROWSER_CHANNEL || 'msedge'});
+  const base='http://127.0.0.1:18089';
+  let occupied=false;
+  try {occupied=(await fetch(base+'/health')).ok;} catch {}
+  if(occupied)throw Error('Preview port 18089 is already in use; do not reuse an unknown server');
+  const preview=spawn(process.env.PYTHON || 'python',[path.join(__dirname,'preview_panel.py')],{cwd:path.resolve(__dirname,'..'),env:{...process.env,TT_PREVIEW_PORT:'18089'},stdio:['ignore','ignore','pipe']});
+  let serverErrors='';preview.stderr.on('data',chunk=>serverErrors+=chunk.toString());
+  let browser;
   const errors=[];
   try {
+    browser = await chromium.launch({headless:true,channel:process.env.BROWSER_CHANNEL || 'msedge'});
+    for(let i=0;i<60;i++){
+      try {if((await fetch(base+'/health')).ok)break;}catch{}
+      if(i===59)throw Error('Preview did not start: '+serverErrors);
+      await new Promise(resolve=>setTimeout(resolve,100));
+    }
     for(const viewport of [{width:1440,height:1000},{width:390,height:844},{width:320,height:740},{width:768,height:1024}]) {
       const page=await browser.newPage({viewport});
       page.on('pageerror',e=>errors.push(e.message));
@@ -111,6 +124,7 @@ const path = require('path');
       await page.close();
     }
     if(errors.length) throw Error(errors.join('\n'));
+    if(serverErrors)throw Error(serverErrors);
     console.log('Desktop/mobile: login, drawers, lazy QR, confirmations, soft refresh, search, pagination, themes, chart and eleven views passed.');
-  } finally {await browser.close();}
+  } finally {await browser?.close();if(preview.exitCode===null&&preview.signalCode===null){const exit=new Promise(resolve=>preview.once('exit',resolve));preview.kill();await exit;}}
 })().catch(e=>{console.error(e);process.exit(1);});

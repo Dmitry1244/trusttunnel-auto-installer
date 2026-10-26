@@ -22,11 +22,20 @@ const path = require('path');
       await page.goto(url+'/?view=security');
       await page.getByRole('button',{name:'Проверить сервер и получить рекомендации',exact:true}).waitFor();
       if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1))throw Error('LIVE_SECURITY_OVERFLOW');
+      await page.goto(url+'/?view=clients');
+      await page.locator('[data-drawer^="identity-"]').first().click();
+      const drawer=page.locator('aside.drawer.open');
+      if(await drawer.locator('input[value="guard-restrict"]').count())throw Error('LEGACY_TRANSPORT_PRESET');
+      if(await drawer.locator('input[value="guard-watch-save"]').count()!==1)throw Error('WATCH_CONTROLS_MISSING');
+      if(await drawer.locator('input[name="source_cidr"]').count()!==1)throw Error('INVITE_SCOPE_MISSING');
+      await page.goto(url+'/?view=routing');
+      await page.locator('#torrent-controls').waitFor();
+      if(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1))throw Error('LIVE_ROUTING_OVERFLOW');
       await page.locator('form[action="/logout"] button').click();
       await page.waitForURL(url+'/login');
       if(errors.length)throw Error('LIVE_PAGE_ERROR');
       await page.close();
     }
-    console.log('Live trusted HTTPS, real browser login, dashboard, security controls, responsive layout and logout: PASS');
+    console.log('Live trusted HTTPS, real login, dashboard, security, watch/invite and torrent controls; responsive layout and logout: PASS');
   }finally{await browser.close();}
 })().catch(()=>{console.error('Live browser verification failed. No credentials or page content logged.');process.exit(1);});

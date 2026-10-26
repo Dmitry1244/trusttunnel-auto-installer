@@ -25,6 +25,7 @@ panel.current_warp_backend = lambda: 'wg-interface'
 fixture_clients = [dict(username=f'client{i:02}', password='synthetic-password', enabled=i % 3 != 0, note='Тестовый профиль') for i in range(1, 28)]
 panel.client_inventory = lambda: [dict(c) for c in fixture_clients]
 panel.load_clients = lambda: [c for c in panel.client_inventory() if c['enabled']]
+panel.guard_state = lambda: {'policies':{'client01':{'source_watch':{'enabled':True,'minutes':60,'threshold':4,'ipv6_prefix':64}}}}
 panel.security_snapshot = lambda: dict(checks=[dict(title=title, state=state, detail=detail) for title,state,detail in [('Сетевой экран','ok','Status: active'),('Защита SSH','ok','SSH jail работает'),('Вход по SSH','warn','Пароль: yes; root: yes. Базовые настройки без учёта Match-блоков.'),('Доступ к панели','ok','Публичный HTTPS'),('Приватные файлы','ok','Файлы учётных данных и ключа доступны только владельцу'),('Сертификат VPN','ok','Действителен ещё 58 дней'),('Перезагрузка ОС','ok','Не требуется')]])
 def synthetic_link(name, protocol='http2', kind='static'):
     import base64
@@ -40,6 +41,13 @@ panel.PANEL_PASSWORD = 'synthetic-preview-password'
 panel.rules_text = lambda: '[[rule]]\ncidr="192.0.2.0/24"\naction="deny"\n'
 panel.monitor_snapshot = lambda: dict(cpu='2.4%', memory='512 МиБ / 2 ГиБ', disk='8 ГиБ / 40 ГиБ', uptime='14д 02ч', memory_percent=25, disk_percent=20, services=panel.service_snapshot(), route='WARP · WireGuard', interfaces={'ens3':{'rx':int(panel.time.time()*12345),'tx':int(panel.time.time()*6789)}}, time=panel.time.time())
 panel.client_metrics = lambda: dict(available=True,checked_at=panel.time.time(),clients=[dict(username=c['username'],online=c['enabled'],sessions=1 if c['enabled'] else 0,upload=123456789,download=987654321,last_seen=panel.time.time()-(0 if c['enabled'] else 3600)) for c in fixture_clients],guard={},accounting_error='')
+original_metrics = panel.client_metrics
+def watched_metrics():
+    data = original_metrics()
+    for item in data['clients']:
+        item['sharing'] = dict(enabled=item['username']=='client01', alert=item['username']=='client01', observed_networks=5, minutes=60, last_sample=panel.time.time(), enforcement=False)
+    return data
+panel.client_metrics = watched_metrics
 
 
 class Preview(panel.Handler):

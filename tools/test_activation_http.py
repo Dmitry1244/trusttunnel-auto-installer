@@ -63,6 +63,14 @@ class ActivationHTTPTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError) as caught: self.request(path)
             self.assertEqual(caught.exception.code,401)
 
+    def test_activation_uses_socket_peer_not_forwarded_address(self):
+        token=self.fixture.issue(); csrf=self.csrf()
+        with patch.object(panel,'redeem_enrollment',return_value={'link':'tt://?synthetic'}) as redeem:
+            data=urllib.parse.urlencode({'token':token,'_csrf':csrf}).encode()
+            request=urllib.request.Request(self.base+'/activate',data=data,headers={'Origin':self.base,'X-Forwarded-For':'198.51.100.7'})
+            with self.opener.open(request,timeout=8) as response: self.assertEqual(response.status,200)
+            redeem.assert_called_once_with(token,'127.0.0.1')
+
     def test_repeated_bad_tokens_are_throttled(self):
         csrf=self.csrf()
         codes=[]

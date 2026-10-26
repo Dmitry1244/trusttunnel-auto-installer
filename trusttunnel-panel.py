@@ -31,6 +31,7 @@ import ipaddress
 import socket
 import configparser
 import io
+import shlex
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -44,7 +45,7 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 DEEPLINK_CACHE = {}
 DEEPLINK_CACHE_TTL = 300
-ADMIN_VERSION = '2026.10.25'
+ADMIN_VERSION = '2026.10.26'
 MASQUE_ADDR = '127.0.0.1:40002'
 MASQUE_DIR = Path('/opt/warp-masque')
 MASQUE_VERSION = 'v4.2.1'
@@ -78,6 +79,14 @@ SECURITY_REPORT = Path('/var/cache/trusttunnel-panel/security.json')
 SYSCTL_DIR = Path('/etc/sysctl.d')
 USAGE_DB = Path('/var/lib/trusttunnel-panel/usage.sqlite3')
 GUARD_STATUS = {'checked_at': 0, 'error': ''}
+TORRENT_STATE = Path('/var/lib/trusttunnel-panel/torrent-filter.json')
+TORRENT_DROPIN = Path('/etc/systemd/system/trusttunnel.service.d/60-torrent-filter.conf')
+TORRENT_LOCK = threading.RLock()
+TORRENT_MARKER = 'TrustTunnel BitTorrent filter'
+TORRENT_SIGNATURES = [('tcp','13426974546f7272656e742070726f746f636f6c'),
+                      ('udp','13426974546f7272656e742070726f746f636f6c'),
+                      ('udp','64313a6164323a696432303a'),
+                      ('udp','000004172710198000000000')]
 SAFE_SYSCTLS = {'net.ipv4.tcp_syncookies': '1', 'net.ipv4.conf.all.accept_redirects': '0',
                 'net.ipv4.conf.default.accept_redirects': '0', 'net.ipv4.conf.all.send_redirects': '0',
                 'net.ipv4.conf.default.send_redirects': '0', 'net.ipv4.icmp_echo_ignore_broadcasts': '1',
@@ -413,12 +422,15 @@ def client_operation(action, values):
             atomic_write(TT_DIR/'client-guard.json', json.dumps(guards))
             if USAGE_DB.exists():
                 with usage_database() as db:
-                    for table in ('usage', 'daily', 'enrollment'): db.execute('DELETE FROM '+table+' WHERE username=?', (user,))
+                    for table in ('usage', 'daily', 'enrollment', 'source_observations'): db.execute('DELETE FROM '+table+' WHERE username=?', (user,))
+                    db.execute('DELETE FROM enrollment_sources WHERE digest NOT IN (SELECT digest FROM enrollment)')
         audit_log('client-' + action, user or str(count))
         return 'Изменения сохранены. TrustTunnel работает.'
 
 
 def admin_operation(action, values):
+    if action.startswith('torrent-'):
+        return torrent_operation(action[8:], values)
     if action.startswith(('ufw-', 'f2b-')):
         with admin_lock():
             result = firewall_operation(action[4:], values) if action.startswith('ufw-') else fail2ban_operation(action[4:], values)
@@ -907,6 +919,11 @@ CREATE TABLE IF NOT EXISTS daily (
 CREATE TABLE IF NOT EXISTS enrollment (
  digest TEXT PRIMARY KEY, username TEXT NOT NULL, protocol TEXT NOT NULL, kind TEXT NOT NULL,
  identity TEXT NOT NULL, expires REAL NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS source_observations (
+ username TEXT NOT NULL, observed_at REAL NOT NULL, ip TEXT NOT NULL,
+ PRIMARY KEY(username, ip));
+CREATE TABLE IF NOT EXISTS enrollment_sources (
+ digest TEXT PRIMARY KEY, source_cidr TEXT NOT NULL);
 ''')
         with connection: yield connection
     finally:
@@ -928,6 +945,9 @@ def record_usage(rows, epoch, now=None):
             last_seen = now if row['sessions'] else (old['last_seen'] if old else 0)
             ip = row['ip'] if row['sessions'] and row['ip'] else (old['last_ip'] if old else '')
             changes = (old['ip_changes'] if old else 0) + int(bool(old and old['last_ip'] and ip and ip != old['last_ip']))
+            if row['sessions'] and row['ip']:
+                db.execute('INSERT INTO source_observations VALUES (?,?,?) ON CONFLICT(username,ip) DO UPDATE SET observed_at=excluded.observed_at', (row['username'], now, str(canonical_ip(row['ip']))))
+                db.execute('DELETE FROM source_observations WHERE username=? AND ip NOT IN (SELECT ip FROM source_observations WHERE username=? ORDER BY observed_at DESC,ip LIMIT 256)', (row['username'], row['username']))
             db.execute('INSERT OR REPLACE INTO usage VALUES (?,?,?,?,?,?,?,?,?,?)',
                        (row['username'], epoch, up, down, (old['upload'] if old else 0)+delta_up,
                         (old['download'] if old else 0)+delta_down, last_seen, now, ip, changes))
@@ -936,11 +956,50 @@ def record_usage(rows, epoch, now=None):
                 db.execute('INSERT INTO daily VALUES (?,?,?,?) ON CONFLICT(username,day) DO UPDATE SET upload=upload+excluded.upload, download=download+excluded.download',
                            (row['username'], today, delta_up, delta_down))
         db.execute('DELETE FROM daily WHERE day < ?', ((datetime.datetime.fromtimestamp(now, datetime.timezone.utc)-datetime.timedelta(days=93)).strftime('%Y-%m-%d'),))
+        db.execute('DELETE FROM source_observations WHERE observed_at < ?', (now-86400,))
 
 
 def guard_state():
     raw = read_text(TT_DIR / 'client-guard.json')
-    return json.loads(raw) if raw else {'policies': {}}
+    state = json.loads(raw) if raw else {'policies': {}}
+    for policy in state.get('policies',{}).values():
+        watch = policy.get('source_watch')
+        if watch is not None and (not isinstance(watch,dict) or type(watch.get('enabled')) is not bool
+                                 or type(watch.get('minutes')) is not int or not 5 <= watch['minutes'] <= 1440
+                                 or type(watch.get('threshold')) is not int or not 2 <= watch['threshold'] <= 100
+                                 or type(watch.get('ipv6_prefix')) is not int or watch['ipv6_prefix'] not in (64,128)):
+            raise ValueError('Некорректная политика наблюдения сетей; автоматическое применение остановлено.')
+    return state
+
+
+def canonical_ip(value):
+    address = ipaddress.ip_address(value)
+    if isinstance(address, ipaddress.IPv6Address) and address.scope_id:
+        raise ValueError('Scoped IP is not supported')
+    return address.ipv4_mapped if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped else address
+
+
+def guard_capabilities():
+    # No inference from aggregated metrics can enforce a per-user concurrent IP limit.
+    return dict(source_watch=True, source_watch_enforcement=False, active_ip_limit=False, device_binding=False,
+                reason='Штатный endpoint не предоставляет проверенный per-user admission hook и полный список активных IP. Для строгого IP-лимита нужна доработка endpoint; для ключа устройства также нужен клиент. Fail2ban блокирует IP целиком, а не людей или логины за NAT.')
+
+
+def sharing_observations(db, user, policy, now=None):
+    now = time.time() if now is None else now
+    watch = policy.get('source_watch', {})
+    if not watch.get('enabled'): return dict(enabled=False, alert=False, enforcement=False)
+    window, threshold, prefix = watch['minutes'], watch['threshold'], watch['ipv6_prefix']
+    rows = db.execute('SELECT observed_at,ip FROM source_observations WHERE username=? AND observed_at>=? AND observed_at<=? ORDER BY observed_at', (user, now-window*60, now)).fetchall()
+    networks = set()
+    for row in rows:
+        address = canonical_ip(row['ip'])
+        networks.add(str(ipaddress.ip_network(str(address)+'/'+str(prefix if address.version==6 else 32), strict=False)))
+    return dict(enabled=True, alert=len(networks)>=threshold, observed_networks=len(networks), minutes=window,
+                threshold=threshold, ipv6_prefix=prefix, retained_ips=len(rows), last_sample=rows[-1]['observed_at'] if rows else 0,
+                history_limit=256,
+                enforcement=False, simultaneous_ips=None,
+                explanation='Наблюдавшиеся сети за окно, НЕ одновременные IP и НЕ число устройств. Это повод проверить доступ, не основание для автоматического бана.')
 
 
 @admin_snapshot(10)
@@ -957,9 +1016,11 @@ def client_metrics():
             else:
                 record_usage(live['clients'], epoch)
     records = {}
+    observations = {}
     if USAGE_DB.exists():
         with usage_database() as db:
             records = {r['username']: dict(r) for r in db.execute('SELECT * FROM usage')}
+            observations = {name:sharing_observations(db,name,policy) for name,policy in guard_state().get('policies',{}).items()}
     rows = {row['username']: row for row in live['clients']}
     result = []
     for client in client_inventory():
@@ -971,6 +1032,7 @@ def client_metrics():
                            inbound=current.get('inbound', 0), outbound=current.get('outbound', 0),
                            upload=stored.get('upload', 0), download=stored.get('download', 0),
                            last_seen=stored.get('last_seen', 0), ip=current.get('ip') or stored.get('last_ip', ''),
+                           sharing=observations.get(name, dict(enabled=False, alert=False, enforcement=False)),
                            ip_changes=stored.get('ip_changes', 0), observed_at=stored.get('observed_at', 0)))
     return dict(available=live['available'], clients=result, checked_at=time.time(),
                 accounting_error=live.get('accounting_error', ''), guard=dict(GUARD_STATUS))
@@ -978,7 +1040,7 @@ def client_metrics():
 
 def guard_operation(action, values):
     if action == 'status':
-        return json.dumps(dict(policies=guard_state().get('policies', {}), telemetry=client_metrics()), ensure_ascii=False, indent=2)
+        return json.dumps(dict(capabilities=guard_capabilities(), policies=guard_state().get('policies', {}), telemetry=client_metrics()), ensure_ascii=False, indent=2)
     if action == 'check':
         if values.get('confirm') != 'CONFIRMED': raise ValueError('Подтвердите немедленную проверку с возможным отзывом доступа.')
         return enforce_client_policies()
@@ -1000,16 +1062,33 @@ def guard_operation(action, values):
             if automatic and not (quota_bytes or expires): raise ValueError('Для автоотзыва нужна квота или срок.')
             if automatic and values.get('disconnect_ack') != '1': raise ValueError('Подтвердите краткое переподключение VPN при автоматическом отзыве.')
             if quota_bytes and not client_metrics()['available']: raise ValueError('Сначала включите и проверьте метрики клиентов. Без них квота не применяется.')
-            policies[user] = dict(quota_bytes=quota_bytes, expires_at=expires, auto_suspend=automatic)
+            policies[user] = dict(policies.get(user, {}), quota_bytes=quota_bytes, expires_at=expires, auto_suspend=automatic)
         elif action == 'remove':
-            policies.pop(user, None)
+            if user in policies:
+                for key in ('quota_bytes','expires_at','auto_suspend'): policies[user].pop(key,None)
+                if not policies[user]: policies.pop(user)
+        elif action in ('watch-save','watch-remove'):
+            if action == 'watch-remove':
+                if user in policies:
+                    policies[user].pop('source_watch', None)
+                    if not policies[user]: policies.pop(user)
+            else:
+                try:
+                    minutes = int(values.get('minutes','60'))
+                    threshold = int(values.get('threshold','4'))
+                    prefix = int(values.get('ipv6_prefix','64'))
+                except ValueError: raise ValueError('Окно и порог должны быть числами.') from None
+                if not 5 <= minutes <= 1440 or not 2 <= threshold <= 100 or prefix not in (64,128):
+                    raise ValueError('Окно: 5–1440 минут; порог: 2–100 сетей; IPv6: /64 либо /128.')
+                if not client_metrics()['available']: raise ValueError('Сначала включите и проверьте метрики клиентов.')
+                policies.setdefault(user,{})['source_watch'] = dict(enabled=True, minutes=minutes, threshold=threshold, ipv6_prefix=prefix)
         elif action == 'restrict':
-            return client_operation('limits', dict(username=user, max_http2_conns='1', max_http3_conns='1')) + '\nЛимиты независимы: возможны одновременно одна H2 и одна H3 сессия. Это не привязка к устройству.'
+            raise ValueError('Транспортные лимиты не являются антишарингом. Пресет 1 H2 + 1 QUIC удалён: он может нарушить работу клиента. Текущие лимиты не менялись.')
         else: raise ValueError('Неизвестная операция антишаринга.')
         atomic_write(TT_DIR / 'client-guard.json', json.dumps(state))
         audit_log('guard-' + action, user)
         SNAPSHOT_CACHE.pop('client_metrics', None)
-        return 'Политика сохранена. Квота относится к общему накопленному трафику учётной записи, не к числу устройств. Проверка каждые 15 секунд, возможен перерасход. Изменение IP не вызывает автоматический бан.'
+        return 'Политика сохранена. Наблюдение сетей только предупреждает: метрики не доказывают одновременное использование или число устройств. Изменение IP не вызывает бан. Квота и срок действуют отдельно; проверка каждые 15 секунд при работающей панели, возможен перерасход.'
 
 
 def enforce_client_policies():
@@ -1048,10 +1127,12 @@ def usage_watcher():
         time.sleep(15)
 
 
-def enrollment_identity(user):
+def enrollment_identity(user, source=''):
     record = next((c for c in load_clients() if c['username'] == user), None)
     if record is None: raise ValueError('Клиент не найден или отключён.')
     body = json.dumps(record, sort_keys=True) + str(client_state().get('revisions',{}).get(user,'')) + read_text(TT_DIR/'hosts.toml') + read_text(TT_DIR/'certs/cert.pem') + read_text(TT_DIR/'panel-protection.json') + str(endpoint_port())
+    # Legacy backends reject source-bound invitations rather than ignoring their restriction.
+    if source: body += '\0invitation-source\0'+source
     return hashlib.sha256(body.encode()).hexdigest()
 
 
@@ -1064,12 +1145,23 @@ def enrollment_operation(action, values):
         with usage_database() as db:
             db.execute('BEGIN IMMEDIATE')
             db.execute('DELETE FROM enrollment WHERE expires < ? OR consumed=1', (time.time(),))
+            db.execute('DELETE FROM enrollment_sources WHERE digest NOT IN (SELECT digest FROM enrollment)')
             if action == 'revoke':
                 db.execute('DELETE FROM enrollment WHERE username=?', (user,))
+                db.execute('DELETE FROM enrollment_sources WHERE digest NOT IN (SELECT digest FROM enrollment)')
                 audit_log('enrollment-revoke', user)
                 return 'Неиспользованные приглашения отозваны. Уже импортированный профиль отзывается сменой пароля или отключением клиента.'
             if action != 'issue': raise ValueError('Неизвестная операция выдачи.')
-            identity = enrollment_identity(user)
+            source = values.get('source_cidr','').strip()
+            if source:
+                try:
+                    if len(source)>64: raise ValueError()
+                    if '/' not in source: source = str(canonical_ip(source))
+                    network = ipaddress.ip_network(source, strict=False)
+                    if network.prefixlen < (16 if network.version==4 else 48) or '%' in source: raise ValueError()
+                    source = str(network)
+                except ValueError: raise ValueError('Источник приглашения: один IP или CIDR не шире IPv4 /16 либо IPv6 /48.') from None
+            identity = enrollment_identity(user,source)
             env = current_panel_env()
             if env.get('PANEL_TLS') != '1': raise ValueError('Для передачи приглашений включите HTTPS-панель.')
             minutes = int(values.get('minutes', '15'))
@@ -1080,19 +1172,26 @@ def enrollment_operation(action, values):
             if db.execute('SELECT count(*) FROM enrollment').fetchone()[0] >= 512: raise ValueError('Слишком много приглашений. Отзовите неиспользуемые.')
             token = secrets.token_urlsafe(32)
             db.execute('DELETE FROM enrollment WHERE username=?',(user,))
-            db.execute('INSERT INTO enrollment VALUES (?,?,?,?,?,?,0)', (hashlib.sha256(token.encode()).hexdigest(), user, protocol, kind, identity, time.time()+minutes*60))
+            db.execute('DELETE FROM enrollment_sources WHERE digest NOT IN (SELECT digest FROM enrollment)')
+            digest = hashlib.sha256(token.encode()).hexdigest()
+            db.execute('INSERT INTO enrollment (digest,username,protocol,kind,identity,expires,consumed) VALUES (?,?,?,?,?,?,0)', (digest, user, protocol, kind, identity, time.time()+minutes*60))
+            if source: db.execute('INSERT INTO enrollment_sources VALUES (?,?)',(digest,source))
         audit_log('enrollment-issue', user)
-        return 'Одноразовое приглашение ('+str(minutes)+' мин):\nhttps://'+domain()+':'+str(int(env.get('PANEL_PORT','8088')))+'/activate#'+token+'\n\nПервое нажатие «Получить профиль» погашает приглашение. Полученный tt-профиль можно скопировать: это защита выдачи, не аппаратная привязка. Не публикуйте приглашение.'
+        return 'Одноразовое приглашение ('+str(minutes)+' мин):\nhttps://'+domain()+':'+str(int(env.get('PANEL_PORT','8088')))+'/activate#'+token+'\n\nИсточник получения: '+(source or 'любой IP')+'. Первое нажатие «Получить профиль» погашает приглашение. Полученный tt-профиль можно скопировать: это защита выдачи, не аппаратная привязка. Не публикуйте приглашение.'
 
 
-def redeem_enrollment(token):
+def redeem_enrollment(token, peer=''):
     if not re.fullmatch(r'[A-Za-z0-9_-]{43}', token): raise ValueError('Приглашение недействительно или уже использовано.')
     with admin_lock(), usage_database() as db:
         db.execute('BEGIN IMMEDIATE')
         digest = hashlib.sha256(token.encode()).hexdigest()
-        record = db.execute('SELECT * FROM enrollment WHERE digest=? AND consumed=0 AND expires>?', (digest, time.time())).fetchone()
+        record = db.execute("SELECT e.*,COALESCE(s.source_cidr,'') AS source_cidr FROM enrollment e LEFT JOIN enrollment_sources s USING(digest) WHERE e.digest=? AND e.consumed=0 AND e.expires>?", (digest, time.time())).fetchone()
         if record is None: raise ValueError('Приглашение недействительно или уже использовано.')
-        if not secrets.compare_digest(record['identity'], enrollment_identity(record['username'])):
+        if record['source_cidr']:
+            try: permitted = canonical_ip(peer) in ipaddress.ip_network(record['source_cidr'])
+            except ValueError: permitted = False
+            if not permitted: raise ValueError('Приглашение недействительно для этого источника.')
+        if not secrets.compare_digest(record['identity'], enrollment_identity(record['username'],record['source_cidr'])):
             raise ValueError('Настройки изменились; запросите новое приглашение у администратора.')
         link = deeplink(record['username'], record['protocol'], record['kind'])
         picture = base64.b64encode(qr_image(link)).decode('ascii')
@@ -1684,6 +1783,249 @@ def network_operation(action, values):
     raise ValueError('Неизвестная операция сети.')
 
 
+@contextmanager
+def torrent_lock(nonblocking=False):
+    import fcntl
+    TORRENT_STATE.parent.mkdir(parents=True,exist_ok=True)
+    with TORRENT_LOCK, TORRENT_STATE.with_suffix('.lock').open('a') as lock:
+        os.chmod(lock.name,0o600)
+        try: fcntl.flock(lock,fcntl.LOCK_EX | (fcntl.LOCK_NB if nonblocking else 0))
+        except BlockingIOError:
+            yield False
+            return
+        try: yield True
+        finally: fcntl.flock(lock,fcntl.LOCK_UN)
+
+
+def torrent_ports(value):
+    entries = value.split(',') if value.strip() else []
+    if len(entries)>12: raise ValueError('Не более 12 портов или диапазонов.')
+    result=[]
+    reserved={53,80,443} | {port for port,proto in protected_ports()}
+    for item in entries:
+        match=re.fullmatch(r'([0-9]{1,5})(?::([0-9]{1,5}))?',item.strip())
+        if not match: raise ValueError('Порты: числа или диапазоны через запятую, например 6881:6889,6969,51413.')
+        lo,hi=int(match[1]),int(match[2] or match[1])
+        if not 1<=lo<=hi<=65535 or any(lo<=port<=hi for port in reserved):
+            raise ValueError('Диапазон некорректен или включает DNS, HTTP(S), SSH, VPN либо панель.')
+        token=str(lo) if lo==hi else f'{lo}:{hi}'
+        if token not in result: result.append(token)
+    return result
+
+
+def torrent_state():
+    raw=read_text(TORRENT_STATE)
+    state=json.loads(raw) if raw else {'enabled':False,'mode':'signatures','ports':[]}
+    if not isinstance(state,dict) or state.get('mode') not in ('signatures','ports') or type(state.get('enabled')) is not bool:
+        raise ValueError('Повреждены настройки фильтра BitTorrent; автоматическое изменение остановлено.')
+    if not isinstance(state.get('ports',[]),list) or len(state.get('ports',[]))>12 or any(not isinstance(v,str) or not re.fullmatch(r'[0-9]{1,5}(?::[0-9]{1,5})?',v) for v in state.get('ports',[])):
+        raise ValueError('Некорректные сохранённые порты BitTorrent.')
+    if not isinstance(state.get('retired',[]),list) or len(state.get('retired',[]))>4: raise ValueError('Некорректный журнал фильтра BitTorrent.')
+    for ctx in [state.get('active'),state.get('pending'),*state.get('retired',[])]:
+        if ctx:
+            if not isinstance(ctx,dict): raise ValueError('Некорректный контекст фильтра BitTorrent.')
+            if not re.fullmatch(r'TT_BT_[0-9a-f]{12}',ctx.get('chain','')): raise ValueError('Некорректная управляемая цепочка BitTorrent.')
+            torrent_cgroup_valid(ctx.get('cgroup',''))
+    return state
+
+
+def torrent_cgroup_valid(value):
+    if not re.fullmatch(r'[A-Za-z0-9_./@:-]{1,256}/trusttunnel\.service',value) or any(part in ('','..','.') for part in value.split('/')):
+        raise ValueError('Не удалось определить отдельный cgroup TrustTunnel; весь сервер фильтроваться не будет.')
+    return value
+
+
+def torrent_context():
+    data=checked_run(['systemctl','show','trusttunnel','--property=ControlGroup','--property=InvocationID','--property=MainPID'])
+    values=dict(line.split('=',1) for line in data.splitlines() if '=' in line)
+    cgroup=torrent_cgroup_valid(values.get('ControlGroup','').lstrip('/'))
+    if not values.get('MainPID','').isdigit() or int(values['MainPID'])<=0: raise ValueError('TrustTunnel не запущен; фильтр не применяется к другим процессам.')
+    invocation=values.get('InvocationID','')
+    if not re.fullmatch(r'[0-9a-f]{32}',invocation): raise ValueError('Не удалось проверить текущий запуск TrustTunnel.')
+    return {'cgroup':cgroup,'invocation':invocation}
+
+
+def torrent_jump(ctx):
+    return ['OUTPUT','-m','cgroup','--path',torrent_cgroup_valid(ctx['cgroup']),'-m','comment','--comment',TORRENT_MARKER,'-j',ctx['chain']]
+
+
+def torrent_program(ctx,mode,ports):
+    chain=ctx['chain']
+    if not re.fullmatch(r'TT_BT_[0-9a-f]{12}',chain): raise ValueError('Некорректная цепочка.')
+    rules=[['-N',chain]]
+    # Service replies are not tunneled client egress, including QUIC replies.
+    for proto in ('tcp','udp'):
+        rules.append(['-A',chain,'-p',proto,'--sport',str(int(endpoint_port())),'-m','comment','--comment',TORRENT_MARKER,'-j','RETURN'])
+    for proto,signature in TORRENT_SIGNATURES:
+        rules.append(['-A',chain,'-p',proto,'-m','string','--algo','kmp','--to','256','--hex-string','|'+signature+'|',
+                      '-m','comment','--comment',TORRENT_MARKER,'-j','DROP'])
+    if mode=='ports':
+        for proto in ('tcp','udp'):
+            for port in ports:
+                rules.append(['-A',chain,'-p',proto,'--dport',port,'-m','comment','--comment',TORRENT_MARKER,'-j','DROP'])
+    rules.append(['-A',chain,'-m','comment','--comment',TORRENT_MARKER,'-j','RETURN'])
+    def argument(value): return json.dumps(value) if ' ' in value else value
+    return '*mangle\n'+'\n'.join(' '.join(argument(value) for value in args) for args in rules)+'\nCOMMIT\n'
+
+
+def torrent_remove(ctx):
+    if not ctx: return
+    for tool in ('iptables','ip6tables'):
+        base=[tool,'-w','5','-t','mangle']
+        all_rules=checked_run(base+['-S'])
+        parsed=[shlex.split(line) for line in all_rules.splitlines()]
+        if ['-N',ctx['chain']] not in parsed: continue
+        for parts in parsed:
+            if parts[:2]!=['-A',ctx['chain']]: continue
+            if parts[:1]==['-A'] and ('--comment' not in parts or parts[parts.index('--comment')+1]!=TORRENT_MARKER):
+                raise ValueError('Управляемая цепочка изменена извне; чужие правила не удаляются.')
+        output=checked_run(base+['-S','OUTPUT'])
+        numbers=[]; number=0
+        for line in output.splitlines():
+            parts=shlex.split(line)
+            if parts[:2]!=['-A','OUTPUT']: continue
+            number+=1
+            if parts[-2:]!=['-j',ctx['chain']]: continue
+            if '--comment' not in parts or parts[parts.index('--comment')+1]!=TORRENT_MARKER:
+                raise ValueError('Есть внешняя ссылка на цепочку BitTorrent; автоматическое удаление остановлено.')
+            numbers.append(number)
+        # A private mangle transaction does not flush UFW, WARP or other chains.
+        lines=[f'-D OUTPUT {n}' for n in reversed(numbers)]+['-F '+ctx['chain'],'-X '+ctx['chain']]
+        rc,out=run([tool+'-restore','--wait','5','--noflush'],input_text='*mangle\n'+'\n'.join(lines)+'\nCOMMIT\n')
+        if rc: raise RuntimeError('Не удалось убрать только цепочку BitTorrent: '+out)
+
+
+def torrent_script():
+    script=str(Path(__file__).resolve())
+    if script not in ('/usr/local/sbin/trusttunnel-panel.py','/usr/local/lib/trusttunnel/admin.py'):
+        raise ValueError('Сначала установите актуальный backend панели в штатный путь; staging не включается в автозапуск.')
+    return script
+
+
+def torrent_units():
+    script=torrent_script()
+    marker='# Managed by TrustTunnel torrent filter\n'
+    command='/usr/bin/python3 '+script+' --torrent-reconcile'
+    files={TORRENT_DROPIN:marker+'[Service]\nExecStartPost=-'+command+'\n',
+           SCHEDULE_DIR/'trusttunnel-torrent-filter.service':marker+'[Unit]\nDescription=Reconcile TrustTunnel BitTorrent restrictions\nAfter=trusttunnel.service\n[Service]\nType=oneshot\nExecStart='+command+'\nUMask=0077\n',
+           SCHEDULE_DIR/'trusttunnel-torrent-filter.timer':marker+'[Unit]\nDescription=Check TrustTunnel BitTorrent restrictions\n[Timer]\nOnBootSec=20s\nOnUnitActiveSec=30s\nAccuracySec=5s\n[Install]\nWantedBy=timers.target\n'}
+    originals={path:read_text(path) for path in files}
+    if any(text and not text.startswith(marker) for text in originals.values()): raise ValueError('Имя unit/drop-in занято; чужие файлы не перезаписываются.')
+    try:
+        for path,text in files.items(): atomic_write(path,text,0o644)
+        checked_run(['systemctl','daemon-reload'])
+        checked_run(['systemctl','enable','--now','trusttunnel-torrent-filter.timer'])
+    except Exception:
+        if not originals.get(SCHEDULE_DIR/'trusttunnel-torrent-filter.timer'):
+            run(['systemctl','disable','--now','trusttunnel-torrent-filter.timer'])
+        for path,text in originals.items():
+            if text: atomic_write(path,text,0o644)
+            else: path.unlink(missing_ok=True)
+        run(['systemctl','daemon-reload'])
+        raise
+
+
+def torrent_apply(state,context,mode,ports,install_units=False):
+    candidate=dict(context,chain='TT_BT_'+secrets.token_hex(6))
+    program=torrent_program(candidate,mode,ports)
+    for tool in ('iptables','ip6tables'):
+        rc,out=run([tool+'-restore','--wait','5','--noflush','--test'],input_text=program)
+        if rc: raise RuntimeError('Ядро/iptables не поддерживает нужный фильтр IPv4/IPv6; изменения не применены: '+out)
+    staged=dict(state,pending=candidate)
+    atomic_write(TORRENT_STATE,json.dumps(staged))
+    try:
+        for tool in ('iptables','ip6tables'):
+            rc,out=run([tool+'-restore','--wait','5','--noflush'],input_text=program)
+            if rc: raise RuntimeError(out)
+        for tool in ('iptables','ip6tables'):
+            checked_run([tool,'-w','5','-t','mangle','-I','OUTPUT','1',*torrent_jump(candidate)[1:]])
+        if install_units: torrent_units()
+        retired=[state['active']] if state.get('active') else []
+        updated={'enabled':True,'mode':mode,'ports':ports,'active':candidate,'retired':retired}
+        atomic_write(TORRENT_STATE,json.dumps(updated))
+    except Exception:
+        try:
+            torrent_remove(candidate)
+            atomic_write(TORRENT_STATE,json.dumps(state))
+        except Exception:
+            raise RuntimeError('Применение прервано; журнал восстановления сохранён. Проверьте состояние фильтра, основной firewall не сбрасывался.') from None
+        raise
+    for old in retired: torrent_remove(old)
+    updated.pop('retired',None)
+    atomic_write(TORRENT_STATE,json.dumps(updated))
+    return updated
+
+
+def torrent_reconcile():
+    with torrent_lock(nonblocking=True) as acquired:
+        if not acquired: return
+        state=torrent_state()
+        recovering=bool(state.get('pending') or state.get('retired'))
+        for ctx in [state.get('pending'),*state.get('retired',[])]:
+            if ctx: torrent_remove(ctx)
+        state.pop('pending',None); state.pop('retired',None)
+        if recovering: atomic_write(TORRENT_STATE,json.dumps(state))
+        if not state['enabled']: return
+        context=torrent_context()
+        active=state.get('active')
+        if active and all(active.get(key)==value for key,value in context.items()):
+            if all(run([tool,'-w','5','-t','mangle','-C',*torrent_jump(active)])[0]==0 for tool in ('iptables','ip6tables')):
+                return
+        torrent_apply(state,context,state['mode'],state.get('ports',[]))
+
+
+@cached_snapshot(10)
+def torrent_snapshot():
+    state=torrent_state()
+    result={'enabled':state['enabled'],'active':False,'mode':state['mode'],'ports':state.get('ports',[]),'dropped':0,
+            'warning':'Частичная защита: не блокирует весь зашифрованный, фрагментированный или инкапсулированный P2P-трафик.'}
+    result['recovering']=bool(state.get('pending') or state.get('retired'))
+    if result['recovering']: result['error']='Нужно завершить восстановление управляемых цепочек; состояние не подтверждено.'
+    if not state['enabled']: return result
+    try:
+        context=torrent_context(); active=state.get('active',{})
+        if not active or any(active.get(k)!=v for k,v in context.items()): raise ValueError('Ожидается применение к текущему запуску TrustTunnel.')
+        for tool in ('iptables','ip6tables'):
+            if run([tool,'-w','5','-t','mangle','-C',*torrent_jump(active)])[0]: raise ValueError('Правила отсутствуют; фильтрация не подтверждена.')
+            counters=checked_run([tool,'-w','5','-t','mangle','-n','-v','-x','-L',active['chain']])
+            result['dropped']+=sum(int(m[1]) for m in re.finditer(r'(?m)^\s*(\d+)\s+\d+\s+DROP\s',counters))
+        result['active']=not state.get('pending') and not state.get('retired')
+        if not result['active']: result['error']='Нужно завершить восстановление управляемых цепочек.'
+    except (ValueError,RuntimeError,OSError) as exc: result['error']=str(exc)
+    return result
+
+
+def torrent_operation(action,values):
+    if action=='status': return json.dumps(torrent_snapshot(),ensure_ascii=False,indent=2)
+    if action not in ('save','disable'): raise ValueError('Неизвестная операция фильтра BitTorrent.')
+    confirmed(values)
+    require_no_firewall_pending()
+    with admin_lock(),torrent_lock() as acquired:
+        state=torrent_state()
+        for ctx in [state.get('pending'),*state.get('retired',[])]:
+            if ctx: torrent_remove(ctx)
+        state.pop('pending',None); state.pop('retired',None)
+        if action=='disable':
+            torrent_remove(state.get('active'))
+            disabled=dict(state,enabled=False)
+            disabled.pop('active',None); atomic_write(TORRENT_STATE,json.dumps(disabled))
+            if read_text(SCHEDULE_DIR/'trusttunnel-torrent-filter.timer').startswith('# Managed by TrustTunnel torrent filter\n'):
+                checked_run(['systemctl','disable','--now','trusttunnel-torrent-filter.timer'])
+            message='Ограничение BitTorrent отключено. Удалены только его управляемые цепочки; WARP и UFW не сбрасывались.'
+        else:
+            if values.get('limits_ack')!='1': raise ValueError('Подтвердите ограничения частичной защиты от BitTorrent.')
+            mode=values.get('mode','signatures')
+            if mode not in ('signatures','ports'): raise ValueError('Неизвестный режим BitTorrent.')
+            ports=torrent_ports(values.get('ports','6881:6889,6969,51413')) if mode=='ports' else []
+            if mode=='ports' and not ports: raise ValueError('Выберите хотя бы один порт или режим только сигнатур.')
+            context=torrent_context()
+            torrent_apply(state,context,mode,ports,install_units=True)
+            message='Ограничение BitTorrent применено только к выходу TrustTunnel. Маршрут, сертификаты и клиентские профили не менялись. Полная блокировка всех торрентов не гарантируется.'
+        SNAPSHOT_CACHE.pop('torrent_snapshot',None)
+        audit_log('torrent-'+action)
+        return message
+
+
 def configure_echo_policy(values):
     require_no_firewall_pending()
     if values.get('confirm') != 'CONFIRMED': raise ValueError('Подтвердите настройку входящего ping.')
@@ -1886,7 +2228,7 @@ def security_snapshot():
     check('Профили и учёт', 'warn' if unsafe else 'ok', 'Файлов с небезопасными правами/владельцем/ссылками: '+str(unsafe)+'. Содержимое и секреты не включаются в отчёт.')
     integrity, integrity_text = protection_integrity()
     check('TLS-аутентификация VPN', 'info' if integrity else 'warn', integrity_text+' App v1.3 поддерживает ключевую TLS-аутентификацию; нужен совместимый endpoint. Не защищает от копирования ключа.')
-    check('Автоматический антишаринг', 'warn' if GUARD_STATUS.get('error') else 'info', GUARD_STATUS.get('error') or 'Лимиты соединений и сроки/квоты управляются по клиентам. При неизвестной телеметрии автоматического IP-бана нет; аппаратная привязка не заявляется.')
+    check('Контроль передачи доступа', 'warn' if GUARD_STATUS.get('error') else 'info', GUARD_STATUS.get('error') or 'Квоты, сроки, одноразовая выдача и наблюдение сетей управляются по клиентам. Наблюдавшиеся сети не равны одновременным IP. Строгий IP admission и ключ устройства пока не реализованы; автоматического IP-бана нет.')
     rc, verbose = run(['ufw','status','verbose'],timeout=5)
     check('Политика входящих соединений', 'ok' if not rc and 'deny (incoming)' in verbose else 'warn', 'UFW запрещает входящие по умолчанию' if 'deny (incoming)' in verbose else 'Проверьте default incoming и правила. Автоматическая смена политики не выполняется: можно потерять доступ к VPS.')
     rc, kernel = run(['sysctl','-n',*SAFE_SYSCTLS],timeout=5)
@@ -3382,6 +3724,17 @@ def admin_form(action, body, username='', view='clients', confirm=''):
     return f'<form method="post" action="/manage"{confirmation}><input type="hidden" name="action" value="{action}"><input type="hidden" name="view" value="{view}">{identity}{body}</form>'
 
 
+def client_source_watch_controls(name, policy):
+    watch = policy.get('source_watch', {})
+    controls = '<input type="hidden" name="confirm" value="CONFIRMED">'
+    controls += f'<label>Окно наблюдения, минут<input name="minutes" type="number" min="5" max="1440" value="{watch.get("minutes",60)}" required></label>'
+    controls += f'<label>Предупредить от N сетей<input name="threshold" type="number" min="2" max="100" value="{watch.get("threshold",4)}" required></label>'
+    controls += '<label>Считать IPv6<select name="ipv6_prefix">'+''.join(f'<option value="{prefix}" {"selected" if watch.get("ipv6_prefix",64)==prefix else ""}>{title}</option>' for prefix,title in [(64,'По сети /64 (меньше ложных тревог)'),(128,'По каждому адресу /128')])+'</select></label><button>Включить наблюдение сетей</button>'
+    save = admin_form('guard-watch-save',controls,name,confirm='Включить предупреждения по наблюдаемым сетям? Автобана и ограничения числа устройств не будет; наблюдение не меняет VPN-профиль.')
+    remove = admin_form('guard-watch-remove','<input type="hidden" name="confirm" value="CONFIRMED"><button>Выключить наблюдение</button>',name,confirm='Выключить наблюдение сетей? Квота, срок и доступ клиента останутся прежними.')
+    return '<h3>Подозрительное использование</h3><p class="muted" data-client-watch="'+html.escape(name,quote=True)+'">Ожидание отчёта о сетях</p><p class="muted">Это наблюдавшиеся сети за период, не одновременные IP и не число устройств. Wi-Fi, мобильная связь и IPv6 могут дать ложную тревогу. При предупреждении проверьте владельца; не блокируйте общий NAT автоматически.</p>'+save+remove+'<p class="warning">Строгий лимит активных IP пока недоступен: требуется доработка аутентификации endpoint. Привязка к ключу устройства дополнительно требует совместимого клиента. Fail2ban блокирует весь IP и не заменяет эти механизмы.</p>'
+
+
 def clients_console():
     clients = client_inventory()
     policies = guard_state().get('policies', {})
@@ -3406,14 +3759,14 @@ def clients_console():
         note = admin_form('client-note', f'<label>Заметка<input name="note" maxlength="300" value="{html.escape(client["note"], quote=True)}"></label><button>Сохранить</button>', name)
         password = admin_form('client-password', '<label>Новый пароль<input name="password" type="password" placeholder="Пусто: случайный" autocomplete="new-password"></label><button>Сменить пароль</button>', name, confirm='Старый пароль перестанет работать. Потребуется обновить профиль клиента.')
         delete = admin_form('client-delete', '<button class="danger">Удалить клиента</button>', name, confirm='Удалить клиента и отозвать доступ?')
-        limits = admin_form('client-limits', ''.join(f'<label>{title}<input name="{key}" type="number" min="1" max="1000" placeholder="По умолчанию" value="{client.get(key, "")}"></label>' for key, title in [('max_http2_conns', 'Соединений HTTP/2'), ('max_http3_conns', 'Соединений QUIC')]) + '<button>Сохранить лимиты</button>', name, confirm='Изменить лимиты соединений и перезапустить TrustTunnel?')
+        limits = admin_form('client-limits', ''.join(f'<label>{title}<input name="{key}" type="number" min="1" max="1000" placeholder="Пусто: значение endpoint" value="{client.get(key, "")}"></label>' for key, title in [('max_http2_conns', 'Транспортных туннелей HTTP/2'), ('max_http3_conns', 'Транспортных туннелей QUIC')]) + '<button>Сохранить технические лимиты</button>', name, confirm='Изменить технические лимиты туннелей и перезапустить TrustTunnel? Это не ограничение IP или устройств; малое значение может лишить клиента интернета.')
         policy = policies.get(name, {})
         expiry = datetime.datetime.fromtimestamp(policy['expires_at'], datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M') if policy.get('expires_at') else ''
         quota = str(round(policy.get('quota_bytes',0)/1073741824,3)) if policy.get('quota_bytes') else ''
         guard = admin_form('guard-save', '<input type="hidden" name="confirm" value="CONFIRMED">'+f'<label>Общий трафик, ГиБ<input name="quota_gib" type="number" min="0" max="999999" step="0.001" value="{quota}" placeholder="Без ограничения"></label><label>Действует до, UTC<input type="datetime-local" name="expires" value="{expiry}"></label><label class="check"><input type="checkbox" name="auto_suspend" value="1" {"checked" if policy.get("auto_suspend") else ""}>Автоматически отозвать доступ</label><label class="check"><input type="checkbox" name="disconnect_ack" value="1">Допускаю краткий перезапуск VPN при автоотзыве</label><button>Сохранить политику</button>', name, confirm='Сохранить квоту/срок? Автоотзыв отключит учётную запись при превышении и переподключит VPN-клиентов.')
         guard += admin_form('guard-remove','<input type="hidden" name="confirm" value="CONFIRMED"><button>Убрать квоту и срок</button>',name,confirm='Убрать политику? Уже отключённый доступ не включается автоматически.')
-        guard += admin_form('guard-restrict','<input type="hidden" name="confirm" value="CONFIRMED"><button>Ограничить до 1 H2 + 1 QUIC</button>',name,confirm='Поставить по одному соединению для каждого транспорта? Это может помешать многопоточному клиенту и переподключениям. Аппаратной привязки нет.')
-        invite = admin_form('enrollment-issue','<input type="hidden" name="confirm" value="CONFIRMED"><label>Срок приглашения, минут<input type="number" min="1" max="1440" name="minutes" value="15" required></label><label>Транспорт<select name="protocol">'+transports+'</select></label><label>Тип профиля<select name="kind">'+kinds+'</select></label><button>Создать одноразовое приглашение</button>',name,confirm='Создать одноразовую HTTPS-выдачу профиля? Полученный профиль всё ещё можно переслать.')
+        guard += client_source_watch_controls(name,policy)
+        invite = admin_form('enrollment-issue','<input type="hidden" name="confirm" value="CONFIRMED"><label>Срок приглашения, минут<input type="number" min="1" max="1440" name="minutes" value="15" required></label><label>Транспорт<select name="protocol">'+transports+'</select></label><label>Тип профиля<select name="kind">'+kinds+'</select></label><label>IP/CIDR получателя (необязательно)<input name="source_cidr" maxlength="64" placeholder="Например 198.51.100.27/32"><small>Ограничивает только получение. Смена сети может помешать активации; импортированный профиль остаётся копируемым. За reverse proxy проверяется IP прокси, не X-Forwarded-For.</small></label><button>Создать одноразовое приглашение</button>',name,confirm='Создать одноразовую HTTPS-выдачу профиля? Если задан IP/CIDR, получить её можно только из этой сети. Полученный профиль всё ещё можно переслать.')
         invite += admin_form('enrollment-revoke','<input type="hidden" name="confirm" value="CONFIRMED"><button>Отозвать приглашения</button>',name,confirm='Отозвать все неиспользованные приглашения этого клиента?')
         extra = admin_form('diagnostics-client','<button>'+icon('Activity')+'Диагностика клиента</button>',name)
         extra += admin_form('client-refresh-network','<input type="hidden" name="confirm" value="CONFIRMED"><button>Обновить сетевые параметры профиля</button>',name,confirm='Применить текущие DNS/AntiDPI/TLS-профиль к TOML этого клиента? Потребуется повторный импорт; ключи и SNI сохраняются.')
@@ -3553,7 +3906,22 @@ def routing_console():
         fingerprint = hashlib.sha256(json.dumps(rule, sort_keys=True).encode()).hexdigest()
         delete = admin_form('routing-rule-delete', f'<input type="hidden" name="index" value="{index}"><input type="hidden" name="fingerprint" value="{fingerprint}"><button class="danger">Удалить</button>', view='routing', confirm='Удалить это правило доступа?')
         rows.append(f'<tr><td>{index}</td><td>{html.escape(rule.get("cidr", ""))}</td><td>{html.escape(rule.get("client_random_prefix", ""))}</td><td>{html.escape(rule.get("action", ""))}</td><td>{delete}</td></tr>')
-    return f'<div class="page-head"><div><h2>Маршрутизация</h2><p>Настроенный выход: {html.escape(forwarder_label())}</p></div>{admin_form("routing-check", "<button>Полная диагностика</button>", view="routing")}</div><section class="surface"><h3>Выход TrustTunnel в интернет</h3><p class="muted">Маршрут применяется ко всем клиентам этого endpoint. Их логины, пароли и сертификаты не меняются. Интерфейсный WARP не меняет основной маршрут SSH.</p>{switch}</section><section class="surface"><h3>Правила входящего доступа к TrustTunnel</h3><p class="warning">Эти правила проверяют входящий IP клиента, а не посещаемые сайты. Первое совпадение имеет приоритет. При строгой TLS-защите редактирование заблокировано.</p>{add}<div class="table-wrap"><table><thead><tr><th>№</th><th>CIDR</th><th>Client random</th><th>Действие</th><th></th></tr></thead><tbody>{"".join(rows) or "<tr><td colspan=5>Правил нет</td></tr>"}</tbody></table></div></section>'
+    return f'<div class="page-head"><div><h2>Маршрутизация</h2><p>Настроенный выход: {html.escape(forwarder_label())}</p></div>{admin_form("routing-check", "<button>Полная диагностика</button>", view="routing")}</div><section class="surface"><h3>Выход TrustTunnel в интернет</h3><p class="muted">Маршрут применяется ко всем клиентам этого endpoint. Их логины, пароли и сертификаты не меняются. Интерфейсный WARP не меняет основной маршрут SSH.</p>{switch}</section>{torrent_console()}<section class="surface"><h3>Правила входящего доступа к TrustTunnel</h3><p class="warning">Эти правила проверяют входящий IP клиента, а не посещаемые сайты. Первое совпадение имеет приоритет. При строгой TLS-защите редактирование заблокировано.</p>{add}<div class="table-wrap"><table><thead><tr><th>№</th><th>CIDR</th><th>Client random</th><th>Действие</th><th></th></tr></thead><tbody>{"".join(rows) or "<tr><td colspan=5>Правил нет</td></tr>"}</tbody></table></div></section>'
+
+
+def torrent_console():
+    state=torrent_snapshot()
+    selected=state['mode']
+    label='Нужно восстановление' if state.get('recovering') else 'Активно · частичная защита' if state['active'] else 'Не подтверждено' if state['enabled'] else 'Выключено'
+    fields='<input type="hidden" name="confirm" value="CONFIRMED"><label>Режим<select name="mode">'
+    fields+=''.join('<option value="'+key+'"'+(' selected' if selected==key else '')+'>'+title+'</option>' for key,title in [('signatures','Открытые сигнатуры BitTorrent'),('ports','Сигнатуры и выбранные порты')])
+    fields+='</select></label><label>Порты дополнительного режима<input name="ports" value="'+html.escape(','.join(state.get('ports') or ['6881:6889','6969','51413']),quote=True)+'" maxlength="160"></label>'
+    fields+='<label class="check"><input type="checkbox" name="limits_ack" value="1" required>Понимаю: это не полная блокировка всех торрентов; выбранные порты могут использовать другие приложения</label><button class="primary">Применить ограничение</button>'
+    save=admin_form('torrent-save',fields,view='routing',confirm='Ограничить выходящий BitTorrent всех клиентов TrustTunnel? Изменятся только выделенные цепочки по cgroup; SSH, UFW, маршрут WARP и профили не меняются. Возможны пропуски зашифрованного/фрагментированного P2P и ложные совпадения открытых данных.')
+    status=admin_form('torrent-status','<button>'+icon('RefreshCw')+'Проверить фильтр и счётчики</button>',view='routing')
+    off=admin_form('torrent-disable','<input type="hidden" name="confirm" value="CONFIRMED"><button>Отключить ограничение</button>',view='routing',confirm='Удалить только управляемые правила BitTorrent и остановить их таймер проверки?') if state['enabled'] or state.get('recovering') else ''
+    error='<p class="warning">'+html.escape(state['error'])+'</p>' if state.get('error') else ''
+    return '<section class="surface" id="torrent-controls"><div class="section-heading"><h3>Ограничение торрентов на выходе</h3><span class="badge'+(' active' if state['active'] else '')+'">'+label+'</span></div><p class="warning">'+html.escape(state['warning'])+' Это не DPI-классификатор со сборкой потока: сегментированный TCP, MSE/PE, VPN поверх VPN и часть uTP могут пройти.</p><p class="muted">Только сокеты процесса TrustTunnel, до WARP/прямого выхода. Обычный UDP и HTTPS не запрещаются целиком. Нового SOCKS-прокси нет. Счётчик показывает пакеты совпадений, а не количество загрузок; после пересоздания правил он обнуляется.</p>'+error+'<p class="hint">Совпавших отброшенных пакетов: '+str(state['dropped'])+'</p><div class="inline-actions">'+status+off+'</div>'+save+'</section>'
 
 
 def dns_console():
@@ -3715,6 +4083,7 @@ CONSOLE_SCRIPT = r'''
         document.querySelectorAll('[data-client-online]').forEach(cell=>{const item=byName.get(cell.dataset.clientOnline),online=data.available?item?.online:null;cell.textContent=online===true?'Онлайн · '+item.sessions+' сесс.':online===false?'Офлайн':'Статус неизвестен';cell.className='badge'+(online===true?' active':'');cell.closest('[data-client-row]').dataset.online=online===true?'online':online===false?'offline':'unknown';});
         document.querySelectorAll('[data-client-metrics]').forEach(cell=>{const item=byName.get(cell.dataset.clientMetrics);cell.textContent=item?'↓ '+format(item.download)+' · ↑ '+format(item.upload)+' · всего '+format(item.download+item.upload):'Нет сохранённых измерений';});
         document.querySelectorAll('[data-client-seen]').forEach(cell=>{const item=byName.get(cell.dataset.clientSeen);cell.textContent='Последний онлайн: '+(item?.online===true?'сейчас':date(item?.last_seen));});
+        document.querySelectorAll('[data-client-watch]').forEach(cell=>{const item=byName.get(cell.dataset.clientWatch)?.sharing;cell.classList.toggle('warning',Boolean(item?.alert));cell.textContent=!item?.enabled?'Наблюдение сетей выключено.':(!data.available?'Метрики сейчас недоступны. Последние наблюдения: ':item.alert?'Проверьте доступ: ':'Наблюдение: ')+item.observed_networks+' сетей за '+item.minutes+' мин; последний образец '+date(item.last_sample)+'. Это не одновременные IP; автоматического бана нет.';});
         document.querySelectorAll('[data-client-details]').forEach(cell=>{const item=byName.get(cell.dataset.clientDetails);cell.textContent=item?'Последнее наблюдение online: '+date(item.last_seen)+'. Трафик: ↓ '+format(item.download)+' / ↑ '+format(item.upload)+'. Сессий: '+(data.available?item.sessions:'неизвестно')+'. '+(item.sessions>1?'Несколько сессий не доказывают шаринг. ':'')+'История до начала учёта неизвестна. Дата и время показаны в часовом поясе устройства.':'Нет измерений';});
         status.textContent=(data.available?'Обновлено '+new Date(data.checked_at*1000).toLocaleTimeString()+' · автообновление 15 с.':'Метрики недоступны. Статус неизвестен, сохранённый трафик не сброшен. Включение: Endpoint.')+' '+(data.accounting_error||'')+' '+(data.guard?.error||'');
         if(data.guard?.pending?.length)status.append(document.createTextNode(' Квота/срок требуют решения администратора: '+data.guard.pending.join(', ')+'. Проверьте политики в карточках клиентов.'));
@@ -3807,6 +4176,13 @@ PANEL_STYLE += '\n.logout-form{margin:0!important;display:flex;align-items:cente
 PANEL_STYLE += '''
 .route-picker{border:0;padding:0;margin:0 0 16px;min-width:0;width:100%;display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;flex-basis:100%}.route-picker legend{font-size:12px;color:var(--muted);padding:0 0 12px}.route-choice{display:flex;align-items:flex-start;gap:12px;margin:0;padding:16px 30px 16px 14px;border:1px solid var(--line);border-radius:7px;cursor:pointer;min-width:0;background:var(--surface);position:relative}.route-choice:has(input:checked){border-color:var(--accent);background:var(--accent-soft)}.route-choice input{width:18px;height:18px;min-height:18px;flex:0 0 18px;margin:3px 0 0;padding:0;accent-color:var(--accent)}.route-choice span{min-width:0}.route-choice strong{display:block;font-size:13px;color:var(--ink);overflow-wrap:anywhere}.route-choice small{display:block;font-size:11px;line-height:1.5;color:var(--muted);margin-top:5px;overflow-wrap:anywhere}.route-current{display:inline-block;margin-top:8px;font-size:10px;color:var(--accent);font-weight:600}.route-choice .help-button{top:8px;right:5px}.security-check form{margin:12px 0 0}.security-check form button{font-size:11px}.client-usage{line-height:1.6}[data-client-seen]{font-size:11px}@media(max-width:560px){.route-picker{grid-template-columns:1fr}.route-choice{padding:14px 30px 14px 12px}}
 '''
+PANEL_STYLE += '''
+#torrent-controls form:has(input[value="torrent-save"]){display:grid;grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:14px;align-items:start}
+#torrent-controls label.check{grid-column:1/-1;align-items:flex-start;font-size:13px;line-height:1.5}
+#torrent-controls label.check input,.drawer-card label.check input{flex:0 0 17px;width:17px;height:17px;margin-top:2px}
+#torrent-controls form button{justify-self:start}
+@media(max-width:560px){#torrent-controls form:has(input[value="torrent-save"]){grid-template-columns:1fr}#torrent-controls input,#torrent-controls select{width:100%}}
+'''
 ASSET_VERSION = hashlib.sha256((PANEL_STYLE + CONSOLE_SCRIPT).encode()).hexdigest()[:12]
 
 
@@ -3875,6 +4251,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def setup(self):
         super().setup()
         self.connection.settimeout(20)
+
+    def send_error(self, code, message=None, explain=None):
+        # Avoid a TCP reset hiding a rejection when a small POST body is in flight.
+        if self.command=='POST' and not getattr(self,'_post_body_read',False) and not self.headers.get('Transfer-Encoding'):
+            lengths=self.headers.get_all('Content-Length',[])
+            if len(lengths)==1 and re.fullmatch(r'[0-9]{1,5}',lengths[0]) and int(lengths[0])<=65536:
+                timeout=self.connection.gettimeout()
+                try:
+                    self.connection.settimeout(1)
+                    self.rfile.read(int(lengths[0]))
+                    self._post_body_read=True
+                except OSError: pass
+                finally: self.connection.settimeout(timeout)
+        super().send_error(code,message,explain)
 
     def end_headers(self):
         self.send_header('Cache-Control', 'private, max-age=86400, immutable' if getattr(self, '_asset_response', False) else 'no-store')
@@ -4010,6 +4400,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', '0'))
         if not 0 <= length <= 65536:
             raise ValueError('Request body too large')
+        self._post_body_read=True
         body = self.rfile.read(length)
         if len(body) != length: raise ValueError('Incomplete request body')
         parsed = urllib.parse.parse_qs(body.decode('utf-8'),keep_blank_values=True,max_num_fields=80)
@@ -4142,6 +4533,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
+        self._post_body_read=False
         try:
             if self.path == '/activate': self.handle_activation(); return
             if self.path == '/login': self.handle_login(); return
@@ -4166,7 +4558,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not csrf or not secrets.compare_digest(csrf.encode(),self.cookie('activation').encode()):
             self.send_json({'error':'Откройте приглашение повторно.'},403); return
         try:
-            result = redeem_enrollment(values.get('token',''))
+            result = redeem_enrollment(values.get('token',''), self.client_address[0])
         except (ValueError, RuntimeError, OSError, sqlite3.Error):
             login_delay(peer,failed=True)
             self.send_json({'error':'Приглашение истекло, использовано или отозвано. Запросите новое у администратора.'},400); return
@@ -4195,6 +4587,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             read_only = {'monitor', 'logs', 'audit', 'security-audit', 'security-scan', 'security-status', 'security-listeners', 'security-logins', 'security-ignore-list', 'dns-check', 'routing-check', 'client-list', 'client-link', 'endpoint-releases', 'masque-status', 'masque-check', 'certificate-status', 'recommendations', 'interface-status', 'interface-check', 'protection-status', 'schedule-status', 'guard-status'}
             read_only |= {'diagnostics-stack','diagnostics-client','diagnostics-egress','diagnostics-warp','routing-current'}
             read_only |= {'ufw-applications','ufw-logs','ufw-preview','f2b-status','f2b-test','f2b-logs','f2b-jail-status'}
+            read_only.add('torrent-status')
             try:
                 f['_peer'] = self.client_address[0]
                 result = admin_operation(f.get('action', ''), f)
@@ -4341,7 +4734,12 @@ def main():
 
 
 if __name__ == '__main__':
-    if len(sys.argv) == 3 and sys.argv[1] == '--firewall-rollback':
+    if sys.argv[1:] == ['--torrent-reconcile']:
+        try: torrent_reconcile()
+        except (ValueError,RuntimeError,OSError) as exc:
+            print('BitTorrent filter: '+str(exc),file=sys.stderr)
+            sys.exit(1)
+    elif len(sys.argv) == 3 and sys.argv[1] == '--firewall-rollback':
         print(firewall_rollback(sys.argv[2]))
     elif len(sys.argv) > 1 and sys.argv[1] == '--admin':
         try:

@@ -219,6 +219,7 @@ choose_action() {
     echo "33) Рекомендации по безопасности и настройкам"
     echo "34) Защита от сканирования и ClientHello-фильтр"
     echo "35) Безопасность VPS, входящий ping и расписания обслуживания"
+    echo "36) Ограничение BitTorrent на выходе (частичная защита)"
     echo "0) Выход"
     echo
     prompt_value "Выбери действие [1]: "
@@ -258,8 +259,9 @@ choose_action() {
       33) ACTION="recommendations"; return ;;
       34) ACTION="manage-protection"; return ;;
       35) ACTION="manage-server-security"; return ;;
+      36) ACTION="manage-torrents"; return ;;
       0) ACTION="exit"; return ;;
-      *) echo "Нужно выбрать 0-35 из меню." ;;
+      *) echo "Нужно выбрать 0-36 из меню." ;;
     esac
   done
 }
@@ -1483,6 +1485,35 @@ manage_protection() {
   admin_call "protection-$op" confirm=CONFIRMED "clients_ready=$ready" "client_v13=$v13"
 }
 
+manage_torrents() {
+  ensure_admin_helper || return
+  local choice mode ports ack
+  echo "=== Ограничение BitTorrent только для выхода TrustTunnel ==="
+  echo "Это частичный фильтр открытых сигнатур, не полноценный DPI."
+  echo "Шифрование MSE/PE, сегментация TCP и вложенный VPN могут его обойти."
+  echo "1) Состояние и счётчики"
+  echo "2) Открытые сигнатуры, без запрета UDP целиком"
+  echo "3) Сигнатуры + выбранные порты (могут использоваться не только торрентами)"
+  echo "4) Отключить ограничение"
+  echo "0) Назад"
+  prompt_value "Выбор [0]: "; choice="${REPLY_VALUE:-0}"
+  case "$choice" in
+    1) admin_call torrent-status; return ;;
+    4)
+      confirm_action "Удалить только правила ограничения BitTorrent? Маршрут WARP и UFW не сбрасываются."
+      admin_call torrent-disable confirm=CONFIRMED; return ;;
+    2) mode=signatures; ports="" ;;
+    3)
+      mode=ports
+      ask_default ports "Порты/диапазоны через запятую" "6881:6889,6969,51413" ;;
+    *) return ;;
+  esac
+  ask_yes_no ack "Понимаю, что все торренты заблокировать не гарантируется" 0
+  [ "$ack" = 1 ] || return
+  confirm_action "Применить частичный фильтр ко всем клиентам только этого TrustTunnel? SSH, сертификаты и профиль маршрута не меняются."
+  admin_call torrent-save "mode=$mode" "ports=$ports" limits_ack=1 confirm=CONFIRMED
+}
+
 manage_warp() {
   ensure_admin_helper || return
   local backend choice operation
@@ -1996,6 +2027,10 @@ remove_all() {
   local endpoint_port
   endpoint_port="$(current_endpoint_port)"
   backup_identity
+  if [ -f /var/lib/trusttunnel-panel/torrent-filter.json ]; then
+    ensure_admin_helper || return 1
+    admin_call torrent-disable confirm=CONFIRMED || return 1
+  fi
   systemctl disable --now trusttunnel 2>/dev/null || true
   systemctl stop trusttunnel-panel 2>/dev/null || true
   systemctl disable --now warp-interface-watchdog.timer warp-interface.service warp-masque-tun.service warp-masque-bridge.service warp-masque.service 2>/dev/null || true
@@ -2515,6 +2550,12 @@ manage_panel_service() {
 }
 remove_panel() {
   confirm_action "Веб-панель TrustTunnel будет остановлена и удалена."
+  if [ -f /var/lib/trusttunnel-panel/torrent-filter.json ]; then
+    echo "Ограничение BitTorrent будет отключено: его фоновая проверка использует backend панели."
+    confirm_action "Отключить ограничение BitTorrent и продолжить удаление панели?"
+    ensure_admin_helper || return 1
+    admin_call torrent-disable confirm=CONFIRMED || return 1
+  fi
   systemctl disable --now trusttunnel-panel 2>/dev/null || true
   rm -f /etc/systemd/system/trusttunnel-panel.service
   rm -f /usr/local/sbin/trusttunnel-panel.py
@@ -2695,17 +2736,17 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.25'" "$ADMIN_HELPER_PATH"; then return; fi
-  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.25'" /usr/local/lib/trusttunnel/admin.py; then
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.26'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.26'" /usr/local/lib/trusttunnel/admin.py; then
     ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
     return
   fi
   local candidate
   candidate="$(mktemp)"
   if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
-  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.10.25'" "$candidate"; then
+  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.10.26'" "$candidate"; then
     rm -f "$candidate"
-    echo "Требуется общий backend панели 2026.10.25. Обновите панель; старый backend не будет менять настройки." >&2
+    echo "Требуется общий backend панели 2026.10.26. Обновите панель; старый backend не будет менять настройки." >&2
     return 1
   fi
   mkdir -p /usr/local/lib/trusttunnel
@@ -2735,7 +2776,7 @@ manage_clients() {
     echo "8) Включить клиента с прежним паролем"
     echo "9) Изменить заметку"
     echo "10) Создать группу клиентов"
-    echo "11) Лимиты соединений HTTP/2 и QUIC (не привязка к устройству)"
+    echo "11) Технические лимиты туннелей H2/QUIC (не IP и не устройства)"
     echo "12) Статистика: online, последний онлайн и накопленный трафик"
     echo "13) Антишаринг: общий лимит трафика и срок"
     echo "14) Убрать квоту и срок"
@@ -2743,12 +2784,27 @@ manage_clients() {
     echo "16) Отозвать неиспользованные приглашения"
     echo "17) Обновить сетевые параметры выбранного профиля"
     echo "18) Диагностика клиента (без секретов)"
+    echo "19) Настроить предупреждение о частой смене сетей (без автобана)"
+    echo "20) Отключить наблюдение сетей"
     echo "0) Назад"
     prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
       0) return ;;
       1) admin_call client-list ;;
       12) admin_call guard-status ;;
+      19|20)
+        prompt_value "Логин клиента: "; user="$REPLY_VALUE"
+        if [ "$choice" = 20 ]; then
+          confirm_action "Выключить наблюдение? Квота и срок не меняются."
+          admin_call guard-watch-remove "username=$user" confirm=CONFIRMED
+        else
+          local watch_minutes watch_threshold watch_prefix
+          ask_default watch_minutes "Окно наблюдения, минут (5–1440)" "60"
+          ask_default watch_threshold "Предупредить от N наблюдавшихся сетей (2–100)" "4"
+          ask_default watch_prefix "IPv6: сеть /64 или адрес /128" "64"
+          confirm_action "Это не одновременные IP и не число устройств. Только предупреждение, без банов и изменения VPN."
+          admin_call guard-watch-save "username=$user" "minutes=$watch_minutes" "threshold=$watch_threshold" "ipv6_prefix=$watch_prefix" confirm=CONFIRMED
+        fi ;;
       13)
         prompt_value "Логин клиента: "; user="$REPLY_VALUE"
         local quota expiry automatic ack
@@ -2764,12 +2820,13 @@ manage_clients() {
         case "$choice" in
           14) confirm_action "Снять срок и квоту (не включает отключённого клиента)."; admin_call guard-remove "username=$user" confirm=CONFIRMED ;;
           15)
-            local minutes protocol kind
+            local minutes protocol kind source_cidr
             ask_default minutes "Срок приглашения, минут (1–1440)" "15"
             ask_default protocol "Протокол http2/http3" "http2"
             ask_default kind "Профиль static/protected/tls-auth" "static"
+            prompt_value "Разрешённый IP/CIDR для получения (пусто: любой): "; source_cidr="$REPLY_VALUE"
             confirm_action "Создать одноразовую выдачу? После получения сам профиль остаётся копируемым."
-            admin_call enrollment-issue "username=$user" "minutes=$minutes" "protocol=$protocol" "kind=$kind" confirm=CONFIRMED ;;
+            admin_call enrollment-issue "username=$user" "minutes=$minutes" "protocol=$protocol" "kind=$kind" "source_cidr=$source_cidr" confirm=CONFIRMED ;;
           16) confirm_action "Отозвать непогашенные приглашения?"; admin_call enrollment-revoke "username=$user" confirm=CONFIRMED ;;
           17) confirm_action "Обновить DNS/AntiDPI/TLS профиль выбранного клиента. Ключи и SNI сохраняются, нужен повторный импорт."; admin_call client-refresh-network "username=$user" confirm=CONFIRMED ;;
           18) admin_call diagnostics-client "username=$user" ;;
@@ -2780,6 +2837,7 @@ manage_clients() {
         prompt_value "Количество [5]: "; count="${REPLY_VALUE:-5}"
         admin_call client-batch "prefix=$prefix" "count=$count" ;;
       11)
+        echo "Внимание: это туннели транспорта, не адреса сайтов и не число устройств. Малое значение может нарушить интернет; пусто убирает персональный лимит (действует значение endpoint)."
         prompt_value "Логин клиента: "; user="$REPLY_VALUE"
         prompt_value "Лимит HTTP/2 (пусто: по умолчанию): "; local h2="$REPLY_VALUE"
         prompt_value "Лимит QUIC (пусто: по умолчанию): "; local h3="$REPLY_VALUE"
@@ -3339,6 +3397,10 @@ main() {
       ;;
     manage-server-security)
       manage_server_security
+      exit 0
+      ;;
+    manage-torrents)
+      manage_torrents
       exit 0
       ;;
     configure-routing)

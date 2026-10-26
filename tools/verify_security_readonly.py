@@ -19,7 +19,7 @@ def main():
     paths+=list((p.FAIL2BAN_DIR/'jail.d').glob('*'))
     def hashes(): return {str(path):hashlib.sha256(path.read_bytes()).hexdigest() for path in paths if path.is_file()}
     before=hashes()
-    for name in ('test_admin.py','test_client_protection.py','test_activation_http.py','test_firewall_fail2ban.py','test_panel_security_http.py','test_installer_sandbox.py'):
+    for name in ('test_admin.py','test_client_protection.py','test_activation_http.py','test_firewall_fail2ban.py','test_panel_security_http.py','test_sharing_controls.py','test_torrent_filter.py','test_installer_sandbox.py'):
         subprocess.run([sys.executable,str(root/'tools'/name)],check=True,timeout=120)
     subprocess.run(['bash','-n',str(root/'install-trusttunnel-warp.sh')],check=True)
     data=p.firewall_snapshot(); assert data['available'] and data['active'] and len(data['rules'])>=4
