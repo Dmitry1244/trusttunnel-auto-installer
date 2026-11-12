@@ -16,6 +16,13 @@ with tempfile.TemporaryDirectory(prefix='tt-installer-test-') as directory:
     def bash(body, check=True):
         code = library + '\nTT_DIR="$TT_TEST_ROOT"\nDOMAIN=example.test\n' + body
         return subprocess.run(['bash'], input=code, env=env, check=check, text=True, capture_output=True, timeout=15)
+    for address, expected in (('0.0.0.0:8443','8443'),('[::]:9443','9443'),('[2001:db8::1]:54321','54321')):
+        (root/'vpn.toml').write_text('listen_address="'+address+'"\n')
+        assert bash('current_endpoint_port').stdout.strip()==expected
+    (root/'vpn.toml').write_text('listen_address="[::]:70000"\n')
+    assert bash('current_endpoint_port',check=False).returncode!=0
+    (root/'vpn.toml').unlink()
+    print('Structured IPv4/IPv6 endpoint port and malformed-port refusal: PASS')
     for name in ('first', 'second'):
         subprocess.run(['openssl', 'req', '-x509', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', str(root / (name + '.key')), '-out', str(root / (name + '.pem')), '-days', '2', '-subj', '/CN=example.test', '-addext', 'subjectAltName=DNS:example.test'], check=True, capture_output=True)
     hosts = root / 'hosts.toml'

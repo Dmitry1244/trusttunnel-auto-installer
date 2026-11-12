@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Интерактивный установщик TrustTunnel endpoint + WARP.
 # Ubuntu/Debian VPS, в том числе с существующими настройками. Запускать от root.
@@ -1110,7 +1111,7 @@ write_clients() {
     admin_call client-rebuild
     return
   fi
-  local cert existing_clients existing_count existing_credentials generated_count index pass target_clients user zip_path
+  local cert existing_clients existing_count existing_credentials generated_count index pass target_clients user zip_path credentials_candidate
   mkdir -p "$CLIENT_DIR"
   rm -f "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt" "$CLIENT_DIR/server-cert.pem" 2>/dev/null || true
   cert="$(cat "$TT_DIR/certs/cert.pem")"
@@ -1124,7 +1125,8 @@ write_clients() {
     list_existing_clients "$existing_credentials" > "$existing_clients" || true
   fi
 
-  cat > "$TT_DIR/credentials.toml" <<'EOF'
+  credentials_candidate="$(mktemp "$TT_DIR/.credentials.XXXXXX")"
+  cat > "$credentials_candidate" <<'EOF'
 # Managed TrustTunnel users. One user/password per client.
 EOF
   : > "$CLIENT_DIR/clients-credentials.txt"
@@ -1144,7 +1146,7 @@ EOF
         continue
       fi
       generated_count=$((generated_count + 1))
-      cat >> "$TT_DIR/credentials.toml" <<EOF
+      cat >> "$credentials_candidate" <<EOF
 
 [[client]]
 username = "${user}"
@@ -1159,7 +1161,7 @@ EOF
   while [ "$index" -le "$target_clients" ]; do
     user="$(client_name_by_index "$index")"
     pass="$(random_password)"
-    cat >> "$TT_DIR/credentials.toml" <<EOF
+    cat >> "$credentials_candidate" <<EOF
 
 [[client]]
 username = "${user}"
@@ -1173,7 +1175,8 @@ EOF
   rm -f "$existing_credentials"
   rm -f "$existing_clients"
 
-  chmod 0600 "$TT_DIR/credentials.toml"
+  chmod 0600 "$credentials_candidate"
+  mv -f -- "$credentials_candidate" "$TT_DIR/credentials.toml"
   chmod 0600 "$CLIENT_DIR"/*.toml "$CLIENT_DIR/clients-credentials.txt"
   chmod 0644 "$CLIENT_DIR/server-cert.pem"
   zip_path="/root/trusttunnel-clients-${DOMAIN}.zip"
@@ -1395,6 +1398,9 @@ manage_server_security() {
   echo "8) Диагностика endpoint, портов и TLS"
   echo "9) Проверить выход через текущий WARP"
   echo "10) Проверить прямой DNS/TCP/TLS выход VPS"
+  echo "11) Здоровье сервера и история наблюдений"
+  echo "12) Обновить измерение здоровья сервера"
+  echo "13) Статистика защиты веб-панели"
   echo "0) Назад"
   prompt_value "Выбор [1]: "; choice="${REPLY_VALUE:-1}"
   case "$choice" in
@@ -1415,6 +1421,9 @@ manage_server_security() {
     10)
       ask_default kind "Направление cloudflare/github" "cloudflare"
       admin_call diagnostics-egress "target=$kind"; return ;;
+    11) admin_call health-status; return ;;
+    12) admin_call health-check; return ;;
+    13) admin_call scanner-status; return ;;
     5|6) ;;
     *) return ;;
   esac
@@ -1580,7 +1589,7 @@ manage_interface() {
 
 manage_endpoint_features() {
   ensure_admin_helper || return
-  local choice enabled path confirm
+  local choice enabled path confirm http1_ack
   while true; do
     echo "=== Обновления и функции endpoint ==="
     echo "1) Проверить стабильный и предварительный выпуски"
@@ -1599,7 +1608,11 @@ manage_endpoint_features() {
         if [ "$confirm" = BETA ]; then TT_CHANNEL=beta; update_trusttunnel_only; else echo "Отменено."; fi ;;
       4)
         prompt_value "Включить: 1; выключить: 0 [0]: "; enabled="${REPLY_VALUE:-0}"
-        admin_call endpoint-metrics "enabled=$enabled" ;;
+        http1_ack=0
+        if [ "$enabled" = 1 ]; then
+          ask_yes_no http1_ack "Если HTTP/1.1 ещё не настроен, разрешить его добавление для метрик (также на VPN-порту, без отключения HTTP/2 и QUIC)" 0
+        fi
+        admin_call endpoint-metrics "enabled=$enabled" "http1_ack=$http1_ack" ;;
       5)
         prompt_value "Включить: 1; выключить: 0 [0]: "; enabled="${REPLY_VALUE:-0}"
         prompt_value "Путь [/subscription]: "; path="${REPLY_VALUE:-/subscription}"
@@ -1709,7 +1722,18 @@ remove_warp_only() {
 current_endpoint_port() {
   local config="$TT_DIR/vpn.toml"
   if [ -f "$config" ]; then
-    sed -nE 's/^[[:space:]]*listen_address[[:space:]]*=[[:space:]]*"[^:"]+:([0-9]+)".*/\1/p' "$config" | head -1
+    python3 - "$config" <<'PY'
+import pathlib, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+address = tomllib.loads(pathlib.Path(sys.argv[1]).read_text()).get('listen_address', '0.0.0.0:443')
+host, separator, port = str(address).rpartition(':')
+if not separator or not host or not port.isdecimal() or not 1 <= int(port) <= 65535 or (':' in host and not (host.startswith('[') and host.endswith(']'))):
+    raise SystemExit('Invalid endpoint listen_address; refusing a guessed port')
+print(int(port))
+PY
     return
   fi
   printf '443'
@@ -2391,7 +2415,7 @@ install_panel() {
   fi
   apt_update_retry || true
   apt_install_retry -y --no-install-recommends --no-upgrade python3 python3-tomli dnsutils curl qrencode
-  local panel_candidate
+  local panel_candidate env_candidate
   panel_candidate="$(mktemp)"
   if [ -n "${PANEL_SCRIPT_SOURCE:-}" ]; then
     python3 -c 'import os,stat,sys; s=os.stat(sys.argv[1]); assert s.st_uid==0 and not s.st_mode & 0o022 and stat.S_ISREG(s.st_mode), "Panel source must be root-owned and not writable by other users"' "$PANEL_SCRIPT_SOURCE"
@@ -2406,12 +2430,13 @@ install_panel() {
   if [ -z "${PANEL_PASSWORD:-}" ]; then
     PANEL_PASSWORD="$(openssl rand -base64 18 | tr -d '=+/')"
   fi
+  env_candidate="$(mktemp "${env_file}.XXXXXX")"
   if [ "$panel_mode" = "https" ]; then
     if [ ! -f "$TT_DIR/certs/cert.pem" ] || [ ! -f "$TT_DIR/certs/key.pem" ]; then
       echo "Для HTTPS-панели не найден сертификат TrustTunnel в ${TT_DIR}/certs." >&2
       exit 1
     fi
-    cat > "$env_file" <<EOF
+    cat > "$env_candidate" <<EOF
 PANEL_BIND=0.0.0.0
 PANEL_PORT=${PANEL_PORT}
 PANEL_USER=${PANEL_USER}
@@ -2422,7 +2447,7 @@ PANEL_KEY=${TT_DIR}/certs/key.pem
 EOF
     ufw allow "${PANEL_PORT}/tcp" comment "TrustTunnel Panel HTTPS" >/dev/null 2>&1 || true
   else
-    cat > "$env_file" <<EOF
+    cat > "$env_candidate" <<EOF
 PANEL_BIND=127.0.0.1
 PANEL_PORT=${PANEL_PORT}
 PANEL_USER=${PANEL_USER}
@@ -2433,7 +2458,8 @@ PANEL_KEY=${TT_DIR}/certs/key.pem
 EOF
     ufw delete allow "${old_port}/tcp" >/dev/null 2>&1 || true
   fi
-  chmod 0600 "$env_file"
+  chmod 0600 "$env_candidate"
+  mv -f -- "$env_candidate" "$env_file"
   cat > /etc/systemd/system/trusttunnel-panel.service <<EOF
 [Unit]
 Description=TrustTunnel web panel
@@ -2736,17 +2762,17 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.10.26'" "$ADMIN_HELPER_PATH"; then return; fi
-  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.10.26'" /usr/local/lib/trusttunnel/admin.py; then
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.11.12'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.11.12'" /usr/local/lib/trusttunnel/admin.py; then
     ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
     return
   fi
   local candidate
   candidate="$(mktemp)"
   if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
-  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.10.26'" "$candidate"; then
+  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.11.12'" "$candidate"; then
     rm -f "$candidate"
-    echo "Требуется общий backend панели 2026.10.26. Обновите панель; старый backend не будет менять настройки." >&2
+    echo "Требуется общий backend панели 2026.11.12. Обновите панель; старый backend не будет менять настройки." >&2
     return 1
   fi
   mkdir -p /usr/local/lib/trusttunnel
@@ -3152,8 +3178,19 @@ set -euo pipefail
 echo "Services:"
 systemctl --no-pager --plain is-active trusttunnel warp-wireproxy fail2ban 2>/dev/null || true
 echo
-endpoint_port="$(sed -nE 's/^[[:space:]]*listen_address[[:space:]]*=[[:space:]]*"[^:"]+:([0-9]+)".*/\1/p' /opt/trusttunnel/vpn.toml 2>/dev/null | head -1)"
-endpoint_port="${endpoint_port:-443}"
+endpoint_port="$(python3 - <<'PY'
+import pathlib
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+address = tomllib.loads(pathlib.Path('/opt/trusttunnel/vpn.toml').read_text()).get('listen_address', '0.0.0.0:443')
+host, separator, port = str(address).rpartition(':')
+if not separator or not host or not port.isdecimal() or not 1 <= int(port) <= 65535 or (':' in host and not (host.startswith('[') and host.endswith(']'))):
+    raise SystemExit('Invalid endpoint listen_address')
+print(int(port))
+PY
+)"
 echo "TrustTunnel endpoint port:"
 echo "$endpoint_port"
 echo
@@ -3267,9 +3304,9 @@ main() {
   need_root
   choose_action
   case "$ACTION" in
-    refresh-tools)
+    refresh-tools|refresh-menu)
       write_tools
-      if [ -f "$TT_DIR/vpn.toml" ]; then
+      if [ "$ACTION" = refresh-tools ] && [ -f "$TT_DIR/vpn.toml" ]; then
         load_current_trusttunnel_context
         if [ "$CERT_MODE" = letsencrypt ]; then write_certificate_automation; fi
       fi

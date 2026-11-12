@@ -33,8 +33,10 @@ const {spawn} = require('node:child_process');
         if((await page.evaluate(()=>window.__securityViolations)).length)throw Error('Login CSP');
       }
       await page.goto('http://127.0.0.1:18089/?view=clients');
-      await page.waitForFunction(()=>document.querySelector('[data-client-metrics]')?.textContent.includes('всего'));
+      await page.waitForFunction(()=>document.querySelector('[data-client-metrics]')?.textContent.includes('Всего'));
       if(!(await page.locator('[data-client-seen]').first().innerText()).includes('сейчас'))throw Error('Last-online display');
+      if(!(await page.locator('[data-client-address="client01"]').innerText()).includes('IP сейчас: 192.0.2.7'))throw Error('Current observed IP display');
+      if(!(await page.locator('[data-client-address="client03"]').innerText()).includes('Последний замеченный IP: 198.51.100.27'))throw Error('Last observed offline IP display');
       if(viewport.width<=800){
         await page.locator('#mobile-menu').click();
         await page.locator('.sidebar .nav-item.active').waitFor({state:'visible'});
@@ -95,7 +97,7 @@ const {spawn} = require('node:child_process');
         const overflowing=await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1);
         if(overflowing) throw Error(`Page overflow ${view} ${viewport.width}`);
         if(view==='security'){
-          await page.getByRole('button',{name:'Полный отчёт',exact:true}).click();
+          await page.getByRole('button',{name:'Состояние защиты VPS',exact:true}).click();
           await page.locator('#operation-result[open]').waitFor();
           if(!(await page.locator('#result-output').innerText()).includes('Тестовый отчёт'))throw Error('Shared action result failed');
           await page.locator('#result-close').click();

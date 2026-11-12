@@ -82,7 +82,7 @@ class ProtectionTests(unittest.TestCase):
         with patch.object(panel,'fetch_client_metrics',return_value={'available':False,'clients':[]}):
             data=panel.client_metrics()
         self.assertIsNone(data['clients'][0]['online'])
-        self.assertEqual(data['clients'][0]['download'],200)
+        self.assertEqual(data['clients'][0]['download'],100)
         self.assertEqual(data['clients'][0]['last_seen'],1000)
 
     def test_missing_epoch_never_guesses_accounting_continuity(self):

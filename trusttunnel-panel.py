@@ -45,7 +45,7 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 DEEPLINK_CACHE = {}
 DEEPLINK_CACHE_TTL = 300
-ADMIN_VERSION = '2026.10.26'
+ADMIN_VERSION = '2026.11.12'
 MASQUE_ADDR = '127.0.0.1:40002'
 MASQUE_DIR = Path('/opt/warp-masque')
 MASQUE_VERSION = 'v4.2.1'
@@ -79,6 +79,10 @@ SECURITY_REPORT = Path('/var/cache/trusttunnel-panel/security.json')
 SYSCTL_DIR = Path('/etc/sysctl.d')
 USAGE_DB = Path('/var/lib/trusttunnel-panel/usage.sqlite3')
 GUARD_STATUS = {'checked_at': 0, 'error': ''}
+HEALTH_LOCK = threading.RLock()
+HEALTH_LAST = {}
+PANEL_EVENTS_LOCK = threading.Lock()
+PANEL_EVENTS = {}
 TORRENT_STATE = Path('/var/lib/trusttunnel-panel/torrent-filter.json')
 TORRENT_DROPIN = Path('/etc/systemd/system/trusttunnel.service.d/60-torrent-filter.conf')
 TORRENT_LOCK = threading.RLock()
@@ -135,6 +139,7 @@ def login_delay(peer, failed=False, success=False):
             return 0
         count, until = LOGIN_FAILURES.get(peer, (0, now + 60))
         if failed:
+            panel_event('failures')
             if len(LOGIN_FAILURES) >= 2048 and peer not in LOGIN_FAILURES:
                 LOGIN_FAILURES.pop(next(iter(LOGIN_FAILURES)))
             count += 1
@@ -167,8 +172,15 @@ def q(value):
 
 
 def endpoint_port():
-    m = re.search(r'listen_address\s*=\s*"[^:"]+:(\d+)"', read_text(TT_DIR / 'vpn.toml'))
-    return m.group(1) if m else '443'
+    cfg = tomllib.loads(read_text(TT_DIR / 'vpn.toml'))
+    address = cfg.get('listen_address')
+    if address is None: return '443'
+    host, separator, port = str(address).rpartition(':')
+    if not separator or not host or not port.isdecimal() or not 1 <= int(port) <= 65535:
+        raise ValueError('Некорректный listen_address в vpn.toml: проверьте адрес и порт endpoint.')
+    if ':' in host and not (host.startswith('[') and host.endswith(']')):
+        raise ValueError('IPv6 listen_address должен иметь вид [::]:8443.')
+    return str(int(port))
 
 
 def domain():
@@ -429,6 +441,9 @@ def client_operation(action, values):
 
 
 def admin_operation(action, values):
+    if action in ('health-status','health-check','scanner-status'):
+        if action == 'health-check': health_tick()
+        return json.dumps(scanner_snapshot() if action == 'scanner-status' else health_snapshot(),ensure_ascii=False,indent=2)
     if action.startswith('torrent-'):
         return torrent_operation(action[8:], values)
     if action.startswith(('ufw-', 'f2b-')):
@@ -608,7 +623,7 @@ def protection_operation(action, values):
         return '\n'.join([
             'Endpoint: ' + endpoint_version(),
             'Строгий фильтр ClientHello: ' + ('включён' if state.get('enabled') else 'выключен'),
-            'Совместимость строгого фильтра: ' + ('недоступен при включённом QUIC; на 1.1.0 QUIC-проверка не отклоняет обычный клиент' if quic_enabled() else 'только HTTP/2; требуется проверка подготовленных ссылок'),
+            'Совместимость строгого фильтра: ' + ('гарантия защиты от сканирования с QUIC не подтверждена; видимость сертификата не доказывает доступ к VPN' if quic_enabled() else 'только HTTP/2; требуется проверка подготовленных ссылок'),
             'Защищённые ссылки: ' + ('подготовлены' if state.get('prefix') else 'не подготовлены'),
             'HTTP-ответ без авторизации: ' + str(cfg.get('non_connect_auth_failure_status_code', cfg.get('auth_failure_status_code', 407))),
             'Публичный ping / speedtest: ' + str(bool(cfg.get('ping_enable'))) + ' / ' + str(bool(cfg.get('speedtest_enable'))),
@@ -673,7 +688,7 @@ def protection_operation(action, values):
     if action == 'enforce':
         if state.get('tls_enabled'): raise ValueError('Сначала отключите обязательную TLS-аутентификацию.')
         if quic_enabled():
-            raise ValueError('Строгий фильтр не включён: на проверенном endpoint 1.1.0 QUIC обходит ClientHello-prefix правила. Для фильтра нужен endpoint без QUIC; автоматически отключать QUIC нельзя.')
+            raise ValueError('Строгий фильтр не включён: защита от сканирования через QUIC пока не подтверждена. Проверка сертификата и успешное туннелирование — разные этапы. Автоматически отключать QUIC нельзя.')
         if not capabilities.get('prefix') or not state.get('prefix'): raise ValueError('Сначала подготовьте и проверьте защищённые ссылки.')
         if values.get('clients_ready') != '1': raise ValueError('Подтвердите импорт защищённых ссылок на всех устройствах. Старые профили перестанут подключаться.')
         if state.get('enabled'): return 'Строгий фильтр уже включён.'
@@ -828,6 +843,10 @@ def endpoint_feature_operation(action, values):
     if action == 'endpoint-metrics':
         if not endpoint_capabilities()['metrics']:
             raise ValueError('Для метрик пользователей нужен TrustTunnel 1.1.0 или новее.')
+        if enabled and 'http1' not in parsed.get('listen_protocols', {}):
+            if values.get('http1_ack') != '1':
+                raise ValueError('Для локальных метрик нужен HTTP/1.1 codec endpoint. Подтвердите его добавление: HTTP/1.1 станет доступен и на VPN-порту; HTTP/2 и QUIC сохранятся.')
+            text = replace_config_section(text, 'listen_protocols.http1', {'upload_buffer_size':32768})
         settings = parsed.get('metrics', {})
         if set(settings) - {'address', 'request_timeout_secs', 'per_client_metrics'}:
             raise ValueError('Метрики содержат дополнительные настройки. Измените их вручную.')
@@ -924,6 +943,11 @@ CREATE TABLE IF NOT EXISTS source_observations (
  PRIMARY KEY(username, ip));
 CREATE TABLE IF NOT EXISTS enrollment_sources (
  digest TEXT PRIMARY KEY, source_cidr TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS health_samples (
+ ts INTEGER PRIMARY KEY, state TEXT NOT NULL, cpu REAL, ram REAL, disk REAL,
+ interface TEXT NOT NULL, boot TEXT NOT NULL, rx INTEGER, tx INTEGER, issues TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS panel_event_counts (
+ hour INTEGER PRIMARY KEY, failures INTEGER NOT NULL, rejected INTEGER NOT NULL, throttled INTEGER NOT NULL);
 ''')
         with connection: yield connection
     finally:
@@ -931,8 +955,10 @@ CREATE TABLE IF NOT EXISTS enrollment_sources (
 
 
 def record_usage(rows, epoch, now=None):
+    # Legacy column names are retained for rollback: upload stores raw inbound, download raw outbound.
     now = time.time() if now is None else now
     today = datetime.datetime.fromtimestamp(now, datetime.timezone.utc).strftime('%Y-%m-%d')
+    rates={}
     with usage_database() as db:
         db.execute('BEGIN IMMEDIATE')
         for row in rows:
@@ -942,6 +968,9 @@ def record_usage(rows, epoch, now=None):
             same = old is not None and old['epoch'] == epoch
             delta_up = max(0, up-old['raw_up']) if same and up >= old['raw_up'] else up
             delta_down = max(0, down-old['raw_down']) if same and down >= old['raw_down'] else down
+            interval=now-old['observed_at'] if old else 0
+            valid_rate=same and 0<interval<=120 and up>=old['raw_up'] and down>=old['raw_down']
+            rates[row['username']]=dict(download=delta_up/interval,upload=delta_down/interval) if valid_rate else None
             last_seen = now if row['sessions'] else (old['last_seen'] if old else 0)
             ip = row['ip'] if row['sessions'] and row['ip'] else (old['last_ip'] if old else '')
             changes = (old['ip_changes'] if old else 0) + int(bool(old and old['last_ip'] and ip and ip != old['last_ip']))
@@ -957,6 +986,7 @@ def record_usage(rows, epoch, now=None):
                            (row['username'], today, delta_up, delta_down))
         db.execute('DELETE FROM daily WHERE day < ?', ((datetime.datetime.fromtimestamp(now, datetime.timezone.utc)-datetime.timedelta(days=93)).strftime('%Y-%m-%d'),))
         db.execute('DELETE FROM source_observations WHERE observed_at < ?', (now-86400,))
+    return rates
 
 
 def guard_state():
@@ -1005,6 +1035,7 @@ def sharing_observations(db, user, policy, now=None):
 @admin_snapshot(10)
 def client_metrics():
     # Serialize sampling across CLI/web processes; bracket the sample with the service epoch.
+    rates={}
     with admin_lock():
         command = ['systemctl', 'show', 'trusttunnel', '--property=InvocationID', '--value']
         before_rc, before_epoch = run(command,timeout=3)
@@ -1014,13 +1045,16 @@ def client_metrics():
             if rc or before_rc or epoch != before_epoch or not re.fullmatch(r'[a-fA-F0-9]{32}', epoch):
                 live['accounting_error'] = 'Запуск endpoint неизвестен или изменился во время измерения; этот образец не начисляется.'
             else:
-                record_usage(live['clients'], epoch)
+                rates=record_usage(live['clients'], epoch)
     records = {}
     observations = {}
+    daily={}
     if USAGE_DB.exists():
         with usage_database() as db:
             records = {r['username']: dict(r) for r in db.execute('SELECT * FROM usage')}
             observations = {name:sharing_observations(db,name,policy) for name,policy in guard_state().get('policies',{}).items()}
+            day=datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d')
+            daily={row['username']:dict(row) for row in db.execute('SELECT username,upload,download FROM daily WHERE day=?',(day,))}
     rows = {row['username']: row for row in live['clients']}
     result = []
     for client in client_inventory():
@@ -1030,11 +1064,18 @@ def client_metrics():
         result.append(dict(username=name, enabled=client['enabled'], sessions=sessions,
                            online=bool(sessions) if sessions is not None else None,
                            inbound=current.get('inbound', 0), outbound=current.get('outbound', 0),
-                           upload=stored.get('upload', 0), download=stored.get('download', 0),
+                           upload=stored.get('download', 0), download=stored.get('upload', 0),
+                           total_bytes=stored.get('upload',0)+stored.get('download',0),
+                           today_download=daily.get(name,{}).get('upload',0),today_upload=daily.get(name,{}).get('download',0),rate=rates.get(name),
+                           observed_ip=current.get('ip','') if sessions else '',
+                           last_observed_ip=stored.get('last_ip',''),
+                           active_ip_count=0 if sessions==0 else None, ip_evidence='aggregate-only',
                            last_seen=stored.get('last_seen', 0), ip=current.get('ip') or stored.get('last_ip', ''),
                            sharing=observations.get(name, dict(enabled=False, alert=False, enforcement=False)),
                            ip_changes=stored.get('ip_changes', 0), observed_at=stored.get('observed_at', 0)))
     return dict(available=live['available'], clients=result, checked_at=time.time(),
+                traffic_basis='Прикладной поток через endpoint, включая заголовки приложений; без внешних TLS/WARP/сетевых накладных расходов. Это не биллинг провайдера.',
+                directions='inbound=скачано клиентом; outbound=отправлено клиентом. Проверено на официальном endpoint 1.1.0 по HTTP/2 и QUIC.',
                 accounting_error=live.get('accounting_error', ''), guard=dict(GUARD_STATUS))
 
 
@@ -1459,8 +1500,6 @@ def interface_operation(action, values):
     if interface_enabled(): raise ValueError('Перед переустановкой или перерегистрацией сначала отключите интерфейсный маршрут.')
     if transport == 'masque' and run(['ip','link','show','ttmasq0'])[0] == 0 and service_status('warp-masque-tun') != 'active':
         raise ValueError('Имя ttmasq0 уже занято чужим интерфейсом. Его настройки не изменены.')
-    run(['systemctl', 'disable', '--now', 'warp-interface'])
-    run(['systemctl', 'stop', 'warp-masque-tun'])
     if action == 'reregister' and values.get('confirm') != 'REREGISTER':
         raise ValueError('Для новой регистрации введите REREGISTER.')
     account_dir = INTERFACE_DIR / 'wgcf' if transport == 'wireguard' else Path('/opt/warp-masque-tun')
@@ -1469,6 +1508,8 @@ def interface_operation(action, values):
         raise ValueError('Подтвердите условия Cloudflare WARP.')
     tool = Path('/opt/warp-proxy/bin/wgcf') if transport == 'wireguard' else MASQUE_DIR / 'usque'
     if not tool.exists(): raise ValueError('Сначала установите WARP WireGuard (wgcf) или MASQUE (usque) соответствующего типа.')
+    run(['systemctl', 'disable', '--now', 'warp-interface'])
+    run(['systemctl', 'stop', 'warp-masque-tun'])
     if transport == 'wireguard' and not shutil.which('wg'):
         checked_run(['apt-get', 'install', '-y', '--no-install-recommends', '--no-upgrade', 'wireguard-tools'], timeout=120)
     INTERFACE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True); os.chmod(INTERFACE_DIR, 0o700)
@@ -1636,6 +1677,7 @@ def validated_dns(value):
     if not 1 <= len(items) <= 4:
         raise ValueError('Укажите от 1 до 4 DNS-серверов.')
     for item in items:
+        if len(item) > 2048: raise ValueError('Адрес DNS слишком длинный (максимум 2048 символов).')
         try:
             ipaddress.ip_address(item)
             continue
@@ -1686,7 +1728,7 @@ def network_operation(action, values):
     if action == 'routing-rule-reset':
         if values.get('confirm') != 'CONFIRMED': raise ValueError('Подтвердите удаление правил.')
         if strict_protection_locked(): raise ValueError('Сначала отключите строгую TLS/ClientHello-защиту.')
-        apply_endpoint_file(TT_DIR/'rules.toml', '# Empty rules file\n')
+        apply_endpoint_file(managed_rules_path(), '# Empty rules file\n')
         audit_log('routing-rule-reset')
         return 'Правила сброшены.'
     if action == 'routing-switch':
@@ -1730,7 +1772,7 @@ def network_operation(action, values):
     if action in ('routing-rule-add', 'routing-rule-delete'):
         if strict_protection_locked():
             raise ValueError('Сначала отключите строгий ClientHello-фильтр. Иначе изменение может обойти защиту или нарушить её откат.')
-        path = TT_DIR / 'rules.toml'
+        path = managed_rules_path()
         parsed = tomllib.loads(read_text(path))
         rules = parsed.get('rule', [])
         if set(parsed) - {'rule'} or any(set(rule) - {'cidr', 'action', 'client_random_prefix'} for rule in rules):
@@ -2114,6 +2156,119 @@ def schedule_operation(action, values):
     return SCHEDULE_KINDS[kind]+': '+calendar+' · часовой пояс сервера. Пропущенный запуск не выполняется сразу при включении. Endpoint и панель не обновляются автоматически.\n'+checked_run(['timedatectl','show','--property=Timezone','--value'])
 
 
+def panel_event(kind):
+    if kind not in ('failures','rejected','throttled'): return
+    hour=int(time.time()//3600)*3600
+    with PANEL_EVENTS_LOCK:
+        item=PANEL_EVENTS.setdefault(hour,dict(failures=0,rejected=0,throttled=0,flushed={}))
+        item[kind]+=1
+        for old in list(PANEL_EVENTS):
+            if old<hour-86400: PANEL_EVENTS.pop(old,None)
+
+
+def health_checks(stats):
+    checks=[]
+    def service(key,title):
+        state=stats.get('services',{}).get(key,'unknown')
+        checks.append(dict(id=key,title=title,state='ok' if state=='active' else 'unknown' if state=='unknown' else 'error',detail={'active':'Служба работает','inactive':'Служба остановлена','failed':'Ошибка службы'}.get(state,'Нет подтверждённого состояния')))
+    service('trusttunnel','TrustTunnel')
+    backend=current_warp_backend()
+    warp_units={'wg-interface':'warp-interface','masque-interface':'warp-masque-tun','wg-socks':'warp-wireproxy','masque-socks':'warp-masque'}
+    if backend in warp_units: service(warp_units[backend],'Выбранный выход WARP')
+    for key,title,warning,critical in [('cpu_percent','Процессор',85,98),('memory_percent','Память',85,95),('disk_percent','Диск',85,95)]:
+        value=stats.get(key)
+        valid=type(value) in (int,float) and 0<=value<=100
+        state='unknown' if not valid else 'error' if value>=critical else 'warn' if value>=warning else 'ok'
+        checks.append(dict(id=key,title=title,state=state,detail=f'{value:.1f}% · предупреждение от {warning}%' if valid else 'Нужно следующее измерение'))
+    failed=any(c['state']=='error' for c in checks)
+    state='error' if failed else 'warn' if any(c['state']=='warn' for c in checks) else 'unknown' if any(c['state']=='unknown' for c in checks) else 'ok'
+    return state,checks
+
+
+def primary_interface(stats):
+    for line in read_text('/proc/net/route').splitlines()[1:]:
+        fields=line.split()
+        if len(fields)>3 and fields[1]=='00000000' and fields[0] in stats.get('interfaces',{}): return fields[0]
+    return next(iter(stats.get('interfaces',{})),'')
+
+
+def health_tick():
+    global HEALTH_LAST
+    with HEALTH_LOCK:
+        stats=monitor_snapshot(); now=time.time(); state,checks=health_checks(stats)
+        interface=primary_interface(stats); counters=stats.get('interfaces',{}).get(interface,{})
+        with PANEL_EVENTS_LOCK:
+            pending={hour:{key:item[key]-item['flushed'].get(key,0) for key in ('failures','rejected','throttled')} for hour,item in PANEL_EVENTS.items()}
+        with usage_database() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute('INSERT OR REPLACE INTO health_samples VALUES (?,?,?,?,?,?,?,?,?,?)',
+                       (int(now//60)*60,state,stats.get('cpu_percent'),stats.get('memory_percent'),stats.get('disk_percent'),interface,
+                        read_text('/proc/sys/kernel/random/boot_id').strip(),counters.get('rx'),counters.get('tx'),json.dumps([c['id'] for c in checks if c['state']!='ok'])))
+            for hour,counts in pending.items():
+                db.execute('INSERT INTO panel_event_counts VALUES (?,?,?,?) ON CONFLICT(hour) DO UPDATE SET failures=failures+excluded.failures,rejected=rejected+excluded.rejected,throttled=throttled+excluded.throttled',
+                           (hour,counts['failures'],counts['rejected'],counts['throttled']))
+            db.execute('DELETE FROM health_samples WHERE ts<?',(now-30*86400,))
+            db.execute('DELETE FROM panel_event_counts WHERE hour<?',(now-30*86400,))
+        with PANEL_EVENTS_LOCK:
+            for hour,counts in pending.items():
+                if hour in PANEL_EVENTS:
+                    for key,value in counts.items(): PANEL_EVENTS[hour]['flushed'][key]=PANEL_EVENTS[hour]['flushed'].get(key,0)+value
+        HEALTH_LAST=dict(checked_at=now,state=state,checks=checks,error='')
+        SNAPSHOT_CACHE.pop('health_snapshot',None); SNAPSHOT_CACHE.pop('scanner_snapshot',None)
+    return health_snapshot()
+
+
+@cached_snapshot(15)
+def health_snapshot():
+    now=time.time(); today=int(now//86400)*86400
+    with HEALTH_LOCK: current=dict(HEALTH_LAST)
+    groups={}; points=[]; latest=None
+    if USAGE_DB.exists():
+        with usage_database() as db:
+            latest=db.execute('SELECT * FROM health_samples ORDER BY ts DESC LIMIT 1').fetchone()
+            groups={row['day']:dict(row) for row in db.execute("SELECT CAST(ts/86400 AS INTEGER)*86400 AS day,COUNT(*) AS samples,SUM(state='ok') AS ok,SUM(state='warn') AS warn,SUM(state='error') AS errors FROM health_samples WHERE ts>=? GROUP BY day",(today-29*86400,))}
+            points=[dict(row) for row in db.execute('SELECT ts,interface,boot,rx,tx FROM health_samples WHERE ts>=? ORDER BY ts',(now-86400,))]
+    if not current and latest:
+        current=dict(checked_at=latest['ts'],state=latest['state'],checks=[],error='')
+    current.setdefault('checked_at',0); current.setdefault('checks',[])
+    current['stale']=bool(current.get('error')) or not current['checked_at'] or now-current['checked_at']>150 or current['checked_at']>now+30
+    if current['stale']: current['state']='unknown'
+    current['history']=[dict(groups.get(day,dict(samples=0,ok=0,warn=0,errors=0)),day=day) for day in range(today-29*86400,today+1,86400)]
+    current['scope']='Локальное наблюдение: ресурсы и выбранные службы. Не проверяет доступность из интернета или весь клиентский VPN-путь. Пробелы истории не считаются успешными проверками.'
+    rates=[]
+    for old,new in zip(points,points[1:]):
+        dt=new['ts']-old['ts']
+        valid=0<dt<=180 and old['interface']==new['interface'] and old['boot']==new['boot'] and all(type(old[k]) is int and type(new[k]) is int and new[k]>=old[k] for k in ('rx','tx'))
+        rates.append(dict(time=new['ts'],rx=(new['rx']-old['rx'])/dt if valid else None,tx=(new['tx']-old['tx'])/dt if valid else None,interface=new['interface']))
+    current['traffic_history']=rates
+    return current
+
+
+@cached_snapshot(10)
+def scanner_snapshot():
+    start=int((time.time()-86400)//3600)*3600
+    counts={k:0 for k in ('failures','rejected','throttled')}; hourly={}
+    if USAGE_DB.exists():
+        with usage_database() as db:
+            hourly={row['hour']:dict(row) for row in db.execute('SELECT * FROM panel_event_counts WHERE hour>=?',(start,))}
+    with PANEL_EVENTS_LOCK:
+        for hour,item in PANEL_EVENTS.items():
+            if hour>=start:
+                row=hourly.setdefault(hour,dict(hour=hour,failures=0,rejected=0,throttled=0))
+                for key in counts: row[key]+=item[key]-item['flushed'].get(key,0)
+    for row in hourly.values():
+        for key in counts: counts[key]+=row[key]
+    return dict(counts=counts,hourly=sorted(hourly.values(),key=lambda x:x['hour']),scope='Только HTTP-панель: ошибки входа, отклонённые запросы и ответы ограничения частоты. Один запрос может попасть в несколько категорий. Это не число сканеров и не статистика всех портов VPS.',outbound_scans=None,checked_at=time.time())
+
+
+def health_watcher():
+    while True:
+        try: health_tick()
+        except (OSError,ValueError,RuntimeError,sqlite3.Error):
+            with HEALTH_LOCK: HEALTH_LAST.update(error='Не удалось обновить наблюдение; состояние не подтверждено.')
+        time.sleep(60)
+
+
 @cached_snapshot(5)
 def monitor_snapshot():
     result = system_metrics()
@@ -2354,7 +2509,7 @@ def panel_settings():
 
 
 def dns_upstreams():
-    return [item.strip() for item in panel_settings()['DNS_UPSTREAMS'].split(',') if re.fullmatch(r'[A-Za-z0-9_.:/?-]{1,253}', item.strip())][:4]
+    return validated_dns(panel_settings()['DNS_UPSTREAMS'])
 
 
 def client_anti_dpi_enabled():
@@ -2676,6 +2831,7 @@ def system_metrics():
     days, rest = divmod(uptime_seconds, 86400)
     hours, minutes = divmod(rest, 3600)
     cpu = 'Первое измерение'
+    cpu_percent = None
     stat = read_text('/proc/stat').splitlines()
     if stat and stat[0].startswith('cpu '):
         ticks = [int(v) for v in stat[0].split()[1:9]]
@@ -2683,9 +2839,11 @@ def system_metrics():
         if CPU_SAMPLE and total_ticks > CPU_SAMPLE[0]:
             percent = max(0, min(100, 100 * (1 - (idle - CPU_SAMPLE[1]) / (total_ticks - CPU_SAMPLE[0]))))
             cpu = f'{percent:.1f}%'
+            cpu_percent = round(percent,1)
         CPU_SAMPLE = total_ticks, idle
     return {
         'cpu': cpu,
+        'cpu_percent': cpu_percent,
         'load': ' / '.join(f'{item:.2f}' for item in getattr(os, 'getloadavg', lambda: (0.0, 0.0, 0.0))()),
         'memory': f'{human_bytes(max(0, total - available))} / {human_bytes(total)}',
         'disk': f'{human_bytes(disk.used)} / {human_bytes(disk.total)}',
@@ -2911,7 +3069,10 @@ def audit_output():
         output = fp.read(262144).decode('utf-8',errors='replace')
     return ('Показаны последние 256 КиБ журнала.\n' if size > 262144 else '')+output
 def rules_text():
-    return read_text(TT_DIR / 'rules.toml') or '# Empty rules file: all authenticated clients are allowed.\n'
+    try: path = managed_rules_path()
+    except ValueError:
+        return '# Используется нестандартный rules_file: управление из панели отключено.\n'
+    return read_text(path) or '# Правил нет: разрешены все аутентифицированные клиенты.\n'
 
 
 
@@ -3522,7 +3683,7 @@ html[data-effects=flat] .sidebar,html[data-effects=flat] .topbar,html[data-effec
 '''
 
 NAV_ITEMS = (
-    ('dashboard', 'Обзор'), ('endpoint', 'Endpoint'), ('clients', 'Клиенты'),
+    ('dashboard', 'Обзор'), ('endpoint', 'VPN-сервер'), ('clients', 'Клиенты'),
     ('warp', 'WARP'), ('routing', 'Маршрутизация'), ('dns', 'DNS и AntiDPI'),
     ('certificates', 'Сертификаты'), ('security', 'Безопасность'),
     ('system', 'Система'), ('panel', 'Панель'),
@@ -3648,7 +3809,7 @@ def dashboard_view():
 
 def endpoint_view():
     setup = installer_defaults()
-    return f'''<div class="page-head"><div><h2>TrustTunnel Endpoint</h2><p>Установка, версия и транспортные параметры.</p></div><form method="post" action="/installer"><input type="hidden" name="action" value="update-trusttunnel"><button class="primary">Обновить endpoint</button></form></div><section class="surface"><h3>Установка / переустановка</h3><p class="warning">Сохраняются сертификат и текущие пользователи. UFW будет пересобран; для запуска введи REINSTALL.</p><form method="post" action="/installer" class="form-grid"><input type="hidden" name="action" value="install"><label>Домен<input name="domain" value="{html.escape(setup['domain'])}" required></label><label>Количество клиентов<input name="clients" value="{setup['clients']}" required></label><label>Порт endpoint<input name="endpoint_port" value="{setup['endpoint_port']}" required></label><label>Email Let's Encrypt<input name="email" placeholder="только для Let's Encrypt"></label><label>Сертификат<select name="cert_mode"><option value="self-signed" {'selected' if setup['cert_mode'] == 'self-signed' else ''}>self-signed</option><option value="letsencrypt" {'selected' if setup['cert_mode'] == 'letsencrypt' else ''}>Let's Encrypt</option></select></label><label>Подтверждение<input name="confirm" placeholder="REINSTALL" required></label><label class="check"><input type="checkbox" name="warp" value="1" {'checked' if setup['warp'] == '1' else ''}> Включить WARP</label><label class="check"><input type="checkbox" name="quic" value="1" {'checked' if setup['quic'] == '1' else ''}> Включить QUIC/HTTP3</label><div><button class="danger">Установить / переустановить</button></div></form></section><section class="surface"><h3>Порт</h3><form method="post" action="/ports/endpoint"><label>Порт TrustTunnel<input name="port" value="{endpoint_port()}" required></label><button>Сменить порт</button></form></section>'''
+    return f'''<div class="page-head"><div><h2>TrustTunnel Endpoint</h2><p>Установка, версия и транспортные параметры.</p></div><form method="post" action="/installer"><input type="hidden" name="action" value="update-trusttunnel"><button class="primary">Обновить VPN-сервер</button></form></div><section class="surface"><h3>Установка / переустановка</h3><p class="warning">Сохраняются сертификат и текущие пользователи. UFW будет пересобран; для запуска введи REINSTALL.</p><form method="post" action="/installer" class="form-grid"><input type="hidden" name="action" value="install"><label>Домен<input name="domain" value="{html.escape(setup['domain'])}" required></label><label>Количество клиентов<input name="clients" value="{setup['clients']}" required></label><label>Порт endpoint<input name="endpoint_port" value="{setup['endpoint_port']}" required></label><label>Email Let's Encrypt<input name="email" placeholder="только для Let's Encrypt"></label><label>Сертификат<select name="cert_mode"><option value="self-signed" {'selected' if setup['cert_mode'] == 'self-signed' else ''}>self-signed</option><option value="letsencrypt" {'selected' if setup['cert_mode'] == 'letsencrypt' else ''}>Let's Encrypt</option></select></label><label>Подтверждение<input name="confirm" placeholder="REINSTALL" required></label><label class="check"><input type="checkbox" name="warp" value="1" {'checked' if setup['warp'] == '1' else ''}> Включить WARP</label><label class="check"><input type="checkbox" name="quic" value="1" {'checked' if setup['quic'] == '1' else ''}> Включить QUIC/HTTP3</label><div><button class="danger">Установить / переустановить</button></div></form></section><section class="surface"><h3>Порт</h3><form method="post" action="/ports/endpoint"><label>Порт TrustTunnel<input name="port" value="{endpoint_port()}" required></label><button>Сменить порт</button></form></section>'''
 
 
 def clients_view():
@@ -3720,7 +3881,13 @@ def panel_view():
 
 def admin_form(action, body, username='', view='clients', confirm=''):
     confirmation = f' data-confirm="{html.escape(confirm, quote=True)}"' if confirm else ''
-    identity = f'<input type="hidden" name="username" value="{html.escape(username, quote=True)}">' if username else ''
+    vpn_identity = action.startswith(('client-', 'guard-', 'enrollment-')) or action == 'diagnostics-client'
+    field = 'vpn_client_name' if vpn_identity else 'username'
+    identity = f'<input type="hidden" name="{field}" value="{html.escape(username, quote=True)}">' if username else ''
+    if vpn_identity:
+        body = body.replace('name="username"', 'name="vpn_client_name" autocomplete="off"')
+        if 'name="password" type="password" autocomplete=' not in body:
+            body = body.replace('name="password" type="password"', 'name="password" type="password" autocomplete="new-password"')
     return f'<form method="post" action="/manage"{confirmation}><input type="hidden" name="action" value="{action}"><input type="hidden" name="view" value="{view}">{identity}{body}</form>'
 
 
@@ -3769,13 +3936,34 @@ def clients_console():
         invite = admin_form('enrollment-issue','<input type="hidden" name="confirm" value="CONFIRMED"><label>Срок приглашения, минут<input type="number" min="1" max="1440" name="minutes" value="15" required></label><label>Транспорт<select name="protocol">'+transports+'</select></label><label>Тип профиля<select name="kind">'+kinds+'</select></label><label>IP/CIDR получателя (необязательно)<input name="source_cidr" maxlength="64" placeholder="Например 198.51.100.27/32"><small>Ограничивает только получение. Смена сети может помешать активации; импортированный профиль остаётся копируемым. За reverse proxy проверяется IP прокси, не X-Forwarded-For.</small></label><button>Создать одноразовое приглашение</button>',name,confirm='Создать одноразовую HTTPS-выдачу профиля? Если задан IP/CIDR, получить её можно только из этой сети. Полученный профиль всё ещё можно переслать.')
         invite += admin_form('enrollment-revoke','<input type="hidden" name="confirm" value="CONFIRMED"><button>Отозвать приглашения</button>',name,confirm='Отозвать все неиспользованные приглашения этого клиента?')
         extra = admin_form('diagnostics-client','<button>'+icon('Activity')+'Диагностика клиента</button>',name)
-        extra += admin_form('client-refresh-network','<input type="hidden" name="confirm" value="CONFIRMED"><button>Обновить сетевые параметры профиля</button>',name,confirm='Применить текущие DNS/AntiDPI/TLS-профиль к TOML этого клиента? Потребуется повторный импорт; ключи и SNI сохраняются.')
-        controls = '<section class="drawer-section"><h3>Сессии и использование</h3><p class="muted" data-client-details="'+safe+'">Ожидание статистики</p>'+extra+'</section><details class="drawer-section"><summary>Антишаринг: квота, срок и отзыв</summary><p class="muted">Каждому устройству нужна отдельная учётная запись. Квота: сумма загрузки и отдачи с начала учёта, без сброса за месяц. При недоступных метриках квота не отключает доступ. Срок проверяется независимо. Последний активный клиент автоматически не отключается.</p>'+guard+'</details><details class="drawer-section"><summary>Одноразовая выдача профиля</summary><p class="muted">Секрет приглашения хранится только в виде SHA-256. Открытие страницы не погашает ссылку; её погашает кнопка получения. Повторная выдача, просрочка и смена пароля блокируют старое приглашение. Это не аппаратная привязка.</p>'+invite+'</details>'
+        extra += admin_form('client-refresh-network','<input type="hidden" name="confirm" value="CONFIRMED"><button>Обновить настройки файла подключения</button>',name,confirm='Применить текущие DNS/AntiDPI/TLS-профиль к TOML этого клиента? Потребуется повторный импорт; ключи и SNI сохраняются.')
+        controls = '<section class="drawer-section"><h3>Подключения и трафик</h3><p class="muted" data-client-details="'+safe+'">Ожидание статистики</p>'+extra+'</section><details class="drawer-section"><summary>Антишаринг: квота, срок и отзыв</summary><p class="muted">Каждому устройству нужна отдельная учётная запись. Квота: сумма загрузки и отдачи с начала учёта, без сброса за месяц. При недоступных метриках квота не отключает доступ. Срок проверяется независимо. Последний активный клиент автоматически не отключается.</p>'+guard+'</details><details class="drawer-section"><summary>Одноразовая выдача профиля</summary><p class="muted">Секрет приглашения хранится только в виде SHA-256. Открытие страницы не погашает ссылку; её погашает кнопка получения. Повторная выдача, просрочка и смена пароля блокируют старое приглашение. Это не аппаратная привязка.</p>'+invite+'</details>'
         drawers.append(f'<aside class="drawer" id="{drawer_id}" role="dialog" aria-modal="true" aria-label="Клиент {safe}"><div class="drawer-card"><div class="drawer-head"><div><span class="eyebrow">ПРОФИЛЬ КЛИЕНТА</span><h2>{safe}</h2></div><button type="button" data-drawer-close aria-label="Закрыть">×</button></div><section class="drawer-section">{note}</section>{controls}<section class="drawer-section"><label>Текущий пароль<input type="password" value="{html.escape(client["password"], quote=True)}" id="secret-{index}" readonly></label><button type="button" data-reveal="secret-{index}">Показать / скрыть</button><button type="button" data-copy="secret-{index}">{icon("Copy")}Копировать</button></section><section class="drawer-section"><h3>Подключение</h3>{profiles}{share}</section><details class="drawer-section"><summary>Лимиты соединений</summary><p class="muted">Лимиты HTTP/2 и QUIC независимы. Это ограничение соединений, а не привязка к устройству.</p>{limits}</details><section class="drawer-section">{password}{delete}</section></div></aside>')
     create = admin_form('client-add', '<label>Логин<input name="username" pattern="[A-Za-z0-9_.-]{1,64}" required></label><label>Пароль<input name="password" type="password" placeholder="Пусто: случайный"></label><button class="primary">Добавить клиента</button>')
     batch = admin_form('client-batch', '<label>Префикс<input name="prefix" value="client" maxlength="54" required></label><label>Количество<input name="count" type="number" min="1" max="100" value="5" required></label><button>Создать группу</button>', confirm='Создать новых клиентов? TrustTunnel кратковременно перезапустится.')
     active = sum(c['enabled'] for c in clients)
-    return f'<div class="page-head"><div><span class="eyebrow">ДОСТУП И ПОДКЛЮЧЕНИЯ</span><h2>Клиенты</h2><p>{len(clients)} всего · {active} включено · {len(clients)-active} отключено</p></div><div class="page-actions"><button type="button" id="clients-refresh">{icon("RefreshCw")}Сессии и трафик</button><button class="primary" data-drawer="add-client">{icon("Plus")}Добавить клиентов</button></div></div><div id="clients-metrics-status" class="muted" role="status"></div><div class="table-toolbar"><input id="client-search" class="search" aria-label="Поиск клиентов" placeholder="Поиск по логину или заметке"><select id="client-state" aria-label="Состояние клиента"><option value="all">Все состояния</option><option value="active">Включённые</option><option value="inactive">Отключённые</option></select><span id="client-count"></span></div><div class="table-wrap"><table><thead><tr><th>Доступ</th><th>Клиент / заметка</th><th>Состояние</th><th>Транспорт</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div><div class="pagination"><button id="page-prev" aria-label="Предыдущая страница">{icon("ChevronLeft")}</button><span id="page-label"></span><button id="page-next" aria-label="Следующая страница">{icon("ChevronRight")}</button><select id="page-size" aria-label="Строк на странице"><option>10</option><option>25</option><option>50</option></select></div>{"".join(drawers)}<aside class="drawer" id="add-client" role="dialog" aria-modal="true" aria-label="Добавление клиентов"><div class="drawer-card"><div class="drawer-head"><h2>Добавление клиентов</h2><button data-drawer-close aria-label="Закрыть">×</button></div><section class="drawer-section"><h3>Один клиент</h3>{create}</section><section class="drawer-section"><h3>Группа клиентов</h3>{batch}</section></div></aside>'
+    return f'<div class="page-head"><div><span class="eyebrow">ДОСТУП И ПОДКЛЮЧЕНИЯ</span><h2>Клиенты</h2><p>{len(clients)} всего · {active} включено · {len(clients)-active} отключено</p></div><div class="page-actions"><button type="button" id="clients-refresh">{icon("RefreshCw")}Обновить статистику</button><button class="primary" data-drawer="add-client">{icon("Plus")}Добавить клиентов</button></div></div><div id="clients-metrics-status" class="muted" role="status"></div><div class="table-toolbar"><input id="client-search" class="search" aria-label="Поиск клиентов" placeholder="Поиск по логину или заметке"><select id="client-state" aria-label="Состояние клиента"><option value="all">Все состояния</option><option value="active">Включённые</option><option value="inactive">Отключённые</option></select><span id="client-count"></span></div><div class="table-wrap"><table><thead><tr><th>Доступ</th><th>Клиент / заметка</th><th>Состояние</th><th>Транспорт</th><th></th></tr></thead><tbody>{"".join(rows)}</tbody></table></div><div class="pagination"><button id="page-prev" aria-label="Предыдущая страница">{icon("ChevronLeft")}</button><span id="page-label"></span><button id="page-next" aria-label="Следующая страница">{icon("ChevronRight")}</button><select id="page-size" aria-label="Строк на странице"><option>10</option><option>25</option><option>50</option></select></div>{"".join(drawers)}<aside class="drawer" id="add-client" role="dialog" aria-modal="true" aria-label="Добавление клиентов"><div class="drawer-card"><div class="drawer-head"><h2>Добавление клиентов</h2><button data-drawer-close aria-label="Закрыть">×</button></div><section class="drawer-section"><h3>Один клиент</h3>{create}</section><section class="drawer-section"><h3>Группа клиентов</h3>{batch}</section></div></aside>'
+
+
+def health_console():
+    data=health_snapshot(); labels={'ok':'Работает нормально','warn':'Требует внимания','error':'Есть проблема','unknown':'Недостаточно свежих данных'}
+    days=''
+    for row in data['history']:
+        state='unknown' if not row['samples'] else 'error' if row['errors'] else 'warn' if row['warn'] else 'ok' if row['ok']==row['samples'] else 'unknown'
+        date=datetime.datetime.fromtimestamp(row['day'],datetime.timezone.utc).strftime('%d.%m')
+        title=f'{date} UTC · проверок: {row["samples"]}; с проблемой: {row["errors"]}; предупреждений: {row["warn"]}'
+        days+=f'<span class="health-day {state}" title="{title}" aria-label="{title}"></span>'
+    rows=''.join(f'<div class="health-check"><span>{html.escape(c["title"])}</span><span class="badge {c["state"]}">{html.escape(c["detail"])}</span></div>' for c in data['checks'])
+    check=admin_form('health-check','<button>'+icon('RefreshCw')+'Проверить сейчас</button>',view='dashboard')
+    when=datetime.datetime.fromtimestamp(data['checked_at'],datetime.timezone.utc).strftime('%d.%m %H:%M UTC') if data['checked_at'] else 'История начнётся после первого фонового измерения'
+    return f'<section class="surface health-surface" id="server-health"><div class="section-heading"><div><h3>Здоровье сервера</h3><strong id="health-state" class="health-title">{labels.get(data.get("state"),labels["unknown"])}</strong><span id="health-updated" class="muted">{when}</span></div>{check}</div><div id="health-days" class="health-days" aria-label="Наблюдения за 30 дней">{days}</div><div class="health-legend"><span class="ok">Норма</span><span class="warn">Предупреждение</span><span class="error">Проблема</span><span class="unknown">Нет данных</span></div><div id="health-checks" class="health-checks">{rows}</div><p class="muted">{html.escape(data["scope"])}</p></section>'
+
+
+def scanner_console():
+    data=scanner_snapshot()
+    values=''.join(f'<div><span class="muted">{title}</span><strong data-panel-event="{key}">{data["counts"][key]}</strong></div>' for key,title in [('failures','Ошибок входа'),('rejected','Отклонённых запросов'),('throttled','Ограничений частоты')])
+    report=admin_form('scanner-status','<button>'+icon('ShieldCheck')+'Отчёт об ошибках входа</button>',view='security')
+    return '<section class="surface" id="panel-protection"><div class="section-heading"><div><h3>Защита панели от перебора и некорректных запросов</h3><p class="muted" id="protection-updated">Наблюдения за последние 24 часа. Пустая старая история не восстанавливается.</p></div>'+report+'</div><div class="protection-metrics">'+values+'</div><p class="muted">'+html.escape(data['scope'])+'</p><p class="muted">Сканирование исходящего трафика VPS: нет источника данных. VPN-фильтры ClientHello и TLS-аутентификации настраиваются ниже, с проверкой совместимости. Глобальные баны по этим счётчикам не выполняются.</p></section>'
 
 
 def overview_console():
@@ -3785,6 +3973,7 @@ def overview_console():
     services = ''.join(f'<div class="service-row"><span>{html.escape(names.get(name, name))}</span><span id="service-{name}" class="badge {html.escape(status)}">{html.escape(status)}</span></div>' for name, status in stats['services'].items())
     restart = admin_form('system-restart', '<button>' + icon('RotateCw') + 'Перезапустить VPN</button>', view='dashboard', confirm='Перезапустить TrustTunnel? VPN кратковременно отключится.')
     return f'''<div class="page-head"><div><span class="eyebrow">СЕРВЕР</span><h2>Обзор</h2><p>{html.escape(domain())}:{endpoint_port()} <span class="version-pill">Endpoint {html.escape(endpoint_version())}</span></p></div><div class="page-actions"><a class="button" href="/?view=clients">{icon('Users')}Клиенты</a>{restart}</div></div>
+{health_console()}
 <div class="metrics overview-metrics">{cards}</div><div class="resource-bars"><label>Память <meter id="ram-meter" min="0" max="100" value="{stats['memory_percent']}"></meter></label><label>Диск <meter id="disk-meter" min="0" max="100" value="{stats['disk_percent']}"></meter></label></div>
 <section class="surface traffic-surface"><div class="section-heading"><div><h3>Трафик сервера</h3><span id="network-rate" class="network-rate">Ожидание измерения</span></div><div class="monitor-controls"><label class="sr-only" for="interface-select">Сетевой интерфейс</label><select id="interface-select"></select><label class="sr-only" for="refresh-interval">Частота обновления</label><select id="refresh-interval"><option value="10">Каждые 10 с</option><option value="30">Каждые 30 с</option><option value="0">Пауза</option></select><button type="button" id="monitor-refresh" class="icon-button" title="Обновить" aria-label="Обновить">{icon('RefreshCw')}</button></div></div>
 <canvas id="traffic-chart" height="190" aria-label="График скорости выбранного сетевого интерфейса"></canvas><div class="chart-footer"><div class="chart-legend"><span class="rx">Приём</span><span class="tx">Отправка</span><span id="chart-scale"></span></div><span id="monitor-status" class="muted" role="status">Подключено</span></div><div id="interface-totals" class="muted"></div></section>
@@ -3804,11 +3993,11 @@ def security_console():
         advice = '<p>'+html.escape(c['recommendation'])+'</p>' if c.get('recommendation') else ''
         action = admin_form('security-remediate','<input type="hidden" name="confirm" value="CONFIRMED"><input type="hidden" name="check" value="'+c['remediation']+'"><button>Применить рекомендацию</button>',view='security',confirm=c['recommendation']+' Для изменения метрик VPN перезапустится; перед применением проверьте назначение настройки.') if c.get('remediation') else ''
         tiles += f'<article class="security-check {c["state"]}"><span class="check-dot"></span><div><h3>{html.escape(c["title"])}</h3><p>{html.escape(c["detail"])}</p>{advice}{action}</div></article>'
-    status = admin_form('security-status', '<button>' + icon('ShieldCheck') + '<span>Полный отчёт</span></button>', view='security')
+    status = admin_form('security-status', '<button>' + icon('ShieldCheck') + '<span>Состояние защиты VPS</span></button>', view='security')
     status += admin_form('recommendations', '<button>' + icon('Info') + 'Рекомендации</button>', view='security')
-    inspect = admin_form('security-listeners', '<button>' + icon('Globe') + 'Открытые сокеты</button>', view='security') + admin_form('security-logins', '<button>' + icon('Logs') + 'Журнал SSH</button>', view='security')
+    inspect = admin_form('security-listeners', '<button>' + icon('Globe') + 'Прослушиваемые порты</button>', view='security') + admin_form('security-logins', '<button>' + icon('Logs') + 'Журнал SSH</button>', view='security')
     return f'''<div class="page-head"><div><span class="eyebrow">ЗАЩИТА И ДОСТУП</span><h2>Безопасность</h2><p>Текущее состояние сервера и контроль входящих подключений.</p></div>{status}</div><div class="security-grid">{tiles}</div><div class="inline-actions">{inspect}</div>
-{network_security_console()}{server_security_controls()}{protection_console()}'''
+{scanner_console()}{network_security_console()}{server_security_controls()}{protection_console()}'''
 
 
 def network_security_console():
@@ -3888,7 +4077,7 @@ def protection_console():
     defaults = panel_settings()
     tls_options = ''.join('<option value="'+value+'"'+(' selected' if value == defaults['TLS_PROFILE'] else '')+'>'+value+'</option>' for value in ('chrome','safari','firefox','okhttp','openssl','default'))
     custom = admin_form('protection-client-settings','<input type="hidden" name="confirm" value="CONFIRMED"><label>DNS новых профилей<input name="dns" value="'+html.escape(defaults['DNS_UPSTREAMS'],quote=True)+'" required></label><label>TLS ClientHello<select name="tls_profile">'+tls_options+'</select></label><label class="check"><input type="checkbox" name="anti_dpi" value="1" '+('checked' if defaults['CLIENT_ANTI_DPI']=='1' else '')+'>Штатный AntiDPI клиента</label><label class="check"><input type="checkbox" name="post_quantum" value="1" '+('checked' if defaults['POST_QUANTUM']=='1' else '')+'>Post-quantum TLS (не маскировка)</label><button>Сохранить параметры новых профилей</button>',view='security',confirm='Сохранить только параметры по умолчанию? Действующие TOML не переписываются. Проверьте поддержку настроек вашим клиентом.')
-    return '<section class="surface"><h3>AntiDPI и защита от активного зондирования</h3><p class="muted">Нативная защита TrustTunnel: проверка сертификата, клиентский AntiDPI и аутентификация ClientHello. Не скрывает IP сервера и не гарантирует обход DPI. Новые параметры требуют повторного импорта профиля.</p>'+inspect+preset+camo+'<details><summary>Гибкая настройка клиентского AntiDPI</summary><p class="muted">При блокировке UDP сравните HTTP/2. При доступном UDP сравните QUIC. Не меняйте одновременно все параметры: проверяйте один новый профиль на одном устройстве. Для игр предпочтителен уже проверенный WARP-интерфейс; AntiDPI не исправляет плохой маршрут.</p>'+custom+'</details><details><summary>TLS-аутентификация · '+('обязательна' if state.get('tls_enabled') else 'не обязательна')+'</summary><p class="muted">Разработчики подтвердили функцию в App v1.3 22 октября. Наличие версии в магазине и совместимость проверяются на устройстве. '+compatibility+' Сначала подготовьте альтернативные ссылки и проверьте клиент. QUIC-enforcement пока заблокирован до отдельной квалификации. Ключ переносим вместе с профилем и не является идентификатором устройства.</p>'+tls_prepare+tls+'</details><details><summary>Прежний prefix-фильтр · '+('включён' if state.get('enabled') else 'выключен')+'</summary><p class="warning">Только HTTP/2: на проверенном endpoint 1.1.0 QUIC не отклоняет обычный профиль по prefix-фильтру. Автоматического отключения QUIC нет.</p>'+prepare+strict+'</details></section>'
+    return '<section class="surface"><h3>AntiDPI и защита от активного зондирования</h3><p class="muted">Нативная защита TrustTunnel: проверка сертификата, клиентский AntiDPI и аутентификация ClientHello. Не скрывает IP сервера и не гарантирует обход DPI. Новые параметры требуют повторного импорта профиля.</p>'+inspect+preset+camo+'<details><summary>Гибкая настройка клиентского AntiDPI</summary><p class="muted">При блокировке UDP сравните HTTP/2. При доступном UDP сравните QUIC. Не меняйте одновременно все параметры: проверяйте один новый профиль на одном устройстве. Для игр предпочтителен уже проверенный WARP-интерфейс; AntiDPI не исправляет плохой маршрут.</p>'+custom+'</details><details><summary>TLS-аутентификация · '+('обязательна' if state.get('tls_enabled') else 'не обязательна')+'</summary><p class="muted">Разработчики подтвердили функцию в App v1.3 22 октября. Наличие версии в магазине и совместимость проверяются на устройстве. '+compatibility+' Сначала подготовьте альтернативные ссылки и проверьте клиент. QUIC-enforcement пока заблокирован до отдельной квалификации. Ключ переносим вместе с профилем и не является идентификатором устройства.</p>'+tls_prepare+tls+'</details><details><summary>Прежний prefix-фильтр · '+('включён' if state.get('enabled') else 'выключен')+'</summary><p class="warning">Только HTTP/2: требуемая защита от активного сканирования с QUIC пока не подтверждена. Видимый сертификат сам по себе не означает доступ к VPN. Автоматического отключения QUIC нет.</p>'+prepare+strict+'</details></section>'
 
 
 def routing_console():
@@ -3929,7 +4118,7 @@ def dns_console():
     saved = html.escape(values['DNS_UPSTREAMS'], quote=True)
     save = admin_form('dns-save', f'<label>DNS: IP, DoH, DoT или DoQ<input name="dns" size="56" value="{saved}" required></label><button class="primary">Сохранить DNS</button>', view='dns')
     check = admin_form('dns-check', '<button>Проверить DNS с VPS</button>', view='dns')
-    apply = admin_form('dns-apply', '<button>Пересобрать TOML</button>', view='dns', confirm='Пересобрать профили с сохранённым DNS? На устройствах потребуется импортировать новые TOML.')
+    apply = admin_form('dns-apply', '<button>Обновить файлы подключения</button>', view='dns', confirm='Пересобрать профили с сохранённым DNS? На устройствах потребуется импортировать новые TOML.')
     advanced = dns_view()
     advanced = re.sub(r'<div class="page-head">.*?</div></div>', '', advanced, count=1)
     return f'<div class="page-head"><h2>DNS и настройки клиента</h2></div><section class="surface"><h3>DNS-серверы клиентов</h3>{save}<div>{check}{apply}</div><p class="muted">Сохранение не меняет текущие профили. IP DNS проверяется запросом с VPS; для DoH/DoT/DoQ проверяется разрешение имени сервера.</p></section><details class="surface"><summary>TLS и AntiDPI</summary>{advanced}</details>'
@@ -3955,9 +4144,146 @@ CONSOLE_SCRIPT = r'''
   const $ = id => document.getElementById(id);
   const hints={dns:'DNS используется в новых профилях. Сохранение не меняет настройки уже подключённых устройств.',mode:'Direct показывает сайтам IP VPS. WARP меняет исходящий маршрут только TrustTunnel.',address:'Адрес внешнего SOCKS5-прокси в формате host:port. Не указывайте здесь адрес VPN-сервера.',max_http2_conns:'Это лимит соединений HTTP/2, а не привязка к одному физическому устройству.',max_http3_conns:'Это лимит соединений QUIC, а не число людей. Слишком маленькое значение может мешать переподключению.',cert_mode:'Let’s Encrypt доверен устройствами и обновляется автоматически. Замена self-signed требует обновить доверенный сертификат клиента.',transport:'WireGuard и MASQUE — разные транспорты WARP. У каждого интерфейсного режима отдельная регистрация.',channel:'Stable — основной канал. Beta может содержать новые функции и несовместимые изменения.',port:'Выбранный порт не должен быть занят SSH, VPN или другим сервисом.',source:'Пустое значение разрешает любой источник. CIDR ограничивает доступ указанной сетью.',retry:'Число неудачных SSH-входов до блокировки. Не отключайте рабочую SSH-сессию при изменении защиты.',enabled:'Изменение серверного параметра может кратковременно перезапустить TrustTunnel.'};
   Object.assign(hints,{quota_gib:'Сумма загруженного и отправленного трафика с начала наблюдения. 1 ГиБ = 1 073 741 824 байта. Старая история неизвестна; возможен перерасход между проверками. Пусто или 0 снимает квоту.',expires:'Дата и время в UTC, не в часовом поясе телефона. После срока учётная запись помечается для отзыва или отключается при включённом автоотзыве.',auto_suspend:'Если выключено, лимит только отображается. Если включено, панель отключит учётную запись и кратко перезапустит endpoint. Нужна работающая панель; последняя активная запись автоматически не отключается.',minutes:'Приглашение погашается только нажатием кнопки получения, не просмотром страницы. Скопированный после получения профиль остаётся переносимым.',kind:'TLS-auth нужен совместимый App v1.3 и endpoint с auth-key. Подготовка ссылки не включает обязательную проверку на сервере.',disconnect_ack:'Отзыв требует перезапуска endpoint: подключения остальных пользователей кратко прервутся. Это ограничение нативного endpoint, а не панели.',client_v13:'Комментарий разработчиков подтверждает функцию в App v1.3, но фактически установленную версию надо проверить на каждом устройстве.',check:'Исправляется только выбранный пункт. Панель не отключает SSH-пароль и не закрывает порт администратора автоматически.'});
-  document.querySelectorAll('main label').forEach((label,index)=>{const input=label.querySelector('input,select');const text=input&&hints[input.name];if(!text||label.hidden)return;label.classList.add('has-help');const button=document.createElement('button');button.type='button';button.className='help-button';button.title=text;button.setAttribute('aria-label','Пояснение');button.setAttribute('aria-expanded','false');button.append($('help-icon').content.cloneNode(true));const tip=document.createElement('small');tip.className='field-help';tip.id='field-help-'+index;tip.hidden=true;tip.textContent=text;button.setAttribute('aria-controls',tip.id);button.onclick=e=>{e.preventDefault();tip.hidden=!tip.hidden;button.setAttribute('aria-expanded',String(!tip.hidden));};label.append(button,tip);});
+  Object.assign(hints,{threshold:'Порог предупреждения: сколько разных наблюдавшихся сетей увидела панель за выбранный период. Это не одновременные IP. Начните с наблюдения; смена Wi-Fi и мобильной сети не доказывает передачу профиля.',ipv6_prefix:'Группировка /64 уменьшает ложные тревоги от временных IPv6-адресов одного устройства. /128 считает каждый адрес отдельно и может давать больше предупреждений.',source_cidr:'Ограничивает только получение одноразового приглашения с указанного IP или сети. После выдачи профиль остаётся копируемым; это не ограничение IP VPN-клиента.',maxretry:'Количество подтверждённых ошибок для выбранного jail. Это не число VPN-сессий и не число устройств.',findtime:'За какой период Fail2ban считает ошибки. Учитывайте общий NAT и сохраните отдельный доступ по SSH перед изменением.',bantime:'Срок блокировки адреса для выбранного jail. Бан может затронуть других людей за тем же внешним IP.',http1_ack:'В endpoint 1.1.0 локальные метрики используют HTTP/1.1 codec. Его добавление также разрешает HTTP/1.1 на VPN-порту. Без согласия конфигурация не меняется.'});
+  Object.assign(hints,{retry:'Число подтверждённых ошибок в выбранном jail до блокировки. Для SSH это ошибки SSH-входа; другой jail может защищать другую службу. Не связано с числом VPN-клиентов.',increment:'Увеличивает длительность блокировки при повторных нарушениях выбранного jail. Начните с умеренного срока; чужие ошибки за общим NAT могут затронуть законного пользователя.',maxtime:'Максимальная длительность растущей блокировки. Само значение не создаёт бан, пока jail не зарегистрирует нарушение.',direction:'Входящее — соединения к VPS; исходящее — соединения с VPS. Не путайте с загрузкой и отправкой данных конкретного VPN-клиента.',position:'Порядок правил важен: более раннее подходящее правило может определить решение раньше нового. Разрешение для одного IP не отменяет старое широкое разрешение.',destination:'Для какого адреса назначения применяется правило. Пусто означает любой адрес в выбранном направлении; это не DNS-имя сайта.',interface:'Ограничивает правило выбранным сетевым интерфейсом VPS. Пусто означает любой интерфейс. Не меняет маршрут WARP.',policy:'Правило по умолчанию для соединений, которым не подошло ни одно отдельное правило. Перед запретом входящих сначала разрешите SSH, VPN и панель.'});
+  document.querySelectorAll('main label').forEach((label,index)=>{const input=label.querySelector('input,select');const action=label.closest('form')?.querySelector('input[name="action"]')?.value;const text=input&&(input.name==='minutes'&&action==='guard-watch-save'?'Окно наблюдения сетей: от 5 минут до суток. При редком опросе часть адресов не видна. Окно не превращает историю в список одновременно активных IP.':hints[input.name]);if(!text||label.hidden)return;label.classList.add('has-help');const button=document.createElement('button');button.type='button';button.className='help-button';button.title=text;button.setAttribute('aria-label','Пояснение');button.setAttribute('aria-expanded','false');button.append($('help-icon').content.cloneNode(true));const tip=document.createElement('small');tip.className='field-help';tip.id='field-help-'+index;tip.hidden=true;tip.textContent=text;button.setAttribute('aria-controls',tip.id);button.onclick=e=>{e.preventDefault();tip.hidden=!tip.hidden;button.setAttribute('aria-expanded',String(!tip.hidden));};label.append(button,tip);});
   const routeForm=document.querySelector('.route-picker')?.closest('form');
   if(routeForm){const update=()=>{const chosen=routeForm.querySelector('input[name="mode"]:checked'),field=routeForm.querySelector('[data-cascade-address]');if(field){field.hidden=chosen?.value!=='socks5';field.querySelector('input').disabled=field.hidden;}const summary=routeForm.querySelector('[data-route-summary]');if(summary&&chosen)summary.textContent='Выбран: '+chosen.closest('label').querySelector('strong').textContent+'. Переключение только после кнопки и подтверждения.';};routeForm.querySelectorAll('[name="mode"]').forEach(input=>input.addEventListener('change',update,{signal}));update();}
+  const actionDescriptions={
+    'client-add':'Создаёт отдельный логин и пароль VPN, а также файлы подключения. Endpoint кратковременно перезапускается: подключения остальных пользователей могут прерваться.',
+    'client-batch':'Создаёт несколько независимых учётных записей с разными паролями. Префикс и количество определяют имена. Применение кратковременно перезапускает VPN.',
+    'client-note':'Сохраняет только заметку администратора. Пароль, сертификат, профиль и работающий VPN не меняются.',
+    'client-password':'Меняет пароль выбранного клиента. Старые файлы, ссылки и приглашения больше не подходят; пользователю потребуется новый профиль. VPN кратковременно перезапускается.',
+    'client-delete':'Удаляет учётную запись и её файлы подключения. Сохранённый на устройстве профиль больше не даст доступ. Другие пользователи могут кратко переподключиться.',
+    'client-disable':'Временно отзывает доступ, сохраняя учётную запись и профиль. VPN кратковременно перезапускается. Это не блокировка общего внешнего IP.',
+    'client-enable':'Возвращает доступ существующему клиенту с сохранёнными данными. Endpoint применяет список пользователей через перезапуск.',
+    'client-limits':'Ограничивает технические туннели HTTP/2 и QUIC, не сайты, IP или устройства. Малые значения могут полностью нарушить интернет клиента. Для антишаринга не рекомендуется.',
+    'client-refresh-network':'Обновляет DNS, AntiDPI и TLS-параметры в файлах выбранного клиента. Ключ и SNI сохраняются; на устройстве нужен повторный импорт. Сама кнопка не доставляет изменения на телефон.',
+    'client-rebuild':'Заново создаёт экспортируемые файлы из текущих серверных данных. Не является переустановкой VPN. Существующий профиль на телефоне сам не изменится.',
+    'guard-save':'Сохраняет общую квоту трафика и срок доступа. Автоматический отзыв действует только с включённой опцией и работающей панелью; он может перезапустить VPN для всех. Аппаратной привязки здесь нет.',
+    'guard-remove':'Снимает квоту и срок для клиента. Не включает ранее отключённую учётную запись и не меняет её пароль.',
+    'guard-watch-save':'Включает предупреждения о разных замеченных сетях за период. Это не полный список одновременных IP и не доказательство шаринга. Автоматические баны не выполняются.',
+    'guard-watch-remove':'Выключает предупреждения о смене сетей выбранного клиента. Доступ VPN и пароль сохраняются.',
+    'enrollment-issue':'Создаёт временное одноразовое приглашение на получение профиля. Можно ограничить IP/CIDR получателя. После выдачи сам профиль всё ещё можно скопировать.',
+    'enrollment-revoke':'Отзывает ещё не использованные приглашения. Уже скачанный профиль остаётся рабочим: для отзыва доступа отключите клиента или смените пароль.',
+    'health-check':'Собирает локальные ресурсы и состояние выбранных служб и обновляет историю. Не перезапускает службы, не меняет настройки и не проверяет весь путь с телефона.',
+    'scanner-status':'Показывает ошибки входа, отклонённые HTTP-запросы и ограничения панели. Категории могут пересекаться. Это не число сканеров всех портов VPS.',
+    'endpoint-releases':'Проверяет официальные стабильные и предварительные выпуски TrustTunnel и совместимость панели. Ничего не устанавливает и не переводит сервер на beta.',
+    'endpoint-metrics':'Включает локальные метрики сессий и трафика пользователей. Нужен перезапуск VPN. Listener остаётся на loopback; это не публичный API статистики.',
+    'endpoint-subscription':'Настраивает HTTPS-выдачу профилей для совместимого endpoint и клиента. Нужен доверенный сертификат. Ссылка содержит доступ к VPN; серверная функция может быть недоступна в stable.',
+    'dns-save':'Сохраняет DNS по умолчанию для новых файлов подключения. Уже подключённые телефоны и существующие файлы не меняются.',
+    'dns-check':'Проверяет DNS с самого VPS. Для обычного IP выполняется DNS-запрос; для DoH/DoT/DoQ проверка имени не доказывает работу всего зашифрованного протокола или пути с телефона.',
+    'dns-apply':'Пересоздаёт файлы подключения с сохранёнными DNS-параметрами. На устройствах нужен повторный импорт. Это не изменение DNS операционной системы VPS.',
+    'routing-switch':'Меняет выходящий маршрут только TrustTunnel: Direct, выбранный WARP или внешний SOCKS5. Direct показывает IP VPS. Переключение прерывает VPN-сессии; интерфейсный режим не должен менять маршрут SSH.',
+    'routing-check':'Проверяет настроенный маршрут и доступность его компонентов. Не меняет маршрут. HTTP-проверка не доказывает качество игрового UDP, DNS и IPv6.',
+    'routing-rule-add':'Добавляет правило допуска входящих клиентов по IP/подсети. Это не правило выбора выхода для сайта. Порядок правил имеет значение; применение перезапускает endpoint.',
+    'routing-rule-delete':'Удаляет только выбранное правило доступа. Защита от устаревшей страницы не позволяет удалить другую строку. Нестандартный файл правил автоматически не переписывается.',
+    'routing-rule-reset':'Удаляет управляемые правила доступа. Не является сбросом UFW. Требуется подтверждение; при строгой TLS-защите сброс заблокирован.',
+    'warp-operation':'Управляет выбранным вариантом WARP. Установка не равна включению маршрута. Отключение SOCKS возвращает Direct, а интерфейсного режима — предыдущий выход. Перерегистрация меняет WARP-аккаунт, не пользователей VPN.',
+    'torrent-save':'Включает частичное ограничение BitTorrent только для процесса TrustTunnel. Сигнатуры и выбранные порты не гарантируют блокировку шифрованного P2P; возможны ложные совпадения. Общий UDP и SSH не блокируются.',
+    'torrent-disable':'Удаляет только управляемые правила ограничения BitTorrent. Не сбрасывает UFW и маршруты WARP.',
+    'torrent-status':'Проверяет установленное ограничение BitTorrent и его счётчики пакетов. Пакеты не равны людям или числу скачанных файлов.',
+    'certificate-status':'Показывает режим, срок и состояние сертификата. Не перевыпускает его и не меняет клиентские настройки.',
+    'certificate-switch':'Меняет режим сертификата. Let’s Encrypt доверен устройствами; self-signed требует доверенного сертификата в профиле. Замена может потребовать повторного импорта и краткого перезапуска.',
+    'system-restart':'Перезапускает только TrustTunnel, не весь VPS. Активные VPN-подключения кратковременно разорвутся; SSH и панель должны продолжить работу.',
+    'system-reboot':'Планирует перезагрузку всего VPS через 60 секунд. Прервутся VPN, панель и SSH. До срабатывания таймера перезагрузку можно отменить.',
+    'system-reboot-cancel':'Останавливает наш таймер предстоящей перезагрузки. Уже начавшуюся перезагрузку отменить нельзя.',
+    'schedule-save':'Сохраняет расписание выбранной задачи в часовом поясе сервера. Обновления ОС могут перезапускать службы, перезагрузка отключит всё. Endpoint и сама панель автоматически этим расписанием не обновляются.',
+    'schedule-disable':'Отключает только выбранное расписание панели. Не отменяет уже начавшееся обновление и не удаляет системные таймеры других программ.',
+    'schedule-status':'Показывает наши таймеры и время следующего запуска. Наличие расписания не доказывает успешное выполнение прошлой задачи.',
+    'security-scan':'Читает состояние защиты VPS и выдаёт рекомендации. Проверка сама не меняет SSH, UFW, маршруты или настройки VPN. Предупреждение нужно оценить перед исправлением.',
+    'security-audit':'Формирует read-only отчёт о защите сервера. Это автоматические проверки конфигурации, не полноценный внешний пентест.',
+    'security-status':'Показывает текущие UFW, SSH и fail2ban. Не применяет настройки; журнал и информация могут относиться к разным моментам проверки.',
+    'security-remediate':'Применяет только выбранную рекомендацию, а не все сразу. Изоляция метрик перезапустит VPN. Парольный вход SSH и маршруты автоматически не отключаются.',
+    'security-ping':'Меняет только входящие echo-request через управляемые правила UFW. Это не запрет всего ICMP/ICMPv6: служебные сообщения нужны сети. Выключенный ping не скрывает открытые TCP/UDP-порты.',
+    'security-listeners':'Показывает порты, которые слушают процессы VPS. Слушающий порт не обязательно доступен из интернета: доступ также зависит от UFW и firewall провайдера.',
+    'security-logins':'Показывает ограниченный фрагмент журналов SSH. Ошибка входа не всегда атака; перед баном проверьте адрес и время.',
+    'logs':'Показывает последние строки выбранного разрешённого журнала. Не запускает введённые команды. Секреты маскируются, но перед отправкой отчёта его всё равно стоит проверить.',
+    'audit':'Показывает действия администраторов, записанные панелью. Это не полный журнал всех действий root по SSH.',
+    'recommendations':'Показывает советы по текущим проверкам. Настройки не меняются, пока вы отдельно не подтвердите конкретное исправление.',
+    'diagnostics-client':'Показывает наблюдаемые сессии, трафик и параметры выбранного клиента без пароля. Не воспроизводит автоматически работу его Android-приложения.',
+    'diagnostics-stack':'Проверяет endpoint, слушающие порты и сертификат по уровням. TCP/UDP listener не доказывает, что клиентский интернет работает целиком.',
+    'diagnostics-egress':'Проверяет разрешённую внешнюю цель по DNS, TCP и TLS напрямую с VPS. Это не проверка выхода через WARP или с телефона.',
+    'diagnostics-warp':'Проверяет HTTP-выход через выбранный WARP, для интерфейса — в маршруте cgroup TrustTunnel. Не измеряет игровой пинг и потери UDP.',
+    'protection-status':'Проверяет подготовленные и включённые способы защиты VPN от активного зондирования и их совместимость. Ничего не включает.',
+    'protection-camouflage':'Меняет служебные HTTP-ответы endpoint, не клиентские пароли. Это уменьшение явных признаков сервиса, а не невидимость IP, TLS-сертификата или полная защита от DPI.',
+    'protection-camouflage-restore':'Возвращает сохранённые служебные HTTP-настройки. Не выключает UFW и не снимает парольную аутентификацию VPN.',
+    'protection-prepare':'Готовит альтернативные профили с ClientHello-prefix. Старые клиенты не блокируются. Сначала проверьте новый профиль на одном устройстве.',
+    'protection-enforce':'Делает подготовленный ClientHello-фильтр обязательным. Старые профили могут перестать работать. С QUIC строгий режим пока не допускается без подтверждённой квалификации.',
+    'protection-disable':'Снимает наш строгий prefix-фильтр и восстанавливает сохранённые правила, если они не изменены посторонним инструментом. Пароль VPN остаётся необходимым.',
+    'protection-tls-prepare':'Готовит профили с ключевой TLS-аутентификацией для совместимого клиента и endpoint. Не включает обязательную проверку на сервере. Ключ можно скопировать вместе с профилем.',
+    'protection-tls-enforce':'Требует совместимые endpoint и клиент и отдельное подтверждение миграции. Неподготовленные устройства потеряют доступ. Это не привязка к устройству; строгий QUIC пока не квалифицирован.',
+    'protection-tls-disable':'Отключает обязательную ключевую проверку ClientHello и возвращает сохранённые правила. Не отключает обычный пароль VPN.',
+    'protection-client-preset':'Сохраняет рекомендованный набор DNS/AntiDPI/TLS для новых экспортируемых профилей. Он не является гарантированным обходом DPI и не меняет настройки телефонов удалённо.',
+    'protection-client-settings':'Позволяет настроить штатные параметры клиента: AntiDPI, TLS-профиль, DNS и post-quantum. Совместимость зависит от версии приложения. Меняйте по одному параметру и проверяйте новый профиль.',
+    '/ports/endpoint':'Меняет VPN-порт и адрес в экспортируемых профилях. Нужен повторный импорт на устройствах и перезапуск VPN. Убедитесь, что порт свободен; активный интерфейсный WARP сначала требуется безопасно отключить.',
+    '/panel/access':'Меняет способ доступа и порт панели. Localhost доступен через SSH-туннель, HTTPS — через выбранный публичный порт. После перезапуска старый адрес может перестать работать.',
+    '/panel/credentials':'Меняет логин/пароль администратора панели, не VPN-клиентов. После применения потребуется новый вход; сохраните новые данные до закрытия страницы.',
+    '/installer':'Запускает выбранную установку, переустановку, обновление или удаление. Это не просто перезапуск: внимательно проверьте сохранение identity и подтверждение операции.',
+    '/backup/identity':'Сохраняет сертификат, ключ и клиентские данные для восстановления без перенастройки устройств. Backup содержит секреты: держите его только в защищённом месте.',
+    '/backup/latest.zip':'Скачивает архив клиентских настроек. Он содержит доступ к VPN; не публикуйте его и не отправляйте посторонним.'
+  };
+  const securityDescriptions={
+    'Сетевой экран':'UFW фильтрует соединения по IP, портам и направлению. Inactive означает, что он выключен. Перед включением разрешите SSH, VPN и HTTPS-панель и проверьте сохранность доступа. Это не AntiDPI и не полная защита от сканеров.',
+    'Политика входящих соединений':'Default incoming применяется к новым входящим соединениям, для которых не подошло отдельное правило UFW. Обычно рекомендуют deny: разрешены только явно открытые службы. Сначала создайте разрешения SSH, VPN и панели, иначе можно потерять доступ. Эта карточка ничего не изменяет.',
+    'Защита SSH':'Fail2ban временно блокирует адреса после подтверждённых повторных ошибок SSH-входа. Это не число VPN-клиентов и не защита от всех сетевых атак. Общий NAT может объединять разных людей за одним IP.',
+    'Вход по SSH':'Вход ключом обычно предпочтительнее пароля. Не отключайте пароль или root, пока не проверен другой пользователь с sudo и вход по ключу в новой сессии. Проверка базовых параметров не учитывает все Match-исключения.',
+    'Доступ к панели':'Localhost не выставляет веб-панель в интернет: используйте SSH-туннель. Публичный HTTPS шифрует соединение, но не заменяет сильный пароль, обновления и ограничение доверенных IP.',
+    'Приватные файлы':'В этих файлах хранятся пароли VPN, ключ сертификата и пароль панели. Они должны принадлежать root и не читаться группой или другими пользователями ОС. Открытые права могут раскрыть доступ.',
+    'Сертификат VPN':'Сертификат подтверждает сервер и защищает TLS. Проверяется чтение и срок действия. Let’s Encrypt должен своевременно обновляться; замена самоподписанного сертификата требует обновить доверие на устройствах.',
+    'Перезагрузка ОС':'ОС может запросить перезагрузку после обновления ядра или системных библиотек. Перезагрузка остановит SSH, VPN и панель; назначьте подходящее время и сохраните доступ к консоли провайдера.',
+    'Синхронизация времени':'NTP поддерживает правильное время. Ошибка часов мешает TLS, сертификатам и журналам. Применение рекомендации включает синхронизацию, но не доказывает, что источник времени уже доступен.',
+    'SYN cookies':'Штатный механизм ядра помогает TCP переживать переполнение очереди установления соединений. Он не защищает от перегрузки канала, TLS или любых DDoS-атак и не ускоряет игровой UDP.',
+    'Входящий ping':'Ping помогает диагностировать доступность. Запрет echo-request не скрывает открытые порты. Нельзя блокировать весь ICMP/ICMPv6: это может нарушить IPv6 и определение размера пакета.',
+    'Обновления ОС':'Обновления закрывают известные уязвимости, но могут перезапустить службы. Не создавайте конфликтующие APT-расписания. Обновление ОС не равно обновлению TrustTunnel или панели.',
+    'Приватность метрик':'Статистика endpoint содержит логины и IP клиентов. Listener должен быть на loopback, доступном только локальным процессам, а веб-API панели — требовать входа. Не открывайте порт метрик в интернет.',
+    'Доступ VPN к приватным сетям':'Разрешение даёт VPN-клиентам доступ к локальным/приватным назначениям, в том числе некоторым службам VPS. При SOCKS поведение зависит и от удалённого прокси; настройка не доказывает полную изоляцию DNS и приватных сетей.',
+    'Пароль панели':'Используйте уникальный случайный пароль от 20 символов и не применяйте его для SSH или VPN-клиентов. Одна длина не доказывает отсутствие утечки. Доступ к панели даёт административные возможности.',
+    'Профили и учёт':'TOML, файлы состояний и база учёта могут содержать секреты и персональные адреса. Проверяются права, владелец и ссылки. Backup тоже должен храниться приватно.',
+    'TLS-аутентификация VPN':'Ключевая проверка ClientHello затрудняет активное зондирование endpoint, но требует совместимости обеих сторон. Это не mTLS, не аппаратная привязка и не защита от копирования профиля. Строгий QUIC пока не квалифицирован.',
+    'Контроль передачи доступа':'Сроки, квоты и одноразовые приглашения уменьшают неконтролируемую выдачу. История сетей служит только сигналом для проверки владельца. Официальный endpoint не даёт надёжного полного списка одновременных IP.',
+    'Базовая защита ядра':'Набор ограниченных sysctl защищает от некоторых небезопасных сетевых перенаправлений и файловых ссылок. Он не заменяет обновления и firewall. Профиль не меняет MTU, маршруты WARP или UDP.',
+    'Ошибки служб ОС':'Показывает службы в состоянии failed. Причины могут быть разными; сначала изучите журнал и назначение службы. Панель не перезапускает все неизвестные службы автоматически.'
+  };
+  Object.assign(actionDescriptions,{
+    'ufw-status':'Показывает текущие правила и состояние UFW. Ничего не включает и не меняет. Сравните разрешённые порты с SSH, VPN и панелью.',
+    'ufw-enable':'Включает фильтрацию UFW с существующими правилами. Проверьте разрешения SSH, VPN и панели. После применения проверьте новый вход и подтвердите доступ за 120 секунд; иначе наш таймер вернёт прежние настройки.',
+    'ufw-disable':'Выключает фильтрацию UFW. Открытые процессы VPS могут стать доступны извне, если их не ограничивает другой firewall. Это не отключает VPN. Изменение требует проверки сохранности доступа.',
+    'ufw-install':'Устанавливает пакет UFW через APT. Установка пакета не равна включению firewall; откат сетевого правила не удаляет установленный пакет.',
+    'ufw-baseline':'Добавляет разрешения текущих SSH, VPN и панели без полного сброса чужих правил. Уже существующие широкие разрешения остаются. Проверьте доступ и подтвердите изменение.',
+    'ufw-rule':'Добавляет выбранное правило по направлению, порту и адресам. Не заменяет все прежние правила. После применения требуется подтверждение доступа за 120 секунд.',
+    'ufw-delete':'Удаляет только выбранную строку UFW с проверкой версии списка. IPv4 и IPv6 могут быть отдельными строками. Защищённые разрешения SSH, VPN и панели удалить этим действием нельзя.',
+    'ufw-source-block':'Запрещает входящий трафик указанного IP или подсети на всех портах. Может затронуть нескольких людей за NAT. Не является баном одного VPN-логина; адрес администратора и loopback защищены.',
+    'ufw-preview':'Выполняет предварительную проверку команды UFW без применения правила. Успешная проверка синтаксиса не доказывает, что после реального применения сохранится доступ.',
+    'ufw-confirm':'Сохраняет уже применённое изменение и отменяет наш таймер отката. Нажимайте только после проверки новой SSH-сессии, VPN и панели, а не только старого открытого соединения.',
+    'ufw-rollback':'Возвращает сохранённые настройки UFW до ожидающего подтверждения изменения. Не переустанавливает VPN и не откатывает пакеты ОС.',
+    'ufw-default':'Меняет политику UFW по умолчанию. Для входящих обычно нужен запрет с отдельными разрешениями. Неправильный запрет может закрыть SSH, VPN и панель; автоматический откат не отменяет необходимость проверки.',
+    'ufw-logging':'Меняет подробность журналов UFW. Высокая подробность увеличивает расход диска и процессора; для обычной работы предпочтителен умеренный уровень.',
+    'f2b-settings':'Меняет порог ошибок, окно наблюдения и сроки блокировки выбранного jail. Значения формы — предложенные, не обязательно фактически действующие. Сначала посмотрите статистику этого jail.',
+    'f2b-ban':'Временно блокирует внешний IP на портах выбранного jail. Это затрагивает адрес целиком, не отдельного пользователя за NAT. Не используйте как автоматический антишаринг.',
+    'f2b-unban':'Снимает бан только в выбранном jail. UFW или другой jail может продолжать блокировку. Повторные ошибки могут вызвать новый бан.',
+    'f2b-ignore-add':'Добавляет постоянное исключение для выбранного jail. Оно не является разрешением UFW и не отменяет все другие средства защиты.',
+    'f2b-ignore-remove':'Удаляет исключение выбранного jail. Последующие нарушения с этого адреса снова могут приводить к бану. Не удаляйте доверенный доступ без резервной сессии.'
+  });
+  const helpDialog=document.createElement('dialog');helpDialog.id='feature-help';helpDialog.className='explain-dialog';helpDialog.setAttribute('aria-labelledby','feature-help-title');
+  const helpTitle=document.createElement('h3');helpTitle.id='feature-help-title';const helpBody=document.createElement('p'),helpClose=document.createElement('button');helpClose.type='button';helpClose.textContent='Понятно';helpDialog.append(helpTitle,helpBody,helpClose);document.body.append(helpDialog);
+  let helpTrigger=null;helpClose.onclick=()=>helpDialog.close();helpDialog.onclose=()=>{if(helpTrigger?.isConnected)helpTrigger.focus();};helpDialog.onclick=e=>{if(e.target===helpDialog){const r=helpDialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)helpDialog.close();}};
+  signal.addEventListener('abort',()=>helpDialog.remove(),{once:true});
+  function infoButton(title,text){const b=document.createElement('button');b.type='button';b.className='help-button action-help';b.title=text;b.setAttribute('aria-label','Пояснение: '+title);b.append($('help-icon').content.cloneNode(true));b.onclick=()=>{helpTrigger=b;helpTitle.textContent=title;helpBody.textContent=text;helpDialog.showModal();helpClose.focus();};return b;}
+  document.querySelectorAll('.security-check h3').forEach(heading=>{const title=heading.textContent.trim(),text=securityDescriptions[title];if(text){heading.title=text;heading.classList.add('check-explanation');heading.append(infoButton(title,text));}});
+  document.querySelectorAll('main form').forEach(form=>{
+    const action=form.querySelector('input[name="action"]')?.value||form.getAttribute('action');
+    let text=actionDescriptions[action];
+    if(!text&&action?.startsWith('ufw-'))text='UFW управляет сетевыми разрешениями VPS. Проверьте направление, IP и порядок правил, сохранив SSH, VPN и панель. Изменения правил требуют подтверждения доступа за 120 секунд; установка пакета не откатывается как правило.';
+    if(!text&&(action?.startsWith('fail2ban-')||action?.startsWith('f2b-')))text='Операция относится к выбранному jail Fail2ban. Бан действует на внешний IP целиком, а не на один VPN-логин; за общим NAT могут быть другие люди. Сначала проверьте адрес, исключения и сохранность доступа администратора.';
+    if(!text&&action?.startsWith('panel-'))text='Управление самой веб-панелью, не паролями VPN-клиентов. Изменение доступа или остановка могут закрыть текущую страницу. Держите рабочий SSH-доступ для восстановления через ttmenu.';
+    if(!text&&action?.startsWith('certificate-'))text='Управление сертификатом VPN. Перевыпуск и смена режима могут перезапустить endpoint; самоподписанный сертификат нужно доверить на устройстве. Для Let’s Encrypt требуется доступность домена и временного HTTP challenge.';
+    if(!text&&form.dataset.confirm)text=form.dataset.confirm;
+    if(!text)text='Выполняет выбранное действие: '+(form.querySelector('button')?.textContent.trim()||action)+'. Проверьте параметры формы. Результат появится в отдельном окне; опасное изменение требует подтверждения.';
+    const buttons=[...form.querySelectorAll('button:not([type="button"])')];buttons.forEach(b=>b.title=text+(form.dataset.confirm?'\n\nПеред применением: '+form.dataset.confirm:''));
+    const primary=buttons[0];if(primary){const wrap=document.createElement('span');wrap.className='action-control';primary.before(wrap);wrap.append(primary,infoButton(primary.textContent.trim(),primary.title));}
+  });
+  document.querySelectorAll('[data-load-link],[data-copy],[data-reveal],[data-drawer]').forEach(button=>{if(!button.title)button.title=button.hasAttribute('data-copy')?'Копирует выбранный секрет или профиль в буфер обмена. Не отправляйте его посторонним.':button.hasAttribute('data-reveal')?'Показывает или скрывает уже сохранённый пароль выбранного клиента. Учитывайте, кто видит экран.':button.hasAttribute('data-load-link')?'Создаёт ссылку и QR для выбранного клиента и транспорта. Ссылка содержит доступ к VPN; передавайте её только владельцу.':'Открывает карточку клиента или форму добавления. Само открытие не меняет доступ и не перезапускает VPN.';});
   const store = {get(k, fallback) {try{return localStorage.getItem(k)||fallback;}catch(_){return fallback;}},set(k,v){try{localStorage.setItem(k,v);}catch(_){}}};
   $('theme-toggle').onclick=()=>{const t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;store.set('tt-theme',t);};
   if($('effects-toggle'))$('effects-toggle').onclick=()=>{const flat=document.documentElement.dataset.effects!=='flat';document.documentElement.dataset.effects=flat?'flat':'glass';store.set('tt-effects',flat?'flat':'glass');$('effects-toggle').setAttribute('aria-pressed',String(!flat));};
@@ -3980,6 +4306,7 @@ CONSOLE_SCRIPT = r'''
   command.onclick=e=>{if(e.target===command)closeCommand();};
   $('command-search').oninput=e=>document.querySelectorAll('.command-item').forEach(x=>x.hidden=!x.textContent.toLowerCase().includes(e.target.value.toLowerCase()));
   document.addEventListener('keydown',e=>{
+    if(e.key==='Escape'&&helpDialog.open){e.preventDefault();helpDialog.close();return;}
     if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==='k'){e.preventDefault();openCommand();}
     if(e.key==='Escape'){closeNav();closeCommand();closeDrawers();}
     if(e.key!=='Tab')return;
@@ -4021,7 +4348,7 @@ CONSOLE_SCRIPT = r'''
   $('result-search').oninput=()=>{const query=$('result-search').value.toLocaleLowerCase();$('result-output').textContent=resultText.split('\n').filter(line=>line.toLocaleLowerCase().includes(query)).join('\n');};
   $('result-copy').onclick=async()=>{try{await navigator.clipboard.writeText($('result-output').textContent);$('result-copy').setAttribute('title','Скопировано');}catch(_){const range=document.createRange();range.selectNodeContents($('result-output'));const selection=getSelection();selection.removeAllRanges();selection.addRange(range);}};
   $('result-download').onclick=()=>{const url=URL.createObjectURL(new Blob([$('result-output').textContent],{type:'text/plain;charset=utf-8'}));const link=document.createElement('a');link.href=url;link.download='trusttunnel-report.txt';link.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
-  result.onclose=()=>{if(shouldRefresh)refreshContent().catch(error=>{const notice=document.createElement('div');notice.className='notice';notice.textContent=error.message;document.querySelector('main.content').prepend(notice);});};
+  result.onclose=()=>{document.dispatchEvent(new Event('tt-refresh-state'));if(shouldRefresh)refreshContent().catch(error=>{const notice=document.createElement('div');notice.className='notice';notice.textContent=error.message;document.querySelector('main.content').prepend(notice);});};
   $('result-close').onclick=()=>result.close();
   const releases=$('release-status');
   async function loadReleases(attempt=0){
@@ -4080,17 +4407,42 @@ CONSOLE_SCRIPT = r'''
       function unknown(){document.querySelectorAll('[data-client-online]').forEach(cell=>{cell.className='badge';cell.textContent='Статус неизвестен';cell.closest('[data-client-row]').dataset.online='unknown';});}
       try{const response=await fetch('/api/clients-metrics',{cache:'no-store',signal});if(!response.ok)throw Error('Статистика недоступна; прежний трафик сохранён, online не подтверждён.');const data=await response.json();
         const byName=new Map(data.clients.map(x=>[x.username,x]));
-        document.querySelectorAll('[data-client-online]').forEach(cell=>{const item=byName.get(cell.dataset.clientOnline),online=data.available?item?.online:null;cell.textContent=online===true?'Онлайн · '+item.sessions+' сесс.':online===false?'Офлайн':'Статус неизвестен';cell.className='badge'+(online===true?' active':'');cell.closest('[data-client-row]').dataset.online=online===true?'online':online===false?'offline':'unknown';});
-        document.querySelectorAll('[data-client-metrics]').forEach(cell=>{const item=byName.get(cell.dataset.clientMetrics);cell.textContent=item?'↓ '+format(item.download)+' · ↑ '+format(item.upload)+' · всего '+format(item.download+item.upload):'Нет сохранённых измерений';});
+        document.querySelectorAll('[data-client-online]').forEach(cell=>{const item=byName.get(cell.dataset.clientOnline),online=data.available?item?.online:null;cell.textContent=online===true?'Онлайн · '+item.sessions+' тунн.':online===false?'Офлайн':'Статус неизвестен';cell.title='VPN-приложение может держать несколько туннелей. Это не число устройств или IP-адресов.';cell.className='badge'+(online===true?' active':'');cell.closest('[data-client-row]').dataset.online=online===true?'online':online===false?'offline':'unknown';});
+        document.querySelectorAll('[data-client-metrics]').forEach(cell=>{const item=byName.get(cell.dataset.clientMetrics);cell.replaceChildren();if(!item){cell.textContent='Нет сохранённых измерений';return;}for(const [label,value] of [['Скачано',item.download],['Отправлено',item.upload],['Всего',item.total_bytes??item.download+item.upload]]){const span=document.createElement('span');span.textContent=label+': '+format(value);cell.append(span);}cell.title=data.traffic_basis||'С точки зрения устройства клиента. Накопленные счётчики, не тарификация провайдера.';let peer=cell.parentElement.querySelector('[data-client-address]');if(!peer){peer=document.createElement('span');peer.className='muted client-address';peer.dataset.clientAddress=cell.dataset.clientMetrics;cell.after(peer);}const current=data.available&&item.online&&item.observed_ip;peer.textContent=(current?'IP сейчас: '+current:'Последний замеченный IP: '+(item.last_observed_ip||'ещё не зафиксирован'))+'. Одновременных IP: '+(item.active_ip_count===0?'0':'неизвестно');peer.title='Последний адрес из наблюдений панели. Официальный endpoint возвращает один агрегированный IP, не полный список подключений; при нескольких IP это не обязательно адрес самого последнего подключения.';});
         document.querySelectorAll('[data-client-seen]').forEach(cell=>{const item=byName.get(cell.dataset.clientSeen);cell.textContent='Последний онлайн: '+(item?.online===true?'сейчас':date(item?.last_seen));});
         document.querySelectorAll('[data-client-watch]').forEach(cell=>{const item=byName.get(cell.dataset.clientWatch)?.sharing;cell.classList.toggle('warning',Boolean(item?.alert));cell.textContent=!item?.enabled?'Наблюдение сетей выключено.':(!data.available?'Метрики сейчас недоступны. Последние наблюдения: ':item.alert?'Проверьте доступ: ':'Наблюдение: ')+item.observed_networks+' сетей за '+item.minutes+' мин; последний образец '+date(item.last_sample)+'. Это не одновременные IP; автоматического бана нет.';});
-        document.querySelectorAll('[data-client-details]').forEach(cell=>{const item=byName.get(cell.dataset.clientDetails);cell.textContent=item?'Последнее наблюдение online: '+date(item.last_seen)+'. Трафик: ↓ '+format(item.download)+' / ↑ '+format(item.upload)+'. Сессий: '+(data.available?item.sessions:'неизвестно')+'. '+(item.sessions>1?'Несколько сессий не доказывают шаринг. ':'')+'История до начала учёта неизвестна. Дата и время показаны в часовом поясе устройства.':'Нет измерений';});
+        document.querySelectorAll('[data-client-details]').forEach(cell=>{const item=byName.get(cell.dataset.clientDetails);cell.textContent=item?'Последний онлайн: '+date(item.last_seen)+'. Скачано: '+format(item.download)+'. Отправлено: '+format(item.upload)+'. За сегодня (UTC), без начального исторического остатка: скачано '+format(item.today_download)+' / отправлено '+format(item.today_upload)+'. VPN-туннелей: '+(data.available?item.sessions:'неизвестно')+'. Это не число устройств. Полный список одновременных IP недоступен. История до начала наблюдения неизвестна.':'Нет измерений';});
         status.textContent=(data.available?'Обновлено '+new Date(data.checked_at*1000).toLocaleTimeString()+' · автообновление 15 с.':'Метрики недоступны. Статус неизвестен, сохранённый трафик не сброшен. Включение: Endpoint.')+' '+(data.accounting_error||'')+' '+(data.guard?.error||'');
         if(data.guard?.pending?.length)status.append(document.createTextNode(' Квота/срок требуют решения администратора: '+data.guard.pending.join(', ')+'. Проверьте политики в карточках клиентов.'));
         filter();
       }catch(error){if(error.name!=='AbortError'){unknown();status.textContent=error.message;filter();}}finally{reading=false;if(!signal.aborted)b.disabled=false;}
     }
     $('clients-refresh').onclick=refreshClients;refreshClients();const timer=setInterval(refreshClients,15000);const previousCleanup=cleanup;cleanup=()=>{previousCleanup();clearInterval(timer);};document.addEventListener('visibilitychange',refreshClients,{signal});
+    document.addEventListener('tt-refresh-state',refreshClients,{signal});
+  }
+  if($('server-health')||$('panel-protection')){
+    let checking=false;
+    async function refreshSafety(){
+      if(checking||document.hidden||signal.aborted)return;checking=true;
+      try{
+        if($('server-health')){
+          const response=await fetch('/api/server-health',{cache:'no-store',signal});if(!response.ok)throw Error();const data=await response.json();
+          const labels={ok:'Работает нормально',warn:'Требует внимания',error:'Есть проблема',unknown:'Недостаточно свежих данных'};
+          $('health-state').textContent=labels[data.stale?'unknown':data.state]||labels.unknown;
+          $('health-updated').textContent=data.checked_at?'Измерение: '+new Date(data.checked_at*1000).toLocaleString()+(data.stale?' · устарело или недоступно':' · каждые 60 с'):'Ожидание первого фонового измерения';
+          $('health-days').replaceChildren(...data.history.map(row=>{const span=document.createElement('span');const state=!row.samples?'unknown':row.errors?'error':row.warn?'warn':row.ok===row.samples?'ok':'unknown';span.className='health-day '+state;span.title=new Date(row.day*1000).toISOString().slice(0,10)+' UTC · проверок '+row.samples+'; с проблемой '+row.errors+'; предупреждений '+row.warn;span.setAttribute('aria-label',span.title);return span;}));
+          $('health-checks').replaceChildren(...data.checks.map(item=>{const row=document.createElement('div');row.className='health-check';const title=document.createElement('span'),detail=document.createElement('span');title.textContent=item.title;detail.className='badge '+(['ok','warn','error','unknown'].includes(item.state)?item.state:'unknown');detail.textContent=item.detail;row.append(title,detail);return row;}));
+        }
+        if($('panel-protection')){
+          const response=await fetch('/api/panel-protection',{cache:'no-store',signal});if(!response.ok)throw Error();const data=await response.json();
+          document.querySelectorAll('[data-panel-event]').forEach(cell=>cell.textContent=String(data.counts[cell.dataset.panelEvent]??'нет данных'));
+          $('protection-updated').textContent='За последние 24 часа · обновлено '+new Date(data.checked_at*1000).toLocaleTimeString()+'. Категории могут пересекаться.';
+        }
+      }catch(error){if(error.name!=='AbortError'){if($('health-state'))$('health-state').textContent='Свежие данные недоступны';if($('protection-updated'))$('protection-updated').textContent='Нет свежих данных. Показаны последние полученные счётчики.';}}
+      finally{checking=false;}
+    }
+    refreshSafety();const safetyTimer=setInterval(refreshSafety,60000);const safetyCleanup=cleanup;cleanup=()=>{safetyCleanup();clearInterval(safetyTimer);};document.addEventListener('visibilitychange',refreshSafety,{signal});
+    document.addEventListener('tt-refresh-state',refreshSafety,{signal});
   }
   const canvas=$('traffic-chart');if(!canvas)return;
   const interval=$('refresh-interval'),interfaces=$('interface-select'),status=$('monitor-status');
@@ -4119,7 +4471,7 @@ CONSOLE_SCRIPT = r'''
         interfaces.replaceChildren(...keys.map(key=>new Option(key,key)));interfaces.value=keys.includes(selected)?selected:(keys.find(k=>/^(en|eth)/.test(k))||keys[0]||'');
       }
       const name=interfaces.value,v=data.interfaces[name],old=previous?.interfaces[name],dt=previous?data.time-previous.time:0;
-      if(v&&old&&dt>0){const rx=Math.max(0,v.rx-old.rx)/dt,tx=Math.max(0,v.tx-old.tx)/dt;history.push([rx,tx]);history=history.slice(-60);$('network-rate').textContent='↓ '+bytes(rx)+'/с   ↑ '+bytes(tx)+'/с';}
+      if(v&&old&&dt>0&&dt<=180&&v.rx>=old.rx&&v.tx>=old.tx){const rx=(v.rx-old.rx)/dt,tx=(v.tx-old.tx)/dt;history.push([rx,tx]);history=history.slice(-60);$('network-rate').textContent='Приём VPS: '+bytes(rx)+'/с · отправка VPS: '+bytes(tx)+'/с';}else if(previous){history=[];$('network-rate').textContent='Новое начало измерения; ожидаем следующий образец';}
       $('interface-totals').textContent=v?'С запуска интерфейса: принято '+bytes(v.rx)+' · отправлено '+bytes(v.tx):'Нет сетевых интерфейсов';
       status.textContent='Обновлено '+new Date(data.time*1000).toLocaleTimeString();status.className='muted';previous=data;draw();
     }catch(e){failures++;status.textContent='Связь недоступна · повтор автоматически';status.className='error-text';}
@@ -4141,15 +4493,16 @@ def endpoint_console():
     capabilities = endpoint_capabilities()
     cfg = tomllib.loads(read_text(TT_DIR / 'vpn.toml'))
     releases = admin_form('endpoint-releases', '<button>' + icon('RefreshCw') + 'Проверить выпуски</button>', view='endpoint')
-    update = '''<form method="post" action="/installer" data-confirm="Обновить endpoint? VPN кратковременно перезапустится."><input type="hidden" name="action" value="update-trusttunnel"><label>Канал<select name="channel"><option value="stable">Стабильный</option><option value="beta">Beta · предварительный</option></select></label><label>Подтверждение beta<input name="beta_confirm" placeholder="Только для beta: BETA" autocomplete="off"></label><button class="primary">Обновить endpoint</button></form>'''
+    update = '''<form method="post" action="/installer" data-confirm="Обновить endpoint? VPN кратковременно перезапустится."><input type="hidden" name="action" value="update-trusttunnel"><label>Канал<select name="channel"><option value="stable">Стабильный</option><option value="beta">Beta · предварительный</option></select></label><label>Подтверждение beta<input name="beta_confirm" placeholder="Только для beta: BETA" autocomplete="off"></label><button class="primary">Обновить VPN-сервер</button></form>'''
     metrics = cfg.get('metrics', {}).get('per_client_metrics', False)
-    stats = admin_form('endpoint-metrics', f'<label class="check"><input type="checkbox" name="enabled" value="1" {"checked" if metrics else ""}> Сессии и трафик по клиентам</label><button {"" if capabilities["metrics"] else "disabled"}>Применить</button>', view='endpoint', confirm='Перезапустить endpoint для изменения метрик?')
+    http1 = '' if 'http1' in cfg.get('listen_protocols', {}) else '<label class="check"><input type="checkbox" name="http1_ack" value="1">Разрешаю добавить HTTP/1.1 для работы локальных метрик. Он также будет доступен на VPN-порту; HTTP/2 и QUIC сохранятся.</label>'
+    stats = admin_form('endpoint-metrics', f'<label class="check"><input type="checkbox" name="enabled" value="1" {"checked" if metrics else ""}> Сессии и трафик по клиентам</label>{http1}<button {"" if capabilities["metrics"] else "disabled"}>Применить</button>', view='endpoint', confirm='Перезапустить endpoint для изменения метрик?')
     subscription = cfg.get('subscription', {})
     sub = admin_form('endpoint-subscription', f'<label>Путь HTTPS<input name="path" value="{html.escape(subscription.get("path", "/subscription"), quote=True)}"></label><label class="check"><input type="checkbox" name="enabled" value="1" {"checked" if subscription.get("enabled") else ""}> Включить подписки</label><button {"" if capabilities["subscription"] else "disabled"}>Применить</button>', view='endpoint', confirm='Применить HTTPS-подписки и перезапустить endpoint?')
     availability = 'Доступны в установленной версии.' if capabilities['subscription'] else 'Нужен совместимый endpoint 1.3+ и клиент с поддержкой подписок. В 1.1.0 функция недоступна.'
     details = endpoint_view()
     details = details[details.index('<section'):]
-    return f'<div class="page-head"><div><span class="eyebrow">ЯДРО VPN</span><h2>Endpoint</h2><p>Установлен {html.escape(endpoint_version())}</p></div>{releases}</div><section class="surface"><h3>Обновления TrustTunnel</h3>{update}</section><section class="surface"><h3>Статистика пользователей</h3><p class="muted">Доступна панели через локальный адрес 127.0.0.1. Счётчики хранятся в памяти endpoint и сбрасываются при его перезапуске.</p>{stats}</section><section class="surface"><h3>HTTPS-подписки</h3><p class="muted">{availability} Для включения требуется доверенный сертификат. Ссылка содержит данные доступа клиента.</p>{sub}</section><details class="surface"><summary>Установка, переустановка и порт</summary>{details}</details>'
+    return f'<div class="page-head"><div><span class="eyebrow">ЯДРО VPN</span><h2>VPN-сервер</h2><p>Установлен {html.escape(endpoint_version())}</p></div>{releases}</div><section class="surface"><h3>Обновления TrustTunnel</h3>{update}</section><section class="surface"><h3>Статистика пользователей</h3><p class="muted">Доступна панели через локальный адрес 127.0.0.1. Счётчики хранятся в памяти endpoint и сбрасываются при его перезапуске.</p>{stats}</section><section class="surface"><h3>HTTPS-подписки</h3><p class="muted">{availability} Для включения требуется доверенный сертификат. Ссылка содержит данные доступа клиента.</p>{sub}</section><details class="surface"><summary>Установка, переустановка и порт</summary>{details}</details>'
 
 
 def warp_console():
@@ -4164,6 +4517,44 @@ def warp_console():
 
 
 PANEL_STYLE += r'''
+.drawer-card{width:min(550px,100%)}
+.drawer-card form{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,16em),1fr));align-items:end;gap:14px}
+.drawer-card form>:is(label.check,button,.inline-actions),.drawer-card form>label:has(input[type="datetime-local"]){grid-column:1/-1}
+.drawer-card form>label{min-width:0;overflow-wrap:anywhere}
+.drawer-card form>label.has-help{grid-template-columns:minmax(0,1fr) 20px;padding-right:0}
+.drawer-card form>label.has-help>:is(input,select,textarea,.field-help){grid-column:1/-1}
+.drawer-card form>label>.help-button{position:static;grid-column:2;grid-row:1;justify-self:end;align-self:start}
+.drawer-card form>label.check{display:grid;grid-template-columns:17px minmax(0,1fr);align-items:start}
+.drawer-card form>label.check.has-help{grid-template-columns:17px minmax(0,1fr) 20px}
+.drawer-card form>label.check>input[type="checkbox"]{grid-column:1;grid-row:1;width:17px;min-width:17px;height:17px;min-height:17px}
+.drawer-card form>label.check>.help-button{grid-column:3}
+.drawer-card form :is(input:not([type="checkbox"]):not([type="hidden"]),select,textarea){width:100%}
+.client-usage{display:flex;flex-wrap:wrap;gap:4px 16px;line-height:1.7}
+.client-usage>span{white-space:nowrap}.client-address{max-width:60ch;font-size:11px;line-height:1.6;margin:5px 0;overflow-wrap:anywhere}
+.action-control{display:inline-flex;align-items:center;gap:5px;max-width:100%;min-width:0}.action-control>button:first-child{min-width:0;white-space:normal;overflow-wrap:anywhere}
+.help-button.action-help{position:static;width:32px;min-width:32px;height:40px;min-height:40px;flex:none;padding:0;align-self:center}
+.drawer-card form>.action-control{grid-column:1/-1}.drawer-card form>.action-control>button:first-child{flex:1}
+.check-explanation{display:flex;align-items:center;gap:8px;justify-content:space-between}.check-explanation .action-help{height:26px;min-height:26px;width:26px;min-width:26px}
+.explain-dialog{width:min(540px,calc(100% - 28px));max-height:85dvh;overflow:auto;padding:26px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);box-shadow:0 20px 70px #0004}
+.explain-dialog::backdrop{background:#101b2370}.explain-dialog h3{font-size:18px;line-height:1.4;overflow-wrap:anywhere}.explain-dialog p{white-space:pre-line;font-size:14px;line-height:1.7;color:var(--muted);margin:18px 0 24px;overflow-wrap:anywhere}
+.explain-dialog>button{display:block;margin-left:auto}
+dialog button:hover:not(:disabled),dialog button:active:not(:disabled){transform:none}
+.health-title{display:block;font-size:21px;font-weight:650;line-height:1.4;margin-bottom:6px;overflow-wrap:anywhere}
+.health-days{display:grid;grid-template-columns:repeat(30,minmax(0,1fr));gap:4px;min-height:22px}
+.health-day{height:20px;border-radius:2px;background:var(--line)}
+.health-day.ok{background:#22a98b}.health-day.warn{background:#d5a343}.health-day.error{background:#d96977}
+.health-legend{display:flex;flex-wrap:wrap;gap:10px 20px;font-size:11px;color:var(--muted);margin:12px 0 22px}
+.health-legend>span:before{content:"";display:inline-block;width:7px;height:7px;border-radius:2px;margin-right:6px;background:var(--line)}
+.health-legend>.ok:before{background:#22a98b}.health-legend>.warn:before{background:#d5a343}.health-legend>.error:before{background:#d96977}
+.health-checks{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:0 24px}
+.health-check{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-top:1px solid var(--line);padding:12px 0;font-size:12px;min-width:0}
+.health-check .badge{white-space:normal;overflow-wrap:anywhere}.badge.ok{color:var(--accent);background:var(--accent-soft)}
+.badge.error{color:var(--danger);background:var(--danger-soft)}.badge.warn{color:#ae7c20;background:#a8841815}
+.protection-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}
+.protection-metrics>div{border-left:2px solid var(--line);padding:0 16px;min-width:0}
+.protection-metrics strong{display:block;font-size:25px;font-variant-numeric:tabular-nums;margin-top:6px}
+@media(max-width:1000px){.health-checks{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media(max-width:560px){.health-surface .section-heading{align-items:start;flex-wrap:wrap}.health-title{font-size:19px}.health-days{gap:2px}.health-checks{grid-template-columns:1fr}.protection-metrics{grid-template-columns:1fr;gap:18px}.protection-metrics>div{display:flex;align-items:center;justify-content:space-between;gap:10px}.protection-metrics strong{margin:0;font-size:22px}}
 .has-help{position:relative;padding-right:22px}.help-button{position:absolute;right:0;top:-2px;width:20px;height:20px;min-height:20px;padding:0;border:0;background:transparent;box-shadow:none;color:var(--muted)}.help-button .icon{width:15px;height:15px}.field-help{font-size:11px;line-height:1.5;max-width:280px;color:var(--ink);padding:10px;background:var(--accent-soft);border-radius:4px;grid-column:1/-1}.field-help[hidden],label[hidden]{display:none!important}
 #action-confirm{width:min(480px,calc(100% - 28px));max-height:85dvh;padding:28px;border:1px solid var(--glass-edge);border-radius:8px;background:var(--glass);color:var(--ink);box-shadow:0 20px 80px #0004;backdrop-filter:blur(20px)}#action-confirm::backdrop{background:#101b2380;backdrop-filter:blur(3px)}#action-confirm h3{font-size:18px}#action-confirm p{font-size:13px;color:var(--muted);margin:18px 0 24px}#action-confirm .inline-actions{justify-content:flex-end}
 .warp-providers{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:22px}.warp-provider{padding:20px 16px;background:var(--glass);border:1px solid var(--glass-edge);border-radius:8px;box-shadow:var(--shadow);min-width:0}.warp-provider.selected{border-color:var(--accent);box-shadow:inset 0 2px 0 var(--accent),var(--shadow)}.warp-provider>.icon{color:var(--accent);width:23px;height:23px;margin-bottom:14px}.warp-provider:nth-child(2)>.icon{color:#478fce}.warp-provider:nth-child(3)>.icon{color:#b27d4c}.warp-provider:nth-child(4)>.icon{color:#b26b91}.warp-provider h3{font-size:13px;margin-bottom:6px}.warp-provider p{font-size:11px;color:var(--muted);min-height:34px;margin:0 0 15px;overflow-wrap:anywhere}.warp-provider .badge{white-space:normal}.warp-actions{width:100%;margin-top:8px}.warp-actions button{font-size:12px}.warp-actions .danger{margin-left:auto}#operation-result .inline-actions input{flex:1}#operation-result pre{min-height:100px;max-height:55dvh;overflow:auto}
@@ -4245,16 +4636,58 @@ document.getElementById('activation-link').value=data.link;document.getElementBy
 </script></body></html>'''
 
 
+class DeadlineReader(io.RawIOBase):
+    def __init__(self, connection, seconds=20):
+        super().__init__()
+        self.connection = connection
+        self.deadline = time.monotonic() + seconds
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0: raise TimeoutError('Total HTTP read deadline exceeded')
+        self.connection.settimeout(min(20, remaining))
+        return self.connection.recv_into(buffer)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = 'TrustTunnelPanel'
     sys_version = ''
     def setup(self):
         super().setup()
         self.connection.settimeout(20)
+        self.rfile.close()
+        self.rfile = io.BufferedReader(DeadlineReader(self.connection))
+
+    def parse_request(self):
+        if not super().parse_request(): return False
+        if not self.valid_host():
+            self.send_error(400, 'Invalid panel authority')
+            return False
+        return True
+
+    def valid_host(self):
+        authorities = self.headers.get_all('Host', [])
+        if len(authorities) != 1: return False
+        authority = authorities[0]
+        if re.search(r'[\s/@?#\\]', authority): return False
+        try:
+            parsed = urllib.parse.urlsplit('//' + authority)
+            host = (parsed.hostname or '').lower().rstrip('.')
+            port = parsed.port or (443 if isinstance(self.connection, ssl.SSLSocket) else 80)
+            local_host, local_port = self.connection.getsockname()[:2]
+            allowed = {'localhost', '127.0.0.1', '::1', str(local_host).lower(), domain().lower().rstrip('.')}
+            return bool(host) and host in allowed and port == local_port
+        except (ValueError, OSError):
+            return False
 
     def send_error(self, code, message=None, explain=None):
+        if code in (400,401,403,404,405,413,414,431,501): panel_event('rejected')
+        if code==429: panel_event('throttled')
         # Avoid a TCP reset hiding a rejection when a small POST body is in flight.
-        if self.command=='POST' and not getattr(self,'_post_body_read',False) and not self.headers.get('Transfer-Encoding'):
+        if self.command=='POST' and hasattr(self,'headers') and not getattr(self,'_post_body_read',False) and not self.headers.get_all('Transfer-Encoding',[]):
             lengths=self.headers.get_all('Content-Length',[])
             if len(lengths)==1 and re.fullmatch(r'[0-9]{1,5}',lengths[0]) and int(lengths[0])<=65536:
                 timeout=self.connection.gettimeout()
@@ -4296,6 +4729,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         peer = self.client_address[0]
         delay = login_delay(peer)
         if delay:
+            panel_event('throttled')
             self.send_response(429)
             self.send_header('Retry-After', str(delay))
             self.end_headers()
@@ -4331,7 +4765,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def send_login(self, error='', status=200):
         self._csp_nonce = secrets.token_urlsafe(18)
         token = secrets.token_urlsafe(32)
-        body = login_page(token, self._csp_nonce, error).encode('utf-8')
+        page=login_page(token,self._csp_nonce,error)
+        page=page.replace('name="username" autocomplete="username"','name="panel_login" autocomplete="section-tt-admin username"')
+        page=page.replace('name="password" type="password" autocomplete="current-password"','name="panel_password" type="password" autocomplete="section-tt-admin current-password"')
+        body = page.encode('utf-8')
         self.send_response(status)
         self.set_cookie('login', token, 600)
         self.send_header('Content-Type','text/html; charset=utf-8')
@@ -4340,7 +4777,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def handle_login(self):
         delay = login_delay(self.client_address[0])
-        if delay: self.send_login('Слишком много попыток. Подождите минуту.', 429); return
+        if delay:
+            panel_event('throttled'); self.send_login('Слишком много попыток. Подождите минуту.',429); return
         origin = self.headers.get('Origin')
         expected = ('https://' if isinstance(self.connection, ssl.SSLSocket) else 'http://') + self.headers.get('Host','')
         if origin and origin != expected:
@@ -4393,7 +4831,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def form(self):
-        if self.headers.get('Transfer-Encoding') or len(self.headers.get_all('Content-Length', [])) != 1:
+        if self.headers.get_all('Transfer-Encoding', []) or len(self.headers.get_all('Content-Length', [])) != 1:
             raise ValueError('Ambiguous request framing')
         if self.headers.get_content_type() != 'application/x-www-form-urlencoded':
             raise ValueError('Expected a URL-encoded form')
@@ -4405,7 +4843,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if len(body) != length: raise ValueError('Incomplete request body')
         parsed = urllib.parse.parse_qs(body.decode('utf-8'),keep_blank_values=True,max_num_fields=80)
         if any(len(v) != 1 for v in parsed.values()): raise ValueError('Duplicate form fields')
-        return {k:v[0] for k,v in parsed.items()}
+        values = {k:v[0] for k,v in parsed.items()}
+        for source,target in (('vpn_client_name','username'),('panel_login','username'),('panel_password','password')):
+            if source in values:
+                if target in values: raise ValueError('Ambiguous identity fields')
+                values[target] = values.pop(source)
+        return values
 
     def redirect(self, message):
         if 'application/json' in self.headers.get('Accept', ''):
@@ -4443,6 +4886,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(200); self.end_headers(); self.wfile.write(b'ok\n'); return
         if not self.authenticated():
             return
+        if self.path in ('/api/server-health','/api/panel-protection'):
+            self.send_json(health_snapshot() if self.path=='/api/server-health' else scanner_snapshot()); return
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in (f'/assets/{ASSET_VERSION}.css', f'/assets/{ASSET_VERSION}.js'):
             self._asset_response = True
@@ -4588,6 +5033,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             read_only |= {'diagnostics-stack','diagnostics-client','diagnostics-egress','diagnostics-warp','routing-current'}
             read_only |= {'ufw-applications','ufw-logs','ufw-preview','f2b-status','f2b-test','f2b-logs','f2b-jail-status'}
             read_only.add('torrent-status')
+            read_only |= {'health-status','health-check','scanner-status'}
             try:
                 f['_peer'] = self.client_address[0]
                 result = admin_operation(f.get('action', ''), f)
@@ -4685,7 +5131,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 raise ValueError('Для удаления всех правил введите RESET.')
             with admin_lock():
                 if strict_protection_locked():raise ValueError('Сначала отключите строгую TLS/ClientHello-защиту через раздел безопасности.')
-                apply_endpoint_file(TT_DIR / 'rules.toml', '# Empty rules file\n')
+                apply_endpoint_file(managed_rules_path(), '# Empty rules file\n')
             self.redirect('Правила сброшены.'); return
         self.send_error(404)
 
@@ -4696,23 +5142,42 @@ class PanelServer(http.server.ThreadingHTTPServer):
 
     def __init__(self, *args, **kwargs):
         self.slots = threading.BoundedSemaphore(16)
+        self.peers_lock = threading.Lock()
+        self.peers = {}
         super().__init__(*args, **kwargs)
 
     def process_request(self, request, client_address):
+        peer = client_address[0]
+        with self.peers_lock:
+            if self.peers.get(peer, 0) >= 4:
+                panel_event('throttled')
+                self.shutdown_request(request)
+                return
+            self.peers[peer] = self.peers.get(peer, 0) + 1
         if not self.slots.acquire(blocking=False):
+            self.release_peer(peer)
+            panel_event('throttled')
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
             self.slots.release()
+            self.release_peer(peer)
             raise
+
+    def release_peer(self, peer):
+        with self.peers_lock:
+            count = self.peers.get(peer, 1) - 1
+            if count: self.peers[peer] = count
+            else: self.peers.pop(peer, None)
 
     def process_request_thread(self, request, client_address):
         try:
             super().process_request_thread(request, client_address)
         finally:
             self.slots.release()
+            self.release_peer(client_address[0])
 
 
 def main():
@@ -4730,6 +5195,7 @@ def main():
     threading.Thread(target=release_watcher, name='release-watcher', daemon=True).start()
     threading.Thread(target=security_watcher, name='security-watcher', daemon=True).start()
     threading.Thread(target=usage_watcher, name='usage-watcher', daemon=True).start()
+    threading.Thread(target=health_watcher,name='health-watcher',daemon=True).start()
     server.serve_forever()
 
 

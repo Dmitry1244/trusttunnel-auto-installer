@@ -1,1 +1,6 @@
 /ANTIDPI_RESEARCH.md
+/tools/private-*
+/tools/ssh-askpass*
+/tools/qa-*/
+/tools/*.png
+**/__pycache__/

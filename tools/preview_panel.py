@@ -26,7 +26,7 @@ fixture_clients = [dict(username=f'client{i:02}', password='synthetic-password',
 panel.client_inventory = lambda: [dict(c) for c in fixture_clients]
 panel.load_clients = lambda: [c for c in panel.client_inventory() if c['enabled']]
 panel.guard_state = lambda: {'policies':{'client01':{'source_watch':{'enabled':True,'minutes':60,'threshold':4,'ipv6_prefix':64}}}}
-panel.security_snapshot = lambda: dict(checks=[dict(title=title, state=state, detail=detail) for title,state,detail in [('Сетевой экран','ok','Status: active'),('Защита SSH','ok','SSH jail работает'),('Вход по SSH','warn','Пароль: yes; root: yes. Базовые настройки без учёта Match-блоков.'),('Доступ к панели','ok','Публичный HTTPS'),('Приватные файлы','ok','Файлы учётных данных и ключа доступны только владельцу'),('Сертификат VPN','ok','Действителен ещё 58 дней'),('Перезагрузка ОС','ok','Не требуется')]])
+panel.security_snapshot = lambda: dict(checks=[dict(title=title, state=state, detail=detail) for title,state,detail in [('Сетевой экран','ok','Status: active'),('Политика входящих соединений','warn','Проверьте default incoming и правила.'),('Защита SSH','ok','SSH jail работает'),('Вход по SSH','warn','Пароль: yes; root: yes. Базовые настройки без учёта Match-блоков.'),('Доступ к панели','ok','Публичный HTTPS'),('Приватные файлы','ok','Файлы учётных данных и ключа доступны только владельцу'),('Сертификат VPN','ok','Действителен ещё 58 дней'),('Перезагрузка ОС','ok','Не требуется')]])
 def synthetic_link(name, protocol='http2', kind='static'):
     import base64
     fields = [(0,b'\x01'),(1,b'vpn.example.test'),(2,b'vpn.example.test:8443'),(5,name.encode()),(6,b'synthetic-password'),(9,b'\x01' if protocol == 'http2' else b'\x02')]
@@ -34,7 +34,7 @@ def synthetic_link(name, protocol='http2', kind='static'):
     return 'tt://?' + base64.urlsafe_b64encode(data).rstrip(b'=').decode()
 panel.deeplink = synthetic_link
 panel.endpoint_capabilities = lambda: {'subscription':False, 'auth_key':False, 'metrics':True}
-panel.service_snapshot = lambda: {'trusttunnel':'active', 'warp-wireproxy':'active', 'warp-masque':'inactive', 'trusttunnel-panel':'active', 'fail2ban':'active'}
+panel.service_snapshot = lambda: {'trusttunnel':'active', 'warp-interface':'active', 'warp-wireproxy':'inactive', 'warp-masque':'inactive', 'trusttunnel-panel':'active', 'fail2ban':'active'}
 panel.panel_settings = lambda: {'DNS_UPSTREAMS': '1.1.1.1', 'CLIENT_ANTI_DPI': '0', 'TLS_PROFILE': 'chrome', 'POST_QUANTUM': '0'}
 panel.PANEL_USER = 'preview'
 panel.PANEL_PASSWORD = 'synthetic-preview-password'
@@ -45,9 +45,14 @@ original_metrics = panel.client_metrics
 def watched_metrics():
     data = original_metrics()
     for item in data['clients']:
+        item['last_observed_ip']='198.51.100.27'
+        item['observed_ip']='192.0.2.7' if item['online'] else ''
+        item['active_ip_count']=None if item['online'] else 0
         item['sharing'] = dict(enabled=item['username']=='client01', alert=item['username']=='client01', observed_networks=5, minutes=60, last_sample=panel.time.time(), enforcement=False)
     return data
 panel.client_metrics = watched_metrics
+panel.health_snapshot = lambda: dict(state='ok',stale=False,checked_at=panel.time.time(),checks=[dict(title='TrustTunnel',state='ok',detail='Служба работает'),dict(title='Память',state='ok',detail='25%')],history=[dict(day=int(panel.time.time()//86400)*86400-i*86400,samples=0 if i>8 else 24,ok=0 if i>8 else 24,warn=0,errors=0) for i in range(29,-1,-1)],scope='Синтетический стенд: не проверяет VPN-путь.',traffic_history=[])
+panel.scanner_snapshot = lambda: dict(counts=dict(failures=3,rejected=5,throttled=1),hourly=[],scope='Только HTTP-панель; не все порты VPS.',outbound_scans=None,checked_at=panel.time.time())
 
 
 class Preview(panel.Handler):
@@ -58,7 +63,7 @@ class Preview(panel.Handler):
             action = data.get('action',[''])[0]
             if action == 'client-note':
                 for item in fixture_clients:
-                    if item['username'] == data.get('username',[''])[0]: item['note'] = data.get('note',[''])[0]
+                    if item['username'] == data.get('vpn_client_name',data.get('username',['']))[0]: item['note'] = data.get('note',[''])[0]
             self.send_json({'ok':True,'output':'Тестовый отчёт: изменений на сервере нет.','refresh':action.startswith('client-')})
         elif self.path in ('/login','/logout'): super().do_POST()
         else: self.send_error(405)

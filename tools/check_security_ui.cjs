@@ -46,7 +46,7 @@ const assert = require('node:assert/strict');
       await settings.locator('..').locator('summary').click();
       await settings.locator('[name="jail"]').selectOption('nginx-http-auth');
       await settings.locator('[name="retry"]').fill('7');
-      await settings.getByRole('button', {name: 'Сохранить параметры'}).click();
+      await settings.getByRole('button', {name: 'Сохранить параметры', exact: true}).click();
       await page.locator('#action-confirm[open]').waitFor();
       await page.locator('#confirm-accept').click();
       await page.locator('#operation-result[open]').waitFor();
