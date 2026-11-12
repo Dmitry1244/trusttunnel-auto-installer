@@ -34,7 +34,8 @@ def main():
                          for unit in ('trusttunnel','ssh','warp-interface','fail2ban')}
     before=hashes(); invocations=epochs()
     tests=['test_admin','test_client_protection','test_sharing_controls','test_firewall_fail2ban',
-           'test_torrent_filter','test_panel_security_http','test_activation_http','test_health_metrics','test_network_compatibility']
+           'test_torrent_filter','test_panel_security_http','test_activation_http','test_health_metrics','test_network_compatibility',
+           'test_firewall_hardening','test_panel_login_protection','test_panel_login_integration']
     env=dict(os.environ,TT_PANEL_SOURCE=str(root/'trusttunnel-panel.py'),TT_INSTALLER_SOURCE=str(root/'install-trusttunnel-warp.sh'))
     subprocess.run([sys.executable,'-m','unittest',*tests],cwd=root/'tools',env=env,check=True,timeout=180)
     subprocess.run([sys.executable,str(root/'tools/test_security_review_20261112.py')],env=env,check=True,timeout=30)
@@ -43,7 +44,7 @@ def main():
     p.USAGE_DB=root/'candidate-synthetic-usage.sqlite3'
     operation=p.admin_operation
     def readonly(action,values):
-        if action not in ('monitor','security-audit','health-status','health-check','scanner-status'):
+        if action not in ('monitor','security-audit','health-status','health-check','scanner-status','login-protection-status'):
             raise ValueError('Read-only candidate: mutation refused')
         return operation(action,values)
     p.admin_operation=readonly
@@ -79,7 +80,7 @@ def main():
             assert "'unsafe-inline'" not in headers['Content-Security-Policy']
             if view=='clients':assert 'name="vpn_client_name"' in page
         p.health_tick()
-        for path in ('/api/clients-metrics','/api/server-health','/api/panel-protection'):
+        for path in ('/api/clients-metrics','/api/server-health','/api/panel-protection','/api/firewall-plan'):
             assert request(path,authenticated=False)[0]==401
             status,_,body=request(path);assert status==200 and isinstance(json.loads(body),dict)
         status,_,body=request('/api/clients-metrics')

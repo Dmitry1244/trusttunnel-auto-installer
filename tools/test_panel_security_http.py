@@ -7,6 +7,7 @@ import re
 import threading
 import unittest
 import urllib.parse
+from contextlib import nullcontext
 from unittest.mock import patch
 
 from test_firewall_fail2ban import p
@@ -15,6 +16,7 @@ from test_firewall_fail2ban import p
 class PanelHTTPAudit(unittest.TestCase):
     def setUp(self):
         self.patches=[patch.object(p,'PANEL_USER','audit'),patch.object(p,'PANEL_PASSWORD','synthetic-audit-password'),
+                      patch.object(p,'admin_lock',nullcontext),
                       patch.object(p,'admin_operation',return_value='safe result'),patch.object(p,'html_page',return_value='<html>synthetic</html>')]
         for item in self.patches: item.start()
         class Quiet(p.Handler):
@@ -44,8 +46,20 @@ class PanelHTTPAudit(unittest.TestCase):
         return self.request('/manage',urllib.parse.urlencode(values),**kwargs)
 
     def test_private_routes_require_authentication(self):
-        for path in ('/','/api/client-link?username=alice','/api/clients-metrics','/api/monitor','/backup/latest.zip','/client/alice/http2.toml','/qr-link/alice.png'):
+        for path in ('/','/api/client-link?username=alice','/api/clients-metrics','/api/monitor','/api/firewall-plan','/backup/latest.zip','/client/alice/http2.toml','/qr-link/alice.png'):
             with self.subTest(path=path): self.assertEqual(self.request(path,authenticated=False)[0],401)
+        p.admin_operation.assert_not_called()
+
+    def test_firewall_plan_is_authenticated_readonly_and_rejects_duplicate_query(self):
+        plan=dict(fingerprint='a'*64,blockers=[],allowed=['8443/tcp'],kept=[],removed=[],scope='synthetic')
+        with patch.object(p,'firewall_hardening_plan',return_value=plan) as inspect:
+            status,_,body=self.request('/api/firewall-plan?extra_ports=80%2Ftcp')
+            self.assertEqual(status,200)
+            self.assertEqual(json.loads(body)['fingerprint'],'a'*64)
+            inspect.assert_called_once_with({'extra_ports':'80/tcp'})
+            inspect.reset_mock()
+            self.assertEqual(self.request('/api/firewall-plan?extra_ports=80%2Ftcp&extra_ports=22%2Ftcp')[0],400)
+            inspect.assert_not_called()
         p.admin_operation.assert_not_called()
 
     def test_cross_origin_and_missing_csrf_do_not_execute(self):

@@ -6,6 +6,7 @@ import sys
 import os
 from pathlib import Path
 import urllib.parse
+from contextlib import nullcontext
 sys.path.insert(0, str(Path(__file__).parent / 'qa-deps'))
 if os.environ.get('TT_UI_DEPS'): sys.path.insert(0,os.environ['TT_UI_DEPS'])
 import qrcode
@@ -17,8 +18,10 @@ panel.cert_mode = lambda: 'letsencrypt'
 panel.endpoint_version = lambda: 'TrustTunnel test fixture'
 panel.client_tls_profile = lambda: 'chrome'
 panel.jail_settings = lambda: {'maxretry':'5','findtime':'600','bantime':'3600'}
-panel.firewall_snapshot = lambda: dict(available=True,active=True,verbose='Status: active\nDefault: deny (incoming), allow (outgoing)',added='ufw allow 49222/tcp',version='synthetic-version',rules=[dict(number=i+1,text=text) for i,text in enumerate(['49222/tcp  ALLOW IN  Anywhere','8443/tcp  ALLOW IN  Anywhere','8443/udp  ALLOW IN  Anywhere','8088/tcp  ALLOW IN  Anywhere','9000/tcp  ALLOW IN  192.0.2.0/24'])])
+panel.firewall_snapshot = lambda: dict(available=True,active=True,verbose='Status: active\nDefault: deny (incoming), allow (outgoing)',added='ufw allow 49222/tcp\nufw allow 8443/tcp\nufw allow 8443/udp\nufw allow 8088/tcp\nufw allow from 192.0.2.0/24 to any port 9000 proto tcp',version='synthetic-version',rules=[dict(number=i+1,text=text) for i,text in enumerate(['49222/tcp  ALLOW IN  Anywhere','8443/tcp  ALLOW IN  Anywhere','8443/udp  ALLOW IN  Anywhere','8088/tcp  ALLOW IN  Anywhere','9000/tcp  ALLOW IN  192.0.2.0/24'])])
 panel.firewall_pending = lambda: None
+panel.admin_lock = nullcontext
+panel.hardening_required_ports = lambda: {(49222,'tcp'),(8443,'tcp'),(8443,'udp'),(8088,'tcp')}
 panel.fail2ban_snapshot = lambda: dict(available=True,active=['sshd','nginx-http-auth'],configured=['sshd','nginx-http-auth'],status='2 jails active',service='active')
 panel.forwarder_label = lambda: 'WARP · WireGuard интерфейс'
 panel.current_warp_backend = lambda: 'wg-interface'
@@ -26,7 +29,8 @@ fixture_clients = [dict(username=f'client{i:02}', password='synthetic-password',
 panel.client_inventory = lambda: [dict(c) for c in fixture_clients]
 panel.load_clients = lambda: [c for c in panel.client_inventory() if c['enabled']]
 panel.guard_state = lambda: {'policies':{'client01':{'source_watch':{'enabled':True,'minutes':60,'threshold':4,'ipv6_prefix':64}}}}
-panel.security_snapshot = lambda: dict(checks=[dict(title=title, state=state, detail=detail) for title,state,detail in [('Сетевой экран','ok','Status: active'),('Политика входящих соединений','warn','Проверьте default incoming и правила.'),('Защита SSH','ok','SSH jail работает'),('Вход по SSH','warn','Пароль: yes; root: yes. Базовые настройки без учёта Match-блоков.'),('Доступ к панели','ok','Публичный HTTPS'),('Приватные файлы','ok','Файлы учётных данных и ключа доступны только владельцу'),('Сертификат VPN','ok','Действителен ещё 58 дней'),('Перезагрузка ОС','ok','Не требуется')]])
+panel.security_snapshot = lambda: dict(checks=[dict(title=title, state=state, detail=detail) for title,state,detail in [('Сетевой экран','ok','Status: active'),('Fail2ban','ok','Работает, активный jail: sshd'),('Защита входа в панель','info','Отдельный jail выключен'),('Зондирование и DPI провайдера','info','Невидимость для провайдера не подтверждена'),('Политика входящих соединений','warn','Проверьте default incoming и правила.'),('Защита SSH','ok','SSH jail работает'),('Вход по SSH','warn','Пароль: yes; root: yes. Базовые настройки без учёта Match-блоков.'),('Доступ к панели','ok','Публичный HTTPS'),('Приватные файлы','ok','Файлы учётных данных и ключа доступны только владельцу'),('Сертификат VPN','ok','Действителен ещё 58 дней'),('Перезагрузка ОС','ok','Не требуется')]])
+panel.panel_login_protection_status = lambda: dict(jail='trusttunnel-panel-login',enabled=False,configured_enabled=False,active=False,available=True,state='off',port=None,errors=[],recidive_active=False,port_change_blocked=False)
 def synthetic_link(name, protocol='http2', kind='static'):
     import base64
     fields = [(0,b'\x01'),(1,b'vpn.example.test'),(2,b'vpn.example.test:8443'),(5,name.encode()),(6,b'synthetic-password'),(9,b'\x01' if protocol == 'http2' else b'\x02')]

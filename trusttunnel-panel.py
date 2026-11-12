@@ -32,6 +32,7 @@ import socket
 import configparser
 import io
 import shlex
+import stat
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -45,7 +46,7 @@ PANEL_CERT = os.environ.get('PANEL_CERT', '/opt/trusttunnel/certs/cert.pem')
 PANEL_KEY = os.environ.get('PANEL_KEY', '/opt/trusttunnel/certs/key.pem')
 DEEPLINK_CACHE = {}
 DEEPLINK_CACHE_TTL = 300
-ADMIN_VERSION = '2026.11.12'
+ADMIN_VERSION = '2026.11.12.1'
 MASQUE_ADDR = '127.0.0.1:40002'
 MASQUE_DIR = Path('/opt/warp-masque')
 MASQUE_VERSION = 'v4.2.1'
@@ -71,6 +72,7 @@ CPU_SAMPLE = None
 IGNORE_FILE = Path('/etc/fail2ban/jail.d/zz-trusttunnel-ignore.local')
 UFW_DIR = Path('/etc/ufw')
 UFW_DEFAULTS = Path('/etc/default/ufw')
+DOCKER_SOCKET = Path('/var/run/docker.sock')
 FIREWALL_PENDING = Path('/var/lib/trusttunnel-panel/firewall-pending.json')
 FAIL2BAN_DIR = Path('/etc/fail2ban')
 FAIL2BAN_OVERRIDE = FAIL2BAN_DIR / 'jail.d/zzzz-trusttunnel-panel.local'
@@ -145,6 +147,19 @@ def login_delay(peer, failed=False, success=False):
             count += 1
             LOGIN_FAILURES[peer] = (count, until)
         return max(1, int(until - now)) if count >= 5 else 0
+
+
+def panel_auth_failure(peer, port):
+    # Journal identity comes only from the accepted socket, never HTTP fields.
+    try:
+        if '%' in str(peer): return
+        address = ipaddress.ip_address(peer)
+        address = getattr(address, 'ipv4_mapped', None) or address
+        if not str(port).isdecimal() or not 1 <= int(port) <= 65535: return
+        sys.stderr.write(f'TT_PANEL_AUTH_FAILURE peer={address} port={int(port)}\n')
+        sys.stderr.flush()
+    except (ValueError, OSError):
+        pass
 
 
 def run(cmd, timeout=40, input_text=None, env=None, cwd=None):
@@ -441,6 +456,14 @@ def client_operation(action, values):
 
 
 def admin_operation(action, values):
+    if action == 'login-protection-access-check':
+        if panel_login_protection_status()['port_change_blocked']:
+            raise ValueError('Сначала отключите отдельный Fail2ban-jail панели и проверьте его состояние; затем меняйте порт или режим доступа.')
+        return 'Защита панели не препятствует смене порта или режима доступа.'
+    if action.startswith('login-protection-'):
+        result = panel_login_protection(action[len('login-protection-'):], values)
+        with CACHE_LOCK: SNAPSHOT_CACHE.clear()
+        return panel_login_protection_report(result)
     if action in ('health-status','health-check','scanner-status'):
         if action == 'health-check': health_tick()
         return json.dumps(scanner_snapshot() if action == 'scanner-status' else health_snapshot(),ensure_ascii=False,indent=2)
@@ -2341,9 +2364,16 @@ def security_snapshot():
         checks.append(dict(title=title, state=state, detail=detail))
     rc, ufw = run(['ufw', 'status'], timeout=5)
     check('Сетевой экран', 'ok' if rc == 0 and 'Status: active' in ufw else 'warn', ufw.splitlines()[0] if ufw else 'UFW недоступен')
+    f2b=fail2ban_snapshot()
+    f2b_ready=f2b.get('available') and f2b.get('service')=='active' and bool(f2b.get('active'))
+    check('Fail2ban','ok' if f2b_ready else 'warn',
+          'Служба: '+str(f2b.get('service','неизвестно'))+'. Активные защиты: '+(', '.join(f2b.get('active',[])) or 'нет подтверждённых')+'. Управление отдельными защитами находится ниже.')
     rc, jail = run(['fail2ban-client', 'status', 'sshd'], timeout=5)
     banned = re.search(r'Currently banned:\s*(\d+)', jail)
     check('Защита SSH', 'ok' if rc == 0 else 'warn', ('SSH jail работает' + (' · заблокировано IP: ' + banned[1] if banned else '')) if rc == 0 else 'SSH jail недоступен')
+    login = panel_login_protection_status()
+    check('Защита входа в панель', 'ok' if login['active'] is True and not login['errors'] else 'warn' if login['enabled'] else 'info',
+          ('Отдельный Fail2ban-jail работает на TCP '+str(login['port']) if login['active'] is True else 'Отдельный jail не работает; встроенное ограничение попыток входа остаётся')+'. Настройка находится ниже. Это не защита от DPI.')
     rc, ssh = run(['sshd', '-T'], timeout=5)
     ssh_cfg = dict(line.split(' ', 1) for line in ssh.splitlines() if ' ' in line) if rc == 0 else {}
     password = ssh_cfg.get('passwordauthentication', 'неизвестно')
@@ -2382,6 +2412,11 @@ def security_snapshot():
     unsafe = sum(1 for p in extra if p.exists() and (p.is_symlink() or p.stat().st_mode & 0o077 or p.stat().st_uid != 0))
     check('Профили и учёт', 'warn' if unsafe else 'ok', 'Файлов с небезопасными правами/владельцем/ссылками: '+str(unsafe)+'. Содержимое и секреты не включаются в отчёт.')
     integrity, integrity_text = protection_integrity()
+    state = protection_state()
+    check('Зондирование и DPI провайдера', 'info',
+          'Служебные HTTP-ответы: '+('изменены нашим режимом' if state.get('http_backup') is not None else 'штатные')+
+          '. Строгая проверка ClientHello: '+('включена' if state.get('enabled') or state.get('tls_enabled') else 'не включена')+
+          '. Невидимость для провайдера не подтверждена: IP, порт и признаки трафика остаются видимыми. TLS-auth требует совместимых клиентов; строгий QUIC пока не квалифицирован.')
     check('TLS-аутентификация VPN', 'info' if integrity else 'warn', integrity_text+' App v1.3 поддерживает ключевую TLS-аутентификацию; нужен совместимый endpoint. Не защищает от копирования ключа.')
     check('Контроль передачи доступа', 'warn' if GUARD_STATUS.get('error') else 'info', GUARD_STATUS.get('error') or 'Квоты, сроки, одноразовая выдача и наблюдение сетей управляются по клиентам. Наблюдавшиеся сети не равны одновременным IP. Строгий IP admission и ключ устройства пока не реализованы; автоматического IP-бана нет.')
     rc, verbose = run(['ufw','status','verbose'],timeout=5)
@@ -3151,6 +3186,13 @@ def change_endpoint_port(new_port):
 
 
 def update_panel_access(mode, port):
+    with admin_lock():
+        if panel_login_protection_status()['port_change_blocked']:
+            raise ValueError('Сначала отключите отдельную защиту входа в панель в Fail2ban и проверьте её состояние. После смены режима или порта включите её заново.')
+        return _update_panel_access_locked(mode, port)
+
+
+def _update_panel_access_locked(mode, port):
     require_no_firewall_pending()
     if not validate_port(port) or mode not in ('https', 'localhost'):
         raise ValueError('Некорректный режим или порт панели.')
@@ -3382,7 +3424,12 @@ def firewall_transaction(commands, values):
         FIREWALL_PENDING.unlink(missing_ok=True)
         raise RuntimeError('Не удалось запустить независимый таймер отката; UFW не изменён.') from None
     try:
-        output = '\n'.join(checked_run(cmd) for cmd in commands)
+        output=[]
+        for cmd in commands:
+            remaining=pending['deadline']-time.time()-60
+            if remaining<=0: raise RuntimeError('Применение UFW заняло слишком долго; выполняется откат.')
+            output.append(checked_run(cmd,timeout=min(40,remaining)))
+        output='\n'.join(output)
     except Exception as exc:
         try: firewall_rollback(token)
         except Exception: raise RuntimeError('Ошибка UFW; автоматический откат ещё ожидается. Проверьте доступ через консоль хостинга.') from exc
@@ -3468,7 +3515,102 @@ def firewall_baseline_commands():
             for p,proto in protected_ports() if not any(lo <= p <= hi and (not pr or pr == proto) for lo,hi,pr in permitted)]
 
 
+def hardening_required_ports():
+    ports=set(ssh_listener_ports()) | {(int(endpoint_port()),'tcp')}
+    if quic_enabled(): ports.add((int(endpoint_port()),'udp'))
+    env=current_panel_env()
+    if env.get('PANEL_BIND','127.0.0.1') not in ('127.0.0.1','::1','localhost'):
+        if not validate_port(env.get('PANEL_PORT','')): raise ValueError('Не определён публичный порт панели.')
+        ports.add((int(env['PANEL_PORT']),'tcp'))
+    return ports
+
+
+def hardening_saved_permit(line):
+    tokens=shlex.split(line)
+    if len(tokens)<2 or tokens[0]!='ufw': raise ValueError('Неизвестная строка сохранённых правил.')
+    if tokens[1] in ('deny','reject'): return None
+    if tokens[1] not in ('allow','limit'): raise ValueError('Маршрутизируемое или неизвестное правило требует ручной проверки.')
+    body=tokens[2:]
+    if 'comment' in body:
+        index=body.index('comment')
+        if index!=len(body)-2: raise ValueError('Не удалось разобрать комментарий правила.')
+        body=body[:index]
+    if body and body[0]=='out': return None
+    if body and body[0]=='in': body=body[1:]
+    if not body: raise ValueError('Широкое разрешение без порта требует ручной проверки.')
+    simple=re.fullmatch(r'([0-9]{1,5})(?:/(tcp|udp))?',body[0])
+    if simple:
+        if len(body)!=1: raise ValueError('Составное разрешение требует ручной проверки.')
+        port,proto=simple[1],simple[2]
+    else:
+        fields={}
+        for index in range(0,len(body),2):
+            key=body[index]
+            if index+1>=len(body) or key not in ('proto','from','to','port','on') or key in fields:
+                raise ValueError('Профиль приложения, диапазон или сложное правило требует ручной проверки.')
+            fields[key]=body[index+1]
+        port,proto=fields.get('port',''),fields.get('proto')
+        for key in ('from','to'):
+            if fields.get(key,'any')!='any': ipaddress.ip_network(fields[key],strict=False)
+        if 'on' in fields and not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,14}',fields['on']):
+            raise ValueError('Неизвестный интерфейс правила.')
+    if not validate_port(port) or proto not in (None,'tcp','udp'):
+        raise ValueError('Разрешены только отдельные TCP/UDP-порты; диапазоны проверяются вручную.')
+    return dict(ports={(int(port),value) for value in ([proto] if proto else ['tcp','udp'])},args=tokens[1:],text=line)
+
+
+def firewall_hardening_plan(values):
+    extra=values.get('extra_ports','').strip()
+    if len(extra)>512: raise ValueError('Слишком длинный список дополнительных портов.')
+    parts=[value for value in re.split(r'[\s,;]+',extra) if value]
+    if len(parts)>16: raise ValueError('Укажите не более 16 дополнительных портов.')
+    allowed=set(hardening_required_ports())
+    for part in parts:
+        match=re.fullmatch(r'([0-9]{1,5})/(tcp|udp)',part)
+        if not match or not validate_port(match[1]): raise ValueError('Дополнительные порты: например 80/tcp, 53/udp. Без диапазонов.')
+        allowed.add((int(match[1]),match[2]))
+    SNAPSHOT_CACHE.pop('firewall_snapshot',None)
+    snapshot=firewall_snapshot()
+    blockers=[];kept=[];removed=[];covered=set()
+    if not snapshot['available']: blockers.append('Не удалось полностью прочитать UFW.')
+    if firewall_pending(): blockers.append('Сначала подтвердите или откатите предыдущее изменение UFW.')
+    if DOCKER_SOCKET.exists(): blockers.append('Обнаружен Docker: опубликованные контейнерные порты требуют отдельной проверки, UFW может их не фильтровать.')
+    for line in snapshot['added'].splitlines():
+        line=line.strip()
+        if not line or line.startswith(('#','Added user rules','(None)')): continue
+        try: rule=hardening_saved_permit(line)
+        except ValueError as error:
+            blockers.append(str(error)+' '+line);continue
+        if rule is None: continue
+        overlap=rule['ports']&allowed
+        if overlap and overlap!=rule['ports']:
+            blockers.append('Правило объединяет нужный и невыбранный протокол; сначала разделите его: '+line)
+        elif overlap:kept.append(rule['text']);covered.update(rule['ports'])
+        else:removed.append(rule)
+    # Delete only reviewed exact permits; retained source restrictions are never widened.
+    commands=[['ufw','--force','delete',*rule['args']] for rule in removed]
+    commands += [['ufw','allow',f'{port}/{proto}','comment','TrustTunnel reviewed access'] for port,proto in sorted(allowed-covered)]
+    commands += [['ufw','default','deny','incoming'],['ufw','--force','enable']]
+    if len(commands)>32: blockers.append('Слишком много изменений для одного безопасного шага; сначала проверьте и сократите правила вручную.')
+    fingerprint=hashlib.sha256(json.dumps([snapshot['version'],sorted(allowed),blockers],ensure_ascii=False,sort_keys=True).encode()).hexdigest()
+    return dict(fingerprint=fingerprint,allowed=[f'{port}/{proto}' for port,proto in sorted(allowed)],
+                kept=kept,removed=[rule['text'] for rule in removed],commands=commands,blockers=blockers,
+                scope='Только входящие соединения UFW. Исходящие и маршруты не меняются. Это не доказательство фильтрации Docker, другого firewall или правил провайдера.')
+
+
+def firewall_hardening_report(plan):
+    return '\n'.join(['Разрешить: '+', '.join(plan['allowed']),
+                       'Сохранить существующие ограничения источников:']+plan['kept']+
+                      ['Удалить эти сохранённые разрешения:']+plan['removed']+
+                      ['Остальные входящие: запретить. UFW: включить.',plan['scope']]+
+                      (['Требуется ручная проверка:']+plan['blockers'] if plan['blockers'] else ['План готов. До применения правила не меняются.']))
+
+
 def firewall_operation(action, values):
+    if action=='hardening-plan': return firewall_hardening_report(firewall_hardening_plan(values))
+    if action=='hardening-json':
+        plan=firewall_hardening_plan(values)
+        return json.dumps(dict(fingerprint=plan['fingerprint'],blocked=bool(plan['blockers']),report=firewall_hardening_report(plan)),ensure_ascii=False)
     if action == 'snapshot':
         SNAPSHOT_CACHE.pop('firewall_snapshot',None)
         return json.dumps(firewall_snapshot(),ensure_ascii=False)
@@ -3497,7 +3639,13 @@ def firewall_operation(action, values):
     if action == 'install':
         require_no_firewall_pending()
         return checked_run(['apt-get','-o','Acquire::Retries=3','install','-y','--no-install-recommends','--no-upgrade','ufw'],timeout=180)
-    if action == 'rule': commands = [firewall_rule(values)]
+    if action=='hardening':
+        plan=firewall_hardening_plan(values)
+        if plan['blockers']: raise ValueError('Автоматическое применение отменено: '+'; '.join(plan['blockers']))
+        if not values.get('fingerprint') or not secrets.compare_digest(values['fingerprint'],plan['fingerprint']):
+            raise ValueError('Сначала получите новый план: правила или выбранные порты изменились.')
+        commands=plan['commands']
+    elif action == 'rule': commands = [firewall_rule(values)]
     elif action == 'source-block':
         network = ipaddress.ip_network(values.get('source',''),strict=False)
         if isinstance(network,ipaddress.IPv6Network) and network.prefixlen >= 96 and network.network_address.ipv4_mapped:
@@ -3540,6 +3688,299 @@ def fail2ban_snapshot():
             'service':service_status('fail2ban')}
 
 
+PANEL_LOGIN_JAIL = 'trusttunnel-panel-login'
+PANEL_LOGIN_MARKER = '# Managed by TrustTunnel panel login protection v1\n'
+PANEL_LOGIN_FAILREGEX = r'^TT_PANEL_AUTH_FAILURE peer=<HOST> port=[0-9]{1,5}$'
+PANEL_LOGIN_PREFREGEX = (r'^(?:(?:[^\s:]+[ \t]+)?[^\s:]+:[ \t]+)?'
+                       r'<F-CONTENT>TT_PANEL_AUTH_FAILURE peer=\S+ port=[0-9]{1,5}</F-CONTENT>$')
+
+
+def _panel_login_paths():
+    return (FAIL2BAN_DIR / 'filter.d/trusttunnel-panel.conf',
+            FAIL2BAN_DIR / 'jail.d/zzzz-trusttunnel-panel-login.local')
+
+
+def _panel_login_filter_text():
+    return (PANEL_LOGIN_MARKER + '[Definition]\n'
+            'prefregex = ' + PANEL_LOGIN_PREFREGEX + '\n'
+            'failregex = ' + PANEL_LOGIN_FAILREGEX + '\n'
+            'ignoreregex =\nmaxlines = 1\ndatepattern = {NONE}\n'
+            'journalmatch = _SYSTEMD_UNIT=trusttunnel-panel.service\n')
+
+
+def _panel_login_port(value):
+    value = str(value)
+    if not re.fullmatch(r'[0-9]{1,5}', value) or not 1 <= int(value) <= 65535:
+        raise ValueError('Invalid panel TCP port.')
+    return str(int(value))
+
+
+def _panel_login_jail_text(port, enabled):
+    port = _panel_login_port(port)
+    return (PANEL_LOGIN_MARKER + '[' + PANEL_LOGIN_JAIL + ']\n'
+            'enabled = ' + ('true' if enabled else 'false') + '\n'
+            'backend = systemd\nfilter = trusttunnel-panel\n'
+            'journalmatch = _SYSTEMD_UNIT=trusttunnel-panel.service\n'
+            'usedns = no\nignoreself = true\n'
+            'ignoreip = 127.0.0.0/8 ::1/128 ::ffff:127.0.0.0/104\n'
+            'port = ' + port + '\nprotocol = tcp\nchain = INPUT\n'
+            'banaction = iptables-multiport\n'
+            'action = iptables-multiport[name=' + PANEL_LOGIN_JAIL + ', port="' + port + '", protocol=tcp, chain=INPUT]\n'
+            'maxretry = 10\nfindtime = 600\nbantime = 600\n'
+            'bantime.increment = false\nbantime.rndtime = 0\nbantime.maxtime = 600\n')
+
+
+def _panel_login_check_path(path, directory=False):
+    if not path.is_absolute():
+        raise ValueError('Fail2ban paths must be absolute.')
+    for parent in reversed(path.parents):
+        if parent.is_symlink():
+            raise ValueError('Symlink in Fail2ban path; no changes made.')
+        if parent.exists():
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError('Fail2ban parent must be root-owned and not group/world writable.')
+    if path.is_symlink():
+        raise ValueError('Symlink in managed Fail2ban path; no changes made.')
+    if not path.exists():
+        return
+    info = path.lstat()
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(info.st_mode) or info.st_uid != 0:
+        raise ValueError('Managed Fail2ban path is not a root-owned regular file/directory.')
+    if directory:
+        if info.st_mode & 0o022:
+            raise ValueError('Managed Fail2ban directory is writable by other users.')
+    elif stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 65536 or info.st_nlink != 1:
+        raise ValueError('Managed Fail2ban files must be private 0600, bounded, single-link files.')
+
+
+def _panel_login_read_files():
+    paths = _panel_login_paths()
+    records = {}
+    override = FAIL2BAN_DIR / 'filter.d/trusttunnel-panel.local'
+    if override.exists() or override.is_symlink():
+        raise ValueError('Foreign filter .local override exists; review it before using this jail.')
+    for path in paths:
+        _panel_login_check_path(path)
+        text = read_text(path) if path.exists() else None
+        if text is not None and not text.startswith(PANEL_LOGIN_MARKER):
+            raise ValueError('Foreign Fail2ban file at a managed path; refusing overwrite.')
+        records[path] = text
+    filter_text, jail_text = (records[path] for path in paths)
+    if filter_text is not None and filter_text != _panel_login_filter_text():
+        raise ValueError('Managed filter differs from the known definition; review manually.')
+    configured = None
+    if jail_text is not None:
+        parser = configparser.ConfigParser(interpolation=None, strict=True)
+        try:
+            parser.read_string(jail_text)
+            if parser.defaults() or parser.sections() != [PANEL_LOGIN_JAIL]:
+                raise ValueError()
+            port = _panel_login_port(parser.get(PANEL_LOGIN_JAIL, 'port'))
+            enabled = parser.getboolean(PANEL_LOGIN_JAIL, 'enabled')
+            if jail_text != _panel_login_jail_text(port, enabled):
+                raise ValueError()
+            configured = dict(port=port, enabled=enabled)
+        except (configparser.Error, ValueError):
+            raise ValueError('Managed jail differs from the known definition; review manually.') from None
+    return records, configured
+
+
+def _panel_login_runtime():
+    snapshot = fail2ban_snapshot()
+    if not snapshot.get('available') and snapshot.get('service') in ('inactive', 'failed', 'not-found'):
+        return False, False, []
+    rc, output = run(['fail2ban-client', 'status'], timeout=5)
+    match = re.search(r'(?m)Jail list:[ \t]*([^\n]*)', output) if rc == 0 else None
+    if not match:
+        return None, False, []
+    names = [name.strip() for name in match[1].split(',') if name.strip()]
+    return PANEL_LOGIN_JAIL in names, True, names
+
+
+def panel_login_protection_status():
+    """Read-only. enabled is a conservative port-change interlock, not health."""
+    errors = []
+    configured = None
+    records = {}
+    try:
+        records, configured = _panel_login_read_files()
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+    try:
+        active, available, names = _panel_login_runtime()
+    except (OSError, RuntimeError, ValueError):
+        active, available, names = None, False, []
+    present = any(text is not None for text in records.values())
+    if active is None:
+        errors.append('Fail2ban runtime state is unknown; disable/verify before changing panel access.')
+    if configured and configured['enabled'] and records.get(_panel_login_paths()[0]) is None:
+        errors.append('Enabled jail has no managed filter.')
+    enabled = bool(errors or (configured and configured['enabled']) or active)
+    state = 'unknown' if errors else 'enabled' if enabled else 'prepared' if present else 'off'
+    return dict(jail=PANEL_LOGIN_JAIL, enabled=enabled, configured_enabled=bool(configured and configured['enabled']),
+                active=active, available=available, state=state,
+                port=configured['port'] if configured else None, errors=errors,
+                recidive_active='recidive' in names, port_change_blocked=enabled,
+                scope='Only this panel TCP port. Socket-peer failures only; no proxy headers or global bans.')
+
+
+def _panel_login_target(public):
+    env = current_panel_env()
+    port = _panel_login_port(env.get('PANEL_PORT', '8088'))
+    bind = str(env.get('PANEL_BIND', '127.0.0.1')).strip()
+    try:
+        loopback = bind == 'localhost' or ipaddress.ip_address(bind).is_loopback
+    except ValueError:
+        raise ValueError('Panel bind must be an IP address or localhost.') from None
+    if public and (env.get('PANEL_TLS') != '1' or loopback):
+        raise ValueError('Public login protection requires HTTPS, not localhost. With an SSH tunnel the socket peer is loopback; protect SSH separately.')
+    reserved = {int(endpoint_port())} | {int(value) for value, protocol in ssh_listener_ports() if protocol == 'tcp'}
+    if int(port) in reserved:
+        raise ValueError('Panel protection must not target an SSH or VPN TCP port.')
+    return port
+
+
+def _panel_login_filter_check(path):
+    """Jailless real CLI qualification on activation; all calls mocked in unit tests."""
+    cases = [('TT_PANEL_AUTH_FAILURE peer=198.51.100.23 port=8088', 1),
+             ('qa-host python3[42]: TT_PANEL_AUTH_FAILURE peer=2001:db8::23 port=8088', 1),
+             ('qa-host python3[42]: GET /TT_PANEL_AUTH_FAILURE peer=198.51.100.23 port=8088', 0),
+             ('TT_PANEL_AUTH_FAILURE peer=attacker.invalid port=8088', 0),
+             ('TT_PANEL_AUTH_FAILURE peer=198.51.100.23 port=8088 username=secret', 0)]
+    for line, expected in cases:
+        rc, output = run(['fail2ban-regex', '--usedns=no', '--datepattern={NONE}', line, str(path)], timeout=15)
+        summary = re.search(r'(?m)^Lines:\s*1 lines, 0 ignored, ([0-9]+) matched, ([0-9]+) missed\s*$', output)
+        if rc or not summary or (int(summary[1]), int(summary[2])) != (expected, 1 - expected):
+            raise RuntimeError('Synthetic fail2ban-regex qualification failed; jail not enabled.')
+
+
+def _panel_login_backup(records, action):
+    root = FAIL2BAN_DIR / '.trusttunnel-panel-login-backups'
+    _panel_login_check_path(root, directory=True)
+    if root.exists() and stat.S_IMODE(root.lstat().st_mode) != 0o700:
+        raise ValueError('Panel login backup directory must be private 0700.')
+    root.mkdir(mode=0o700, exist_ok=True)
+    path = root / (secrets.token_hex(16) + '.json')
+    if path.exists() or path.is_symlink():
+        raise ValueError('Backup collision; no configuration changed.')
+    atomic_write(path, json.dumps(dict(owner=PANEL_LOGIN_MARKER.strip(), action=action,
+                                      files={str(key): value for key, value in records.items()}), sort_keys=True), 0o600)
+    return path
+
+
+def _panel_login_restore(records):
+    for path in records:
+        _panel_login_check_path(path)
+        if path.exists() and not read_text(path).startswith(PANEL_LOGIN_MARKER):
+            raise RuntimeError('Rollback refused: managed path changed ownership/content.')
+    for path, text in records.items():
+        if text is None:
+            path.unlink(missing_ok=True)
+        else:
+            atomic_write(path, text, 0o600)
+
+
+def panel_login_protection(action, values):
+    """Explicit confirmed mutation, scoped to our two config files and one jail."""
+    if action == 'status':
+        return panel_login_protection_status()
+    if action not in ('prepare', 'enable', 'disable'):
+        raise ValueError('Unknown panel login protection operation.')
+    if values.get('confirm') != 'CONFIRMED':
+        raise ValueError('Confirm panel login protection with confirm=CONFIRMED.')
+    for key, expected in (('maxretry', '10'), ('findtime', '600'), ('bantime', '600')):
+        if key in values and str(values[key]) != expected:
+            raise ValueError('This isolated jail uses fixed maxretry=10/findtime=600/bantime=600.')
+    if any(key in values for key in ('port', 'protocol', 'banaction', 'backend', 'ignoreip', 'journalmatch')):
+        raise ValueError('Jail scope cannot be overridden by request arguments.')
+    if not hasattr(os, 'geteuid') or os.geteuid() != 0:
+        raise PermissionError('Root is required for panel login protection.')
+    with admin_lock():
+        filter_path, jail_path = _panel_login_paths()
+        backup_root = FAIL2BAN_DIR / '.trusttunnel-panel-login-backups'
+        for path in (FAIL2BAN_DIR, filter_path.parent, jail_path.parent, backup_root):
+            _panel_login_check_path(path, directory=True)
+        if not FAIL2BAN_DIR.exists():
+            raise ValueError('Install Fail2ban separately before preparing this jail.')
+        records, configured = _panel_login_read_files()
+        active, available, names = _panel_login_runtime()
+        if active and configured is None:
+            raise ValueError('A live jail with our name has no owned configuration; refusing mutation.')
+        if active is None:
+            raise RuntimeError('Fail2ban runtime is unknown; no configuration changed.')
+        if action == 'prepare' and (active or (configured and configured['enabled'])):
+            raise ValueError('Disable the existing panel login jail before preparing it again.')
+        if action == 'disable' and not active and not (configured and configured['enabled']):
+            return panel_login_protection_status()
+        port = configured['port'] if action == 'disable' else _panel_login_target(public=action == 'enable')
+        if action == 'enable':
+            if not available:
+                raise ValueError('Fail2ban must already be running; this feature never starts the whole service.')
+            if 'recidive' in names:
+                raise ValueError('Active recidive may escalate this jail into an all-port ban. Review that separate policy first; other jails were not changed.')
+            if active and configured and configured['port'] != port:
+                raise ValueError('Panel port changed while protection was active; disable protection first.')
+        if action == 'enable' and active and configured and configured['enabled']:
+            return panel_login_protection_status()
+        backup = _panel_login_backup(records, action)
+        touched_runtime = False
+        try:
+            if action != 'disable':
+                atomic_write(filter_path, _panel_login_filter_text(), 0o600)
+            atomic_write(jail_path, _panel_login_jail_text(port, action == 'enable'), 0o600)
+            checked_run(['fail2ban-client', '-t'])
+            if action != 'disable':
+                _panel_login_filter_check(filter_path)
+            if action == 'enable':
+                touched_runtime = True
+                checked_run(['fail2ban-client', 'reload', '--if-exists', PANEL_LOGIN_JAIL])
+            elif action == 'disable' and active:
+                touched_runtime = True
+                checked_run(['fail2ban-client', 'stop', PANEL_LOGIN_JAIL])
+            result = panel_login_protection_status()
+            if action == 'enable' and result['active'] is not True:
+                raise RuntimeError('Scoped jail activation was not confirmed.')
+            if action == 'disable' and result['active'] is not False:
+                raise RuntimeError('Scoped jail stop was not confirmed.')
+        except Exception as exc:
+            rollback_errors = []
+            try:
+                _panel_login_restore(records)
+            except (OSError, RuntimeError, ValueError):
+                rollback_errors.append('file rollback unconfirmed')
+            if touched_runtime:
+                command = (['fail2ban-client', 'reload', '--if-exists', PANEL_LOGIN_JAIL]
+                           if active and configured and configured['enabled'] else
+                           ['fail2ban-client', 'stop', PANEL_LOGIN_JAIL])
+                if run(command, timeout=15)[0]:
+                    rollback_errors.append('runtime rollback UNKNOWN')
+            detail = '; '.join(rollback_errors) or 'owned files restored; prior runtime requested'
+            audit_log('panel-login-protection-rollback', action + ': ' + detail)
+            raise RuntimeError('Panel login protection failed; ' + detail + '; private backup: ' + str(backup)) from exc
+        audit_log('panel-login-protection-' + action, 'TCP ' + port)
+        result['backup'] = str(backup)
+        result['message'] = ('Prepared, disabled by default.' if action == 'prepare' else
+                             'Only the panel HTTPS TCP port is protected.' if action == 'enable' else
+                             'Only our panel login jail was disabled; SSH/VPN jails were not changed.')
+        return result
+
+
+def panel_login_protection_report(data):
+    labels = {'off':'Не настроена', 'prepared':'Подготовлена, но выключена', 'enabled':'Включена в конфигурации', 'unknown':'Требуется ручная проверка'}
+    active = 'работает' if data['active'] is True else 'не работает' if data['active'] is False else 'неизвестно'
+    lines = ['Защита входа в панель: '+labels[data['state']], 'Jail: '+data['jail'],
+             'Состояние jail сейчас: '+active, 'Порт панели: '+(data['port'] or 'ещё не задан'),
+             '10 ошибок за 10 минут → блокировка IP на 10 минут, только TCP-порт панели.',
+             'SSH и VPN не блокируются этим jail. За общим NAT могут находиться несколько людей.',
+             'Через SSH-туннель или reverse proxy этот фильтр не определяет внешний IP. Заголовки прокси не принимаются.',
+             'Это защита от перебора пароля, не от DPI провайдера и не от всех сканеров.']
+    if data['errors']: lines += ['Проверка: '+value for value in data['errors']]
+    if data.get('backup'): lines.append('Приватная копия прежних файлов: '+data['backup'])
+    return '\n'.join(lines)
+
+
 def jail_name(values):
     jail = values.get('jail','sshd')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}',jail) or jail not in set(fail2ban_snapshot()['configured']+fail2ban_snapshot()['active']):
@@ -3548,6 +3989,8 @@ def jail_name(values):
 
 
 def save_jail_override(jail, updates):
+    if jail == PANEL_LOGIN_JAIL:
+        raise ValueError('Отдельный jail панели управляется в разделе «Защита входа в панель». Его область блокировки нельзя менять через общие настройки.')
     old = read_text(FAIL2BAN_OVERRIDE)
     config = configparser.ConfigParser(interpolation=None)
     if old:
@@ -3603,6 +4046,10 @@ def fail2ban_operation(action, values):
     if action == 'jail-status':
         return checked_run(['fail2ban-client','status',jail])+'\n\n'+'\n'.join(k+': '+checked_run(['fail2ban-client','get',jail,k]) for k in ('maxretry','findtime','bantime','ignoreip'))
     confirmed(values)
+    if jail == PANEL_LOGIN_JAIL and action not in ('ban','unban'):
+        raise ValueError('Для этого jail используйте отдельное управление защитой входа в панель. Здесь доступна только блокировка или разблокировка отдельного IP.')
+    if jail == 'recidive' and action == 'jail-enable' and panel_login_protection_status()['enabled']:
+        raise ValueError('Recidive может расширить бан панели на все порты. Сначала отключите отдельную защиту панели и проверьте политику эскалации.')
     if action in ('ban','unban'):
         address = normalized_ip(values.get('ip',''))
         if action == 'ban' and (address.is_loopback or address.is_unspecified or address.is_multicast or address == admin_peer(values)):
@@ -4005,6 +4452,8 @@ def network_security_console():
         if warning: body = '<input type="hidden" name="confirm" value="CONFIRMED">'+body
         return admin_form(action,body,view='security',confirm=warning)
     firewall = firewall_snapshot()
+    hardening = admin_form('ufw-hardening','<input type="hidden" name="confirm" value="CONFIRMED"><label>Дополнительно оставить открытыми<input name="extra_ports" id="hardening-extra" placeholder="Например: 80/tcp, 53/udp" maxlength="512" autocomplete="off"></label><input type="hidden" name="fingerprint" id="hardening-fingerprint"><button type="button" id="hardening-preview">Показать план</button><button class="primary" id="hardening-apply" disabled>Открыть нужные и закрыть остальные</button>',view='security',confirm='Применить только показанный план UFW: удалить перечисленные разрешения, сохранить ограничения нужных портов, запретить остальные входящие и включить UFW? Проверьте новую SSH-сессию, VPN и панель и подтвердите доступ за 120 секунд.')
+    hardening = '<details id="firewall-hardening"><summary>Защитить входящие порты одним действием</summary><p class="muted">SSH, VPN и публичная панель определяются автоматически. Укажите порты других нужных служб. Неизвестные профили и сложные правила требуют ручной проверки; весь firewall не сбрасывается. Порты Docker и firewall провайдера здесь не контролируются.</p>'+hardening+'<pre id="hardening-plan" role="status">Сначала получите план. До его подтверждения правила не меняются.</pre></details>'
     pending = firewall_pending()
     rollback = ''
     if pending:
@@ -4029,6 +4478,11 @@ def network_security_console():
     policy = form('ufw-default','<label>Направление<select name="direction"><option value="incoming">Входящие</option><option value="outgoing">Исходящие</option><option value="routed">Транзитные</option></select></label><label>Политика<select name="policy"><option>deny</option><option>reject</option><option>allow</option></select></label><button>Изменить политику</button>','Изменить политику по умолчанию? Исключения SSH / VPN / панели будут добавлены. Для исходящего и транзитного трафика допускается только allow, чтобы не нарушить WARP / DNS.')
     reports = form('ufw-applications','<button>Профили приложений</button>')+form('ufw-logs','<button>'+icon('Logs')+'События UFW</button>')
     data = fail2ban_snapshot()
+    login = panel_login_protection_status()
+    login_controls = form('login-protection-status','<button>Проверить защиту входа в панель</button>')
+    for action,label,warning in [('prepare','Подготовить без включения','Создать только наши файлы Fail2ban с выключенным jail? Другие защиты и firewall не меняются.'),('enable','Включить защиту входа','После 10 ошибок входа за 10 минут IP будет заблокирован на 10 минут только на TCP-порту панели. Сохраните SSH-доступ. За одним NAT могут находиться другие люди. Включить?'),('disable','Отключить защиту входа','Отключить только отдельный jail панели? Защита SSH, VPN и встроенный лимит попыток не меняются.')]:
+        login_controls += form('login-protection-'+action,'<button>'+label+'</button>',warning)
+    login_controls = '<details id="panel-login-protection"><summary>Защита входа в панель · Fail2ban</summary><p class="muted">Отдельная опция, по умолчанию выключена. Только прямой доступ по HTTPS: для SSH-туннеля или reverse proxy внешний адрес не определяется. 10 ошибок за 10 минут → бан IP на 10 минут, только на порту панели. Перед сменой порта отключите эту защиту. Активный recidive несовместим: он может расширить блокировку на все порты.</p><pre>'+html.escape(panel_login_protection_report(login))+'</pre><div class="inline-actions">'+login_controls+'</div></details>'
     options = ''.join('<option'+(' selected' if name == 'sshd' else '')+'>'+html.escape(name)+'</option>' for name in sorted(set(data['configured']+data['active'])))
     selector = '<label>Jail<select name="jail">'+options+'</select></label>'
     f2b_controls = form('f2b-status','<button>'+icon('RefreshCw')+'Состояние службы и jail</button>')
@@ -4042,8 +4496,8 @@ def network_security_console():
     bans = ''
     for action,label in [('ban','Заблокировать IP'),('unban','Разблокировать IP'),('ignore-add','Добавить постоянное исключение'),('ignore-remove','Удалить исключение')]:
         bans += form('f2b-'+action,selector+'<label>IP'+(' / CIDR' if action.startswith('ignore') else '')+'<input name="ip" required></label><button>'+label+'</button>','Изменить блокировку или исключение только выбранного jail? Текущий IP администратора и loopback защищены.')
-    return f'''<section class="surface" id="ufw-controls"><div class="section-heading"><h3>UFW · сетевой экран</h3><span class="badge {'active' if firewall['active'] else ''}">{'Включён' if firewall['active'] else 'Отключён / недоступен'}</span></div>{rollback}<div class="inline-actions">{controls}</div><details><summary>Текущая политика</summary><pre>{html.escape(firewall['verbose'])}</pre></details><div class="table-wrap"><table><thead><tr><th>№</th><th>Правило</th><th>Действие</th></tr></thead><tbody>{rows or '<tr><td colspan="3">Нет доступных правил</td></tr>'}</tbody></table></div><p class="hint">Удаление затрагивает одну строку, не всю пару IPv4 / IPv6. Правила SSH, VPN и панели защищены. Существующие широкие разрешения не отменяются добавлением адресного разрешения.</p><details><summary>Новое правило</summary>{create}<details><summary>Предварительная проверка</summary>{preview}</details></details><details><summary>Блокировка IP / подсети</summary>{source_block}</details><details><summary>Политика и журналирование</summary>{policy}{logging}{reports}</details></section>
-<section class="surface" id="fail2ban-controls"><div class="section-heading"><h3>Fail2ban · защита служб</h3><span class="badge {'active' if data['service'] == 'active' else ''}">{html.escape(data['service'])}</span></div><p class="muted">Работающие jail: {html.escape(', '.join(data['active']) or 'нет подтверждённых')}. Изменения сохраняются отдельным override-файлом; чужие настройки не стираются.</p><div class="inline-actions">{f2b_controls}</div><details><summary>Управление jail</summary>{jail}</details><details><summary>Время и усиление блокировок</summary>{settings}</details><details><summary>Блокировки и доверенные адреса</summary>{bans}</details><p class="hint">Блокировка применяется к портам, указанным в выбранном jail. Исключение fail2ban не является разрешением UFW. Для диагностики сначала проверьте конфигурацию и журнал; отключение fail2ban не устраняет причину атак.</p></section>'''
+    return f'''<section class="surface" id="ufw-controls"><div class="section-heading"><h3>UFW · сетевой экран</h3><span class="badge {'active' if firewall['active'] else ''}">{'Включён' if firewall['active'] else 'Отключён / недоступен'}</span></div>{rollback}{hardening}<div class="inline-actions">{controls}</div><details><summary>Текущая политика</summary><pre>{html.escape(firewall['verbose'])}</pre></details><details><summary>Сохранённые правила UFW</summary><p class="muted">При выключенном UFW эти разрешения и запреты не фильтруют трафик.</p><pre>{html.escape(firewall['added'])}</pre></details><div class="table-wrap"><table><thead><tr><th>№</th><th>Правило</th><th>Действие</th></tr></thead><tbody>{rows or '<tr><td colspan="3">Нет доступных правил</td></tr>'}</tbody></table></div><p class="hint">Удаление затрагивает одну строку, не всю пару IPv4 / IPv6. Правила SSH, VPN и панели защищены. Существующие широкие разрешения не отменяются добавлением адресного разрешения.</p><details><summary>Новое правило</summary>{create}<details><summary>Предварительная проверка</summary>{preview}</details></details><details><summary>Блокировка IP / подсети</summary>{source_block}</details><details><summary>Политика и журналирование</summary>{policy}{logging}{reports}</details></section>
+<section class="surface" id="fail2ban-controls"><div class="section-heading"><h3>Fail2ban · защита служб</h3><span class="badge {'active' if data['service'] == 'active' else ''}">{html.escape(data['service'])}</span></div><p class="muted">Работающие jail: {html.escape(', '.join(data['active']) or 'нет подтверждённых')}. Изменения сохраняются отдельным override-файлом; чужие настройки не стираются.</p>{login_controls}<div class="inline-actions">{f2b_controls}</div><details><summary>Управление jail</summary>{jail}</details><details><summary>Время и усиление блокировок</summary>{settings}</details><details><summary>Блокировки и доверенные адреса</summary>{bans}</details><p class="hint">Блокировка применяется к портам, указанным в выбранном jail. Исключение fail2ban не является разрешением UFW. Для диагностики сначала проверьте конфигурацию и журнал; отключение fail2ban не устраняет причину атак.</p></section>'''
 
 
 def server_security_controls():
@@ -4150,6 +4604,10 @@ CONSOLE_SCRIPT = r'''
   const routeForm=document.querySelector('.route-picker')?.closest('form');
   if(routeForm){const update=()=>{const chosen=routeForm.querySelector('input[name="mode"]:checked'),field=routeForm.querySelector('[data-cascade-address]');if(field){field.hidden=chosen?.value!=='socks5';field.querySelector('input').disabled=field.hidden;}const summary=routeForm.querySelector('[data-route-summary]');if(summary&&chosen)summary.textContent='Выбран: '+chosen.closest('label').querySelector('strong').textContent+'. Переключение только после кнопки и подтверждения.';};routeForm.querySelectorAll('[name="mode"]').forEach(input=>input.addEventListener('change',update,{signal}));update();}
   const actionDescriptions={
+    'login-protection-status':'Показывает сохранённое и фактическое состояние отдельного jail панели. Запущенный Fail2ban сам по себе ещё не защищает вход в панель.',
+    'login-protection-prepare':'Создаёт только наши фильтр и выключенный jail, проверяет конфигурацию и синтетические сообщения. Не включает защиту, не меняет SSH/VPN и чужие файлы.',
+    'login-protection-enable':'Включает отдельную защиту прямого HTTPS-входа: после 10 ошибок за 10 минут блокирует IP на 10 минут только на TCP-порту панели. Сохраните SSH-доступ. Не используйте за reverse proxy или вместе с all-port recidive.',
+    'login-protection-disable':'Останавливает только отдельный jail панели и сохраняет его выключенным. SSH и VPN-jail остаются без изменений. Встроенное ограничение попыток входа продолжает работать.',
     'client-add':'Создаёт отдельный логин и пароль VPN, а также файлы подключения. Endpoint кратковременно перезапускается: подключения остальных пользователей могут прерваться.',
     'client-batch':'Создаёт несколько независимых учётных записей с разными паролями. Префикс и количество определяют имена. Применение кратковременно перезапускает VPN.',
     'client-note':'Сохраняет только заметку администратора. Пароль, сертификат, профиль и работающий VPN не меняются.',
@@ -4224,6 +4682,9 @@ CONSOLE_SCRIPT = r'''
     '/backup/latest.zip':'Скачивает архив клиентских настроек. Он содержит доступ к VPN; не публикуйте его и не отправляйте посторонним.'
   };
   const securityDescriptions={
+    'Защита входа в панель':'Встроенный лимит попыток действует всегда. Отдельный Fail2ban-jail включается по вашему выбору: 10 ошибок за 10 минут приводят к бану IP на 10 минут только на TCP-порту панели. Не блокирует SSH/VPN. Не работает как определитель внешнего IP за reverse proxy или SSH-туннелем.',
+    'Зондирование и DPI провайдера':'Активное зондирование — попытки распознать VPN запросами к серверу. Штатные ClientHello/TLS-auth и изменённые HTTP-ответы затрудняют отдельные способы распознавания, но не скрывают IP, порт или форму трафика. Fail2ban борется с перебором пароля, а не с пассивным DPI. Нет обещания невидимости; строгий QUIC требует отдельной проверки.',
+    'Fail2ban':'Следит за подтверждёнными ошибками входа в настроенных службах и временно блокирует нарушителя. Важны активные jail, а не только запущенный процесс. SSH и панель требуют отдельных защит. Это не AntiDPI и не ограничение VPN-устройств.',
     'Сетевой экран':'UFW фильтрует соединения по IP, портам и направлению. Inactive означает, что он выключен. Перед включением разрешите SSH, VPN и HTTPS-панель и проверьте сохранность доступа. Это не AntiDPI и не полная защита от сканеров.',
     'Политика входящих соединений':'Default incoming применяется к новым входящим соединениям, для которых не подошло отдельное правило UFW. Обычно рекомендуют deny: разрешены только явно открытые службы. Сначала создайте разрешения SSH, VPN и панели, иначе можно потерять доступ. Эта карточка ничего не изменяет.',
     'Защита SSH':'Fail2ban временно блокирует адреса после подтверждённых повторных ошибок SSH-входа. Это не число VPN-клиентов и не защита от всех сетевых атак. Общий NAT может объединять разных людей за одним IP.',
@@ -4246,6 +4707,7 @@ CONSOLE_SCRIPT = r'''
     'Ошибки служб ОС':'Показывает службы в состоянии failed. Причины могут быть разными; сначала изучите журнал и назначение службы. Панель не перезапускает все неизвестные службы автоматически.'
   };
   Object.assign(actionDescriptions,{
+    'ufw-hardening':'Сначала покажите план. SSH, VPN и публичная панель определяются автоматически; порты других служб укажите отдельно. Применение удаляет только перечисленные понятные разрешения, сохраняет ограничения источников нужных правил и запрещает остальные входящие. Сложные правила или Docker требуют ручной проверки. Будет независимый откат через 120 секунд без подтверждения.',
     'ufw-status':'Показывает текущие правила и состояние UFW. Ничего не включает и не меняет. Сравните разрешённые порты с SSH, VPN и панелью.',
     'ufw-enable':'Включает фильтрацию UFW с существующими правилами. Проверьте разрешения SSH, VPN и панели. После применения проверьте новый вход и подтвердите доступ за 120 секунд; иначе наш таймер вернёт прежние настройки.',
     'ufw-disable':'Выключает фильтрацию UFW. Открытые процессы VPS могут стать доступны извне, если их не ограничивает другой firewall. Это не отключает VPN. Изменение требует проверки сохранности доступа.',
@@ -4285,6 +4747,12 @@ CONSOLE_SCRIPT = r'''
   });
   document.querySelectorAll('[data-load-link],[data-copy],[data-reveal],[data-drawer]').forEach(button=>{if(!button.title)button.title=button.hasAttribute('data-copy')?'Копирует выбранный секрет или профиль в буфер обмена. Не отправляйте его посторонним.':button.hasAttribute('data-reveal')?'Показывает или скрывает уже сохранённый пароль выбранного клиента. Учитывайте, кто видит экран.':button.hasAttribute('data-load-link')?'Создаёт ссылку и QR для выбранного клиента и транспорта. Ссылка содержит доступ к VPN; передавайте её только владельцу.':'Открывает карточку клиента или форму добавления. Само открытие не меняет доступ и не перезапускает VPN.';});
   const store = {get(k, fallback) {try{return localStorage.getItem(k)||fallback;}catch(_){return fallback;}},set(k,v){try{localStorage.setItem(k,v);}catch(_){}}};
+  if($('hardening-preview')){
+    const preview=$('hardening-preview'),apply=$('hardening-apply'),extra=$('hardening-extra'),fingerprint=$('hardening-fingerprint'),report=$('hardening-plan');
+    extra.oninput=()=>{fingerprint.value='';apply.disabled=true;report.textContent='Порты изменены. Получите новый план перед применением.';};
+    preview.title='Показывает, какие входящие разрешения сохранятся или будут удалены. Правила пока не меняются.';
+    preview.onclick=async()=>{preview.disabled=true;apply.disabled=true;fingerprint.value='';report.textContent='Читаем текущие правила и порты служб…';try{const url=new URL('/api/firewall-plan',location.origin);url.searchParams.set('extra_ports',extra.value);const response=await fetch(url,{cache:'no-store',signal});if(!response.ok)throw Error('План недоступен. Проверьте формат портов и состояние UFW.');const data=await response.json();if(signal.aborted)return;report.textContent=data.report;fingerprint.value=data.fingerprint;apply.disabled=data.blocked;}catch(error){if(error.name!=='AbortError')report.textContent=error.message;}finally{if(!signal.aborted)preview.disabled=false;}};
+  }
   $('theme-toggle').onclick=()=>{const t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;store.set('tt-theme',t);};
   if($('effects-toggle'))$('effects-toggle').onclick=()=>{const flat=document.documentElement.dataset.effects!=='flat';document.documentElement.dataset.effects=flat?'flat':'glass';store.set('tt-effects',flat?'flat':'glass');$('effects-toggle').setAttribute('aria-pressed',String(!flat));};
   const nav=$('mobile-nav'), menu=$('mobile-menu');
@@ -4538,6 +5006,7 @@ PANEL_STYLE += r'''
 .explain-dialog{width:min(540px,calc(100% - 28px));max-height:85dvh;overflow:auto;padding:26px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);box-shadow:0 20px 70px #0004}
 .explain-dialog::backdrop{background:#101b2370}.explain-dialog h3{font-size:18px;line-height:1.4;overflow-wrap:anywhere}.explain-dialog p{white-space:pre-line;font-size:14px;line-height:1.7;color:var(--muted);margin:18px 0 24px;overflow-wrap:anywhere}
 .explain-dialog>button{display:block;margin-left:auto}
+.security-check.info .check-dot{background:var(--muted)}
 dialog button:hover:not(:disabled),dialog button:active:not(:disabled){transform:none}
 .health-title{display:block;font-size:21px;font-weight:650;line-height:1.4;margin-bottom:6px;overflow-wrap:anywhere}
 .health-days{display:grid;grid-template-columns:repeat(30,minmax(0,1fr));gap:4px;min-height:22px}
@@ -4740,6 +5209,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return True
         if auth:
             login_delay(peer, failed=True)
+            panel_auth_failure(peer, getattr(getattr(self, 'server', None), 'server_port', 0))
         if not auth and 'text/html' in self.headers.get('Accept', ''):
             self.send_response(303); self.send_header('Location', '/login'); self.end_headers(); return False
         self.send_response(401)
@@ -4795,6 +5265,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         valid_password = secrets.compare_digest(password.encode(), PANEL_PASSWORD.encode())
         if not PANEL_PASSWORD or not (valid_user and valid_password):
             login_delay(self.client_address[0], failed=True)
+            panel_auth_failure(self.client_address[0], getattr(getattr(self, 'server', None), 'server_port', 0))
             self.send_login('Неверный логин или пароль.', 401); return
         login_delay(self.client_address[0], success=True)
         session = secrets.token_urlsafe(32); now = time.monotonic()
@@ -4923,6 +5394,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if parsed.path == '/api/clients-metrics':
             self.send_json(client_metrics())
+            return
+        if parsed.path=='/api/firewall-plan':
+            try: fields=urllib.parse.parse_qs(parsed.query,keep_blank_values=True,max_num_fields=2)
+            except ValueError: self.send_error(400);return
+            if set(fields)-{'extra_ports'} or any(len(items)!=1 for items in fields.values()):
+                self.send_error(400);return
+            with admin_lock(): plan=firewall_hardening_plan({'extra_ports':fields.get('extra_ports',[''])[0]})
+            self.send_json(dict(fingerprint=plan['fingerprint'],blocked=bool(plan['blockers']),report=firewall_hardening_report(plan)))
             return
         if parsed.path == '/api/releases':
             self.send_json(release_snapshot())

@@ -43,7 +43,7 @@ PANEL_SOURCE = PANEL_BYTES.decode("utf-8-sig").replace("\r\n", "\n")
 INSTALLER_SOURCE = INSTALLER_BYTES.decode("utf-8-sig").replace("\r\n", "\n")
 PANEL_TREE = ast.parse(PANEL_SOURCE, filename=str(PANEL_PATH))
 DEFINITIONS = {
-    "Handler", "PanelServer", "DeadlineReader", "login_delay", "client_name_valid", "validate_port",
+    "Handler", "PanelServer", "DeadlineReader", "login_delay", "panel_auth_failure", "client_name_valid", "validate_port",
     "normalized_ip", "admin_peer", "firewall_rule", "jail_name", "confirmed",
     "fail2ban_operation", "installer_operation", "interface_operation",
     "backup_archive", "recent_logs", "diagnostic_report", "power_operation",
@@ -247,6 +247,8 @@ def fresh_namespace():
         health_snapshot=Mock(return_value={"state": "unknown"}),
         scanner_snapshot=Mock(return_value={"counts": {}}),
         fail2ban_snapshot=Mock(return_value={"configured": ["sshd"], "active": ["sshd"]}),
+        PANEL_LOGIN_JAIL="trusttunnel-panel-login",
+        panel_login_protection_status=Mock(return_value={"enabled": False}),
         protected_ports=Mock(return_value=[(22, "tcp"), (443, "tcp"), (8088, "tcp")]),
         html_page=Mock(return_value="<main>synthetic-private-dashboard</main>"),
         login_page=lambda token, nonce, error: '<input name="_login_token" value="' + token + '">',

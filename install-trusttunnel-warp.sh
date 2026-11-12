@@ -2246,6 +2246,10 @@ manage_fail2ban() {
     echo "14) Добавить постоянное исключение"
     echo "15) Удалить исключение"
     echo "16) Журнал"
+    echo "17) Состояние защиты входа в панель"
+    echo "18) Подготовить защиту панели без включения"
+    echo "19) Включить Fail2ban-защиту входа в панель"
+    echo "20) Отключить только защиту входа в панель"
     echo "0) Назад"
     prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
@@ -2253,6 +2257,11 @@ manage_fail2ban() {
       1) admin_call f2b-status ;;
       6) admin_call f2b-test ;;
       16) admin_call f2b-logs ;;
+      17) admin_call login-protection-status ;;
+      18|19|20)
+        case "$choice" in 18) action=prepare ;; 19) action=enable ;; 20) action=disable ;; esac
+        confirm_action "Защита панели (${action}): 10 ошибок за 10 минут — бан IP на 10 минут только на TCP-порту панели. SSH/VPN не затрагиваются. Только прямой HTTPS-доступ; recidive несовместим. Продолжить?"
+        admin_call "login-protection-$action" confirm=CONFIRMED || true ;;
       2|3|4|5|7)
         case "$choice" in 2) action=install ;; 3) action=enable ;; 4) action=disable ;; 5) action=restart ;; 7) action=reload ;; esac
         confirm_action "Изменить службу fail2ban (${action})? Остановка снимает защиту."
@@ -2279,14 +2288,14 @@ manage_fail2ban() {
             confirm_action "Выполнить ${action} для ${ip} только в jail ${jail}?"
             admin_call "f2b-$action" "jail=$jail" "ip=$ip" confirm=CONFIRMED || true ;;
         esac ;;
-      *) echo "Выберите 0-16." ;;
+      *) echo "Выберите 0-20." ;;
     esac
   done
 }
 
 manage_ufw() {
   ensure_admin_helper || return
-  local choice port proto decision direction source destination interface position comment action level policy snapshot version number token
+  local choice port proto decision direction source destination interface position comment action level policy snapshot version number token extra plan fingerprint
   while true; do
     echo
     echo "=== UFW (без сброса чужих правил; откат через 120 секунд) ==="
@@ -2306,6 +2315,7 @@ manage_ufw() {
     echo "14) Профили приложений"
     echo "15) Заблокировать входящий трафик IP / подсети на всех портах"
     echo "16) Установить пакет UFW"
+    echo "17) Открыть нужные и закрыть остальные входящие: сначала план"
     echo "0) Назад"
     prompt_value "Действие [0]: "; choice="${REPLY_VALUE:-0}"
     case "$choice" in
@@ -2358,7 +2368,15 @@ manage_ufw() {
       16)
         confirm_action "Установить пакет UFW без обновления остальных пакетов?"
         admin_call ufw-install confirm=CONFIRMED || true ;;
-      *) echo "Выберите 0-16." ;;
+      17)
+        prompt_value "Порты других нужных служб (например 80/tcp, 53/udp; пусто: только SSH/VPN/публичная панель): "; extra="$REPLY_VALUE"
+        plan="$(python3 "$ADMIN_HELPER_PATH" --admin ufw-hardening-json "extra_ports=$extra" </dev/null)" || continue
+        printf '%s\n' "$plan" | python3 -c 'import json,sys; print(json.load(sys.stdin)["report"])'
+        if ! printf '%s\n' "$plan" | python3 -c 'import json,sys; sys.exit(1 if json.load(sys.stdin)["blocked"] else 0)'; then continue; fi
+        fingerprint="$(printf '%s\n' "$plan" | python3 -c 'import json,sys; print(json.load(sys.stdin)["fingerprint"])')"
+        confirm_action "Применить показанный план? Будут удалены только перечисленные разрешения. Затем проверьте новый SSH-вход, VPN и панель и подтвердите пунктом 11 за 120 секунд."
+        admin_call ufw-hardening "extra_ports=$extra" "fingerprint=$fingerprint" confirm=CONFIRMED || true ;;
+      *) echo "Выберите 0-17." ;;
     esac
   done
 }
@@ -2375,6 +2393,10 @@ load_panel_environment() {
 }
 
 install_panel() {
+  if [ -e /etc/fail2ban/jail.d/zzzz-trusttunnel-panel-login.local ] || [ -L /etc/fail2ban/jail.d/zzzz-trusttunnel-panel-login.local ] || [ -e /etc/fail2ban/filter.d/trusttunnel-panel.conf ]; then
+    ensure_admin_helper || return 1
+    admin_call login-protection-access-check || return 1
+  fi
   local panel_path env_file panel_mode ssh_port default_port default_mode old_port requested_panel_port requested_panel_mode
   requested_panel_port="${PANEL_PORT:-}"
   requested_panel_mode="${PANEL_ACCESS_MODE:-}"
@@ -2576,6 +2598,11 @@ manage_panel_service() {
 }
 remove_panel() {
   confirm_action "Веб-панель TrustTunnel будет остановлена и удалена."
+  if [ -e /etc/fail2ban/jail.d/zzzz-trusttunnel-panel-login.local ] || [ -L /etc/fail2ban/jail.d/zzzz-trusttunnel-panel-login.local ]; then
+    echo "Перед удалением будет отключён только отдельный Fail2ban-jail панели."
+    ensure_admin_helper || return 1
+    admin_call login-protection-disable confirm=CONFIRMED || return 1
+  fi
   if [ -f /var/lib/trusttunnel-panel/torrent-filter.json ]; then
     echo "Ограничение BitTorrent будет отключено: его фоновая проверка использует backend панели."
     confirm_action "Отключить ограничение BitTorrent и продолжить удаление панели?"
@@ -2762,17 +2789,17 @@ ensure_admin_helper() {
     apt_install_retry -y --no-install-recommends python3 python3-tomli || return 1
   fi
   ADMIN_HELPER_PATH="${ADMIN_HELPER_PATH:-/usr/local/sbin/trusttunnel-panel.py}"
-  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.11.12'" "$ADMIN_HELPER_PATH"; then return; fi
-  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.11.12'" /usr/local/lib/trusttunnel/admin.py; then
+  if [ -f "$ADMIN_HELPER_PATH" ] && grep -q "^ADMIN_VERSION = '2026.11.12.1'" "$ADMIN_HELPER_PATH"; then return; fi
+  if [ -f /usr/local/lib/trusttunnel/admin.py ] && grep -q "^ADMIN_VERSION = '2026.11.12.1'" /usr/local/lib/trusttunnel/admin.py; then
     ADMIN_HELPER_PATH=/usr/local/lib/trusttunnel/admin.py
     return
   fi
   local candidate
   candidate="$(mktemp)"
   if ! curl -fsSL "$PANEL_SCRIPT_URL" -o "$candidate"; then rm -f "$candidate"; return 1; fi
-  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.11.12'" "$candidate"; then
+  if ! python3 -m py_compile "$candidate" || ! grep -q "^ADMIN_VERSION = '2026.11.12.1'" "$candidate"; then
     rm -f "$candidate"
-    echo "Требуется общий backend панели 2026.11.12. Обновите панель; старый backend не будет менять настройки." >&2
+    echo "Требуется общий backend панели 2026.11.12.1. Обновите панель; старый backend не будет менять настройки." >&2
     return 1
   fi
   mkdir -p /usr/local/lib/trusttunnel
